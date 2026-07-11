@@ -93,11 +93,21 @@ def _dispatch(argv):
         return 0
     if command in ("claude", "codex"):
         from . import route
-        fam = "claude" if command == "claude" else "codex"
-        # honour an explicit model flag so scoped weekly caps (e.g. Opus)
-        # still gate the routing decision
-        if "--model" in args and args.index("--model") + 1 < len(args):
-            fam = registry.family(args[args.index("--model") + 1])
+        provider_cmd = "claude" if command == "claude" else "codex"
+        # honour an explicit model flag (both `--model X` and `--model=X`) so a
+        # scoped weekly cap (e.g. Opus) gates the routing decision
+        model = None
+        for index, arg in enumerate(args):
+            if arg == "--model" and index + 1 < len(args):
+                model = args[index + 1]
+            elif arg.startswith("--model="):
+                model = arg.split("=", 1)[1]
+        fam = registry.family(model) if model else provider_cmd
+        if registry.family_provider(fam) != provider_cmd:
+            print(f"headroom: `headroom {command}` can't run a "
+                  f"{registry.family_provider(fam)} model ({model}) — use "
+                  f"`headroom {registry.family_provider(fam)}`", file=sys.stderr)
+            return 2
         return route.cmd_exec(fam, [command] + args)
     if command == "run":
         from . import route

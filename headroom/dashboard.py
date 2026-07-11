@@ -8,6 +8,7 @@ transparently re-collects when the snapshot is stale, so the page is always
 current with zero cron setup.
 """
 import http.server
+import ipaddress
 import json
 import os
 import shutil
@@ -71,6 +72,7 @@ def build(config=None, out_dir=None, snapshot_file=None):
     injected = {
         "theme": settings["theme"],
         "title": settings["title"],
+        "redact": bool(settings.get("redact_emails", True)),
         "accounts": [{"name": account["name"], "provider": account["provider"]}
                      for account in registry.accounts(config)],
     }
@@ -103,8 +105,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def _host_ok(self):
         # reject anything but a loopback Host, so a remote page can't reach the
         # server via DNS-rebinding and read the usage feed cross-origin.
-        host = (self.headers.get("Host") or "").split(":")[0].strip("[]")
-        return host in ("127.0.0.1", "localhost", "::1", "")
+        raw = (self.headers.get("Host") or "").strip()
+        if not raw:
+            return False
+        if raw.startswith("["):            # [::1]:port
+            host = raw[1:].split("]")[0]
+        elif raw.count(":") == 1:          # host:port (IPv4 or name)
+            host = raw.split(":")[0]
+        else:                              # bare name or bracketless IPv6
+            host = raw
+        if host == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
 
     def do_GET(self):
         if not self._host_ok():

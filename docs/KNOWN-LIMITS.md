@@ -47,11 +47,29 @@ snapshot and on the dashboard). This keeps offline/air-gapped setups usable.
 If you want provider-verified-only routing, treat `verified_local` as held —
 open an issue if you want this as a config flag.
 
-## Keyring-backed credential stores are unsupported
+## File-based credentials required (macOS Keychain caveat)
 
-Codex `cli_auth_credentials_store = "keyring"` and future non-file stores
-are invisible to headroom; such slots show as not logged in. File-based
-stores (the default on both providers) are required for now.
+headroom reads usage tokens from files (`.credentials.json`, `auth.json`).
+Two cases where that isn't where the token lives:
+
+- **macOS default Claude login.** Recent Claude Code on macOS can store its
+  token in the system Keychain, so the default `~/.claude` has no readable
+  `.credentials.json`. headroom will detect the identity but hold the account
+  with a clear message. **Fix:** connect a *fresh* isolated login instead of
+  adopting the default — `headroom connect work-fresh` runs `claude auth login`
+  inside its own `CLAUDE_CONFIG_DIR`, which writes file-based credentials that
+  headroom can read. (Linux/Windows default logins are already file-based.)
+- **Codex `cli_auth_credentials_store = "keyring"`** and other non-file stores
+  are likewise invisible; such slots show as not logged in.
+
+## Scoped model caps aren't enforced on the generic `claude` route
+
+`headroom claude` routes on the account-wide 5h/7d windows — it can't know
+which model the Claude CLI will actually use, so it does NOT hold an account
+just because one model's weekly cap (e.g. Opus) is exhausted (that would
+wrongly block Sonnet/Haiku work on the same account). To gate on a specific
+model's cap, name it: `headroom claude --model opus` holds when the Opus
+weekly cap is full.
 
 ## `headroom run` retries are for idempotent commands
 

@@ -117,6 +117,35 @@ class BlockReasonFailClosed(unittest.TestCase):
         row["trust_state"] = "held"  # but routable stayed True
         self.assertIsNotNone(self.reason(row))
 
+    def test_expired_observation_holds(self):
+        row = _claude_row()
+        row["windows"]["5h"] = {"used_percent": None,
+                                "freshness": "expired_observation",
+                                "resets_at": 1, "window_minutes": 300}
+        self.assertIsNotNone(self.reason(row))
+
+    def test_identity_mismatch_holds(self):
+        from headroom import collect
+        row = _claude_row()
+        row["identity"] = {"account_fingerprint": "aaaa"}
+        original = collect.local_fingerprint
+        collect.local_fingerprint = lambda provider, home: "bbbb"
+        try:
+            self.assertIsNotNone(self.reason(row))
+        finally:
+            collect.local_fingerprint = original
+
+    def test_identity_match_routes(self):
+        from headroom import collect
+        row = _claude_row()
+        row["identity"] = {"account_fingerprint": "aaaa"}
+        original = collect.local_fingerprint
+        collect.local_fingerprint = lambda provider, home: "aaaa"
+        try:
+            self.assertIsNone(self.reason(row))
+        finally:
+            collect.local_fingerprint = original
+
     def test_generic_claude_not_blocked_by_opus_cap(self):
         row = _claude_row()
         row["windows"]["scoped:Opus"] = {"used_percent": 100.0,

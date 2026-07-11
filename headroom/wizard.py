@@ -45,7 +45,15 @@ def run_setup():
         if not ask_yes_no(f"{config_file} already exists — reconfigure?", False):
             print("keeping the existing config. `headroom connect` adds accounts.")
             return 0
-        config = paths.load_json(config_file) or {}
+        config = paths.load_json(config_file)
+        if config is None:
+            # existing file is corrupt — don't silently discard it
+            if not ask_yes_no("that config is unreadable/corrupt. Start over "
+                              "and OVERWRITE it?", False):
+                print("left the existing config untouched — fix or delete it, "
+                      "then re-run setup.")
+                return 1
+            config = {}
         config.setdefault("schema_version", 1)
         config.setdefault("accounts", [])
         config.setdefault("dashboard", dict(registry.DEFAULT_DASHBOARD))

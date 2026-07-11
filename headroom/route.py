@@ -85,7 +85,9 @@ def _cooldown_lock():
 
 
 def _snapshot_fresh(snapshot, now, max_age):
-    generated = (snapshot or {}).get("generated")
+    if not isinstance(snapshot, dict):
+        return False
+    generated = snapshot.get("generated")
     return (snapshot is not None and _number(generated)
             and now - generated <= max_age and generated <= now + CLOCK_SKEW)
 
@@ -112,7 +114,8 @@ def ensure_fresh_snapshot(max_age=None):
 
 
 def _snapshot_accounts(snapshot):
-    return {row["name"]: row for row in (snapshot or {}).get("accounts") or []
+    rows = snapshot.get("accounts") if isinstance(snapshot, dict) else None
+    return {row["name"]: row for row in (rows or [])
             if isinstance(row, dict) and row.get("name")}
 
 
@@ -137,6 +140,18 @@ def block_reason(account, fam, snapshot_row, cool, now):
     if snapshot_row.get("trust_state") not in ("verified", "verified_local"):
         # routable and trust_state must agree; a mismatch is corrupt state -> hold
         return "trust/routable mismatch: " + str(snapshot_row.get("trust_state"))
+    # TOCTOU guard: the home may have been re-logged into a DIFFERENT account
+    # since this snapshot was taken. Re-derive the identity currently bound in
+    # the slot (local, no network) and hold if it no longer matches — otherwise
+    # we'd launch the new identity on the old one's proven capacity.
+    snap_fp = (snapshot_row.get("identity") or {}).get("account_fingerprint")
+    if snap_fp:
+        current_fp = collector.local_fingerprint(account["provider"],
+                                                 account["home"])
+        if current_fp is None:
+            return "cannot verify slot identity — recollect"
+        if current_fp != snap_fp:
+            return "slot identity changed since snapshot — recollect"
     if snapshot_row.get("stale"):
         return "reading stale"
     captured_at = snapshot_row.get("captured_at")
@@ -151,12 +166,9 @@ def block_reason(account, fam, snapshot_row, cool, now):
             return f"{key} window missing"
         percent = window.get("used_percent")
         if window.get("freshness") == "expired_observation":
-            # only trust "expired" if the window has genuinely reset; a future
-            # reset with no reading is unproven capacity, so hold.
-            reset = window.get("resets_at")
-            if _number(reset) and reset <= now:
-                continue
-            return f"{key} reading expired but window not reset"
+            # an expired observation has NO current reading, so there is no
+            # proof of capacity — always hold, never route on it
+            return f"{key} reading expired — no current capacity proof"
         if not _number(percent) or not 0 <= percent <= 100:
             return f"{key} reading invalid"
         if percent >= 100:
@@ -292,9 +304,18 @@ def cmd_status(fam):
 
 def cmd_run(fam, command):
     snapshot = ensure_fresh_snapshot()
+    rows = _snapshot_accounts(snapshot)
     for account, reason in candidates(fam, snapshot):
         if reason:
             print(f"[headroom] skip {account['name']}: {reason}", file=sys.stderr)
+            continue
+        # re-check against the LATEST cooldown ledger immediately before launch:
+        # another process may have cooled this account since candidates() ran.
+        fresh_reason = block_reason(account, fam, rows.get(account["name"]),
+                                    cooldowns(), time.time())
+        if fresh_reason:
+            print(f"[headroom] skip {account['name']}: {fresh_reason} (rechecked)",
+                  file=sys.stderr)
             continue
         environment = collector.scrubbed_env()
         environment[env_key(account)] = account["home"]

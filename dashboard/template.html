@@ -316,6 +316,7 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 "use strict";
 const CONFIG = /*__HEADROOM_CONFIG__*/ null;
 const DATA_URL = "usage.json";
+const CACHE_KEY = "headroom-cache-" + ((CONFIG && CONFIG.redact) ? "r" : "f");
 let requestNumber = 0;
 
 /* ------------------------------------------------------------- helpers */
@@ -363,7 +364,13 @@ function windowMarkup(account,key){
 // Calm, specific state per account. Codex reads its CLI's own telemetry, so
 // idle/limited are EXPECTED states — label them clearly, never as "broken".
 function accountState(account){
-  if(isCurrent(account))return{cls:"live",label:"Live",note:"observed "+age(account.captured_at)};
+  if(isCurrent(account)){
+    // a fresh reading can still be at 100% — that's "at limit", not "live"
+    const w=account.windows||{};
+    const exhausted=["5h","7d"].some(k=>w[k]&&Number.isFinite(w[k].used_percent)&&w[k].used_percent>=100);
+    if(exhausted)return{cls:"limited",label:"At limit",note:"window full · observed "+age(account.captured_at)};
+    return{cls:"live",label:"Live",note:"observed "+age(account.captured_at)};
+  }
   const code=account.error_code||"";
   const isCodex=account.provider==="codex";
   if(code==="codex_usage_limit"||/usage limit/i.test(account.note||""))
@@ -472,21 +479,23 @@ async function load(manual){
     const data=validate(await response.json());
     if(requestId===requestNumber){
       render(data);
-      try{localStorage.setItem("headroom-cache",JSON.stringify(data));}catch(e){}
+      // key the cache by the redaction setting so a cache written while emails
+      // were visible is never reused after privacy is turned on
+      try{localStorage.setItem(CACHE_KEY,JSON.stringify(data));}catch(e){}
     }
   }catch(error){
     if(requestId===requestNumber){
       let cached=null;
-      try{cached=JSON.parse(localStorage.getItem("headroom-cache")||"null");}catch(e){}
-      // Only reuse a RECENT cache. An old cache may predate a privacy change
-      // (emails since redacted) or a limit that has since changed; beyond an
-      // hour we refuse it rather than resurface stale data as a snapshot.
+      try{cached=JSON.parse(localStorage.getItem(CACHE_KEY)||"null");}catch(e){}
+      // Only reuse a RECENT, non-future cache. An old cache may predate a
+      // privacy change or a limit change; beyond an hour (or dated in the
+      // future) we refuse it rather than resurface stale data as a snapshot.
       const cacheAge=cached&&Number.isFinite(cached.generated)?(Date.now()/1e3-cached.generated):Infinity;
-      if(cached&&cacheAge<=3600){render(cached);
+      if(cached&&cacheAge>=0&&cacheAge<=3600){render(cached);
         const status=document.getElementById("status");
         status.textContent="Feed unreachable ("+(error&&error.message||"error")+"). Showing last snapshot ("+age(cached.generated)+").";
         status.className="statusline is-error";}
-      else{try{localStorage.removeItem("headroom-cache");}catch(e){}
+      else{try{localStorage.removeItem(CACHE_KEY);}catch(e){}
         renderError(error&&error.message?error.message:"unknown feed error");}
     }
   }finally{

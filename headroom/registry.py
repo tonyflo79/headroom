@@ -19,6 +19,8 @@ Config shape (schema_version 1)::
       ]
     }
 """
+import contextlib
+import fcntl
 import os
 import re
 
@@ -128,6 +130,12 @@ def dashboard_settings(config=None):
     config = load() if config is None else config
     settings = dict(DEFAULT_DASHBOARD)
     settings.update(config.get("dashboard") or {})
+    # coerce a wrong-typed port so it can never reach the socket bind as a str
+    try:
+        port = int(settings.get("port", 8377))
+        settings["port"] = port if 1 <= port <= 65535 else 8377
+    except (TypeError, ValueError):
+        settings["port"] = 8377
     return settings
 
 
@@ -140,3 +148,35 @@ def ordered_for(fam, config=None):
 def save(config):
     validate(config)
     paths.write_json_atomic(paths.config_path(), config, mode=0o600)
+
+
+@contextlib.contextmanager
+def config_lock():
+    lock_path = paths.config_path() + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+def apply_pins(pins):
+    """Record usage-org pins WITHOUT clobbering a concurrent account add:
+    take the config lock, reload the latest config, merge pins by slot name,
+    save. A collector that loaded a stale config can no longer delete an
+    account that `connect` added in the meantime."""
+    pins = {name: value for name, value in (pins or {}).items() if value}
+    if not pins:
+        return
+    with config_lock():
+        config = load()
+        changed = False
+        for entry in config["accounts"]:
+            if entry["name"] in pins and not entry.get("pinned_usage_org"):
+                entry["pinned_usage_org"] = pins[entry["name"]]
+                changed = True
+        if changed:
+            save(config)

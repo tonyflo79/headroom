@@ -110,7 +110,9 @@ def existing_fingerprints(config, provider):
 
 
 def add_account(config, name, provider, home, expected_email=None):
-    entry = {"name": name, "provider": provider, "home": home}
+    # always store an absolute, canonical home — a relative path would resolve
+    # against whatever directory a later command runs from
+    entry = {"name": name, "provider": provider, "home": registry.expand(home)}
     if expected_email:
         entry["expected_email"] = expected_email
     config.setdefault("accounts", []).append(entry)
@@ -212,6 +214,12 @@ def cmd_connect(args):
     try:
         config = registry.load()
     except registry.RegistryError:
+        if os.path.exists(paths.config_path()):
+            # a corrupt existing config must be repaired, never silently
+            # replaced with an empty one that then overwrites every slot
+            print(f"headroom: {paths.config_path()} exists but is unreadable; "
+                  f"fix or delete it before connecting", file=sys.stderr)
+            return 1
         config = {"schema_version": 1,
                   "dashboard": dict(registry.DEFAULT_DASHBOARD),
                   "accounts": []}

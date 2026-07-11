@@ -80,11 +80,21 @@ def fingerprint(value):
 
 
 # Auth-override variables that would silently redirect a provider CLI or API
-# call to a different account than the slot we selected (see
+# call to a different account/provider than the slot we selected (see
 # anthropics/claude-code#16238). Scrubbed from every subprocess/env we build.
+# Covers direct keys/tokens, alternate-provider selectors (Bedrock/Vertex),
+# their credentials and base URLs, and Codex's API-key / agent-identity paths.
 AUTH_OVERRIDE_VARS = (
+    # Anthropic direct
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    # Claude Code alternate providers — these reroute Claude off the OAuth slot
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
+    "AWS_PROFILE", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION",
+    "CLOUD_ML_REGION", "ANTHROPIC_VERTEX_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS",
+    # OpenAI / Codex
+    "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY", "CODEX_AGENT_IDENTITY",
 )
 
 
@@ -151,6 +161,23 @@ def claude_local_identity(home):
         "method": "claude_local_metadata",
         "plan_type": None,
     }
+
+
+def local_fingerprint(provider, home):
+    """The identity fingerprint currently bound INSIDE the slot, read from
+    local files only (no network). Used by the router to detect that a home
+    was re-logged into a different account since the snapshot was taken —
+    otherwise it would route the new identity on the old one's capacity."""
+    try:
+        if provider == "claude":
+            return claude_local_identity(home)["account_fingerprint"]
+        auth = paths.load_json(os.path.join(home, "auth.json")) or {}
+        claims = decode_jwt_payload((auth.get("tokens") or {}).get("id_token"))
+        provider_claims = claims.get("https://api.openai.com/auth") or {}
+        return fingerprint(provider_claims.get("chatgpt_account_id")
+                           or claims.get("sub"))
+    except (IdentityBindingError, ValueError, KeyError, OSError):
+        return None
 
 
 def claude_plan(home):
@@ -298,9 +325,11 @@ def claude_limits(home, expected_fingerprint, opener=open_authenticated):
         # the caller pins this fingerprint and holds the slot if it CHANGES.
         # Once pinned, a response with NO org header can't be verified against
         # the pin, so it must hold rather than silently accept.
-        if expected_fingerprint and not response_fingerprint:
+        # require the org header on EVERY response (including the first, before
+        # any pin) — without it the usage can't be bound to the login at all
+        if not response_fingerprint:
             raise IdentityBindingError("claude_usage_org_unverifiable")
-        if (expected_fingerprint and response_fingerprint
+        if (expected_fingerprint
                 and response_fingerprint != expected_fingerprint):
             raise IdentityBindingError("claude_usage_org_changed")
         data = json.load(response)
@@ -380,18 +409,22 @@ def codex_limits(home, now=None):
                 if not limits or not isinstance(limits.get("primary"), dict) \
                         and not isinstance(limits.get("secondary"), dict):
                     continue
-                captured_at = iso_ep(event.get("timestamp")) or file_mtime
+                event_ts = iso_ep(event.get("timestamp"))
+                # the event's OWN timestamp attests when the provider observed
+                # the limit; file mtime only locates the log. Without a real
+                # timestamp we can order candidates but must not call it fresh.
+                captured_at = event_ts if event_ts is not None else file_mtime
                 if captured_at > now + 300:
                     captured_at = file_mtime
                 order = (captured_at, file_mtime, path, line_number)
                 if newest is None or order > newest[0]:
-                    newest = (order, captured_at, limits)
+                    newest = (order, captured_at, limits, event_ts is not None)
         except OSError:
             continue
     if newest is None:
         return {"note": "no rate_limits event in recent Codex sessions"}
-    _, captured_at, limits = newest
-    stale = (now - captured_at) > CODEX_STALE_AFTER
+    _, captured_at, limits, has_timestamp = newest
+    stale = (not has_timestamp) or (now - captured_at) > CODEX_STALE_AFTER
 
     def window(key):
         value = limits.get(key) or {}
@@ -563,8 +596,18 @@ def collect(accounts, backoff=None, persist_backoff=None):
         except IdentityBindingError as error:
             result["ok"] = False
             result["error_code"] = error.code
-            result["note"] = ("identity could not be bound to this slot; "
-                              "account held — run `headroom connect` to re-login")
+            if error.code == "claude_credentials_missing":
+                # verified identity but no file-based token — typically a
+                # Keychain-backed macOS default login headroom can't read
+                result["note"] = ("Claude login found but its token isn't "
+                                  "file-based (macOS Keychain?). headroom needs "
+                                  "a file-based login: `headroom connect "
+                                  f"{account['name']}-fresh` to log in to an "
+                                  "isolated home instead of adopting this one.")
+            else:
+                result["note"] = ("identity could not be bound to this slot; "
+                                  "account held — run `headroom connect` "
+                                  "to re-login")
         except Exception as error:  # noqa: BLE001 — every account must report
             result["ok"] = False
             # `error` is PRIVATE-only (may contain local paths / usernames).
@@ -634,11 +677,9 @@ def run_collect(quiet=False):
         snapshot = collect(registry.accounts(config), backoff, persist)
         pins = {a["name"]: a.pop("pin_usage_org")
                 for a in snapshot["accounts"] if a.get("pin_usage_org")}
-        if pins:
-            for entry in config["accounts"]:
-                if entry["name"] in pins and not entry.get("pinned_usage_org"):
-                    entry["pinned_usage_org"] = pins[entry["name"]]
-            registry.save(config)
+        # merge pins under the config lock against the LATEST config, so a
+        # concurrent `connect` account-add is never overwritten by our stale copy
+        registry.apply_pins(pins)
         if any(a.get("provider") == "claude" and a.get("ok")
                for a in snapshot["accounts"]) \
                 and not any(a.get("error_code") == "usage_source_rate_limited"

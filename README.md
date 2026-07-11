@@ -40,7 +40,9 @@ headroom fixes all three problems:
 ## Quickstart
 
 Requirements: Python 3.9+ (stdlib only — no pip installs), macOS or Linux,
-and the `claude` and/or `codex` CLIs you already use.
+and the `claude` and/or `codex` CLIs you already use. (On macOS, connect
+Claude accounts with a fresh `headroom connect` login rather than adopting the
+Keychain-backed default — see [docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).)
 
 ```bash
 git clone https://github.com/pauldomanski/headroom
