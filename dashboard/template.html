@@ -127,14 +127,42 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 
 .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
            margin-top: 16px; }
-.summary-item { display: flex; align-items: center; justify-content: space-between;
-                gap: 10px; min-height: 64px; padding: 12px 14px;
+.summary-item { display: flex; flex-direction: column; justify-content: space-between;
+                gap: 8px; min-height: 104px; padding: 12px 14px;
                 border: 1px solid var(--line); border-radius: var(--radius);
                 background: var(--panel); box-shadow: var(--panel-shadow); }
+.summary-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .summary-label { display: block; color: var(--ink-3); font: 700 9px/1.3 var(--mono);
                  letter-spacing: .1em; text-transform: uppercase; }
-.summary-note { margin: 3px 0 0; color: var(--ink-2); font: 400 10px/1.3 var(--mono); }
-.summary-value { font: 700 22px/1 var(--mono); }
+.summary-note { margin: 0; color: var(--ink-2); font: 400 9.5px/1.3 var(--mono);
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.summary-value { font: 700 20px/1 var(--mono); }
+.viz { flex: 1 0 auto; display: flex; align-items: flex-end; }
+/* verified: one segment per account */
+.seg-row { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+           gap: var(--cell-gap); height: 10px; width: 100%; align-self: end; }
+.seg { border-radius: var(--cell-radius); background: var(--cell-bg); }
+.seg.is-on { background: var(--green); box-shadow: var(--cell-glow) var(--green); }
+.seg.is-off { background: var(--cell-bg); }
+/* average: a single gauge with tick marks */
+.gauge { position: relative; height: 10px; width: 100%; align-self: end;
+         border-radius: var(--cell-radius); background: var(--cell-bg); overflow: hidden; }
+.gauge-fill { position: absolute; inset: 0; width: var(--fill, 0%);
+              background: var(--tone, var(--unknown));
+              box-shadow: var(--cell-glow) var(--tone, transparent); }
+.gauge-ticks { position: absolute; inset: 0; display: grid;
+               grid-template-columns: repeat(10, 1fr); }
+.gauge-ticks span { border-right: 1px solid var(--bg); }
+.gauge-ticks span:last-child { border-right: 0; }
+/* lowest: a compact battery meter */
+.summary-item .meter { height: 10px; margin-top: 0; width: 100%; align-self: end; }
+/* fleet: one bar per account, height = session headroom */
+.fleet-bars { display: flex; align-items: flex-end; justify-content: flex-start;
+              gap: var(--cell-gap); height: 38px; width: 100%; align-self: end; }
+.fbar { flex: 1; min-width: 6px; max-width: 22px; border-radius: var(--cell-radius);
+        background: var(--tone, var(--unknown)); height: var(--h, 4%);
+        box-shadow: var(--cell-glow) var(--tone, transparent); }
+.fbar.is-unknown { background: var(--cell-bg); height: 100%; opacity: .55; }
 
 .provider { margin-top: 26px; }
 .provider-head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 8px; }
@@ -236,18 +264,30 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
   </header>
 
   <section class="summary" aria-label="Fleet summary">
-    <div class="summary-item"><div><span class="summary-label">Verified</span>
+    <div class="summary-item">
+      <div class="summary-head"><span class="summary-label">Verified</span>
+        <strong class="summary-value" id="verified">–</strong></div>
+      <div class="viz"><div class="seg-row" id="verified-viz" role="img"
+        aria-label="Verified accounts"></div></div>
       <p class="summary-note">provider state known</p></div>
-      <strong class="summary-value" id="verified">–</strong></div>
-    <div class="summary-item"><div><span class="summary-label">Average left</span>
+    <div class="summary-item">
+      <div class="summary-head"><span class="summary-label">Average left</span>
+        <strong class="summary-value" id="average">–</strong></div>
+      <div class="viz"><div class="gauge" id="average-viz" role="img"
+        aria-label="Average remaining capacity"><span class="gauge-fill"></span>
+        <span class="gauge-ticks" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span></div></div>
       <p class="summary-note">all current windows</p></div>
-      <strong class="summary-value" id="average">–</strong></div>
-    <div class="summary-item"><div><span class="summary-label">Lowest tank</span>
+    <div class="summary-item">
+      <div class="summary-head"><span class="summary-label">Lowest tank</span>
+        <strong class="summary-value" id="lowest">–</strong></div>
+      <div class="viz" id="lowest-viz"></div>
       <p class="summary-note" id="lowest-account">waiting for data</p></div>
-      <strong class="summary-value" id="lowest">–</strong></div>
-    <div class="summary-item"><div><span class="summary-label">Accounts</span>
+    <div class="summary-item">
+      <div class="summary-head"><span class="summary-label">Fleet · session left</span>
+        <strong class="summary-value" id="account-count">–</strong></div>
+      <div class="viz"><div class="fleet-bars" id="fleet-viz" role="img"
+        aria-label="Session headroom per account"></div></div>
       <p class="summary-note" id="account-note">–</p></div>
-      <strong class="summary-value" id="account-count">–</strong></div>
   </section>
 
   <div class="statusline" id="status" aria-live="polite">Loading usage readings…</div>
@@ -359,6 +399,18 @@ function render(data){
   set("lowest-account",lowest?lowest.who:"no current readings");
   set("account-count",String(accounts.length));
   set("account-note",(claude.length?("Claude "+claude.length):"")+(claude.length&&codex.length?" · ":"")+(codex.length?("Codex "+codex.length):""));
+  /* top-bar instruments */
+  document.getElementById("verified-viz").innerHTML=accounts.map(a=>
+    '<span class="seg '+(isCurrent(a)?"is-on":"is-off")+'" title="'+esc(a.name)+": "+(isCurrent(a)?"verified":"held")+'"></span>').join("");
+  const gauge=document.getElementById("average-viz");
+  gauge.className="gauge tone-"+tone(avg);
+  gauge.querySelector(".gauge-fill").style.setProperty("--fill",(avg==null?0:avg)+"%");
+  document.getElementById("lowest-viz").innerHTML=meterMarkup(lowest?lowest.left:null);
+  document.getElementById("fleet-viz").innerHTML=accounts.map(a=>{
+    const left=capacity((a.windows||{})["5h"]);
+    if(left==null)return'<span class="fbar is-unknown" title="'+esc(a.name)+': unknown"></span>';
+    return'<span class="fbar tone-'+tone(left)+'" style="--h:'+Math.max(4,left)+'%" title="'+esc(a.name)+": "+Math.round(left)+'% session left"></span>';
+  }).join("");
   set("snapshot-age","snapshot "+age(data.generated));
   set("source-line",current.length+" of "+accounts.length+" verified");
   document.getElementById("providers").innerHTML=
