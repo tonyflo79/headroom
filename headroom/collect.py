@@ -321,7 +321,11 @@ def codex_app_server_read(home, timeout=None):
         if responses[request_id].get("error"):
             raise IdentityBindingError("codex_app_server_error")
     account = (responses[3].get("result") or {}).get("account") or {}
-    rate_limits = (responses[2].get("result") or {}).get("rateLimits") or {}
+    result = responses[2].get("result") or {}
+    # Prefer the canonical per-limit bucket; fall back to the backward-compatible
+    # single-bucket view. Both carry primary/secondary RateLimitWindow objects.
+    by_id = result.get("rateLimitsByLimitId") or {}
+    rate_limits = by_id.get("codex") or result.get("rateLimits") or {}
     return {"account": account, "rate_limits": rate_limits}
 
 
@@ -339,6 +343,40 @@ def codex_window(window, now):
         "window_minutes": window.get("windowDurationMins"),
         "observed_at": now,
         "freshness": "fresh",
+    }
+
+
+# The app-server reports each rate-limit window by its actual duration and OMITS
+# any window that is not currently a constraint: a freshly reset 5-hour window at
+# ~0% comes back as a null secondary, and the "primary" slot can then hold the
+# weekly window instead. So we must NOT assume primary==5h / secondary==7d.
+CODEX_STANDARD_WINDOWS = {300: "5h", 10080: "7d"}
+
+
+def codex_windows(rate_limits, now):
+    """Build headroom's 5h/7d windows from an app-server rate-limits payload,
+    robust to the server reordering or omitting windows.
+
+    Windows are bucketed by their real ``windowDurationMins`` rather than their
+    primary/secondary position. A standard window the server left out is treated
+    as fully available (0% used): a binding window is always reported, so an
+    absent one means that limit is not currently a constraint."""
+    buckets = {}
+    for slot in ("primary", "secondary"):
+        mapped = codex_window(rate_limits.get(slot), now)
+        if mapped is None:
+            continue
+        key = CODEX_STANDARD_WINDOWS.get(mapped.get("window_minutes"))
+        if key and key not in buckets:
+            buckets[key] = mapped
+
+    def available(minutes):
+        return {"used_percent": 0.0, "resets_at": None,
+                "window_minutes": minutes, "observed_at": now,
+                "freshness": "fresh"}
+    return {
+        "5h": buckets.get("5h") or available(300),
+        "7d": buckets.get("7d") or available(10080),
     }
 
 
@@ -371,8 +409,7 @@ def codex_live(home, expected_email=None, now=None):
         "credential_digest": credential_digest("codex", home),
         "subscription": codex_subscription(provider_claims),
     }
-    windows = {"5h": codex_window(rate_limits.get("primary"), now),
-               "7d": codex_window(rate_limits.get("secondary"), now)}
+    windows = codex_windows(rate_limits, now)
     return identity, plan_type, windows
 
 

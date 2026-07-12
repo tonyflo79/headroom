@@ -207,5 +207,38 @@ class PublicSnapshot(unittest.TestCase):
         self.assertEqual(pub["accounts"][0]["email"], "p***@x.com")
 
 
+class CodexWindowMapping(unittest.TestCase):
+    """The app-server reports windows by real duration and omits any that is
+    not a current constraint, so 5h/7d must be bucketed by windowDurationMins,
+    never by primary/secondary position."""
+
+    def test_standard_primary_secondary(self):
+        rl = {"primary": {"usedPercent": 12, "windowDurationMins": 300},
+              "secondary": {"usedPercent": 88, "windowDurationMins": 10080}}
+        w = collect.codex_windows(rl, now=1000)
+        self.assertEqual(w["5h"]["used_percent"], 12.0)
+        self.assertEqual(w["7d"]["used_percent"], 88.0)
+
+    def test_weekly_in_primary_slot_with_null_secondary(self):
+        # freshly reset 5h omitted; weekly lands in the primary slot
+        rl = {"primary": {"usedPercent": 16, "windowDurationMins": 10080},
+              "secondary": None}
+        w = collect.codex_windows(rl, now=1000)
+        self.assertEqual(w["7d"]["used_percent"], 16.0)
+        self.assertEqual(w["5h"]["used_percent"], 0.0)  # absent -> available
+        self.assertEqual(w["5h"]["window_minutes"], 300)
+
+    def test_only_5h_present(self):
+        rl = {"primary": {"usedPercent": 40, "windowDurationMins": 300}}
+        w = collect.codex_windows(rl, now=1000)
+        self.assertEqual(w["5h"]["used_percent"], 40.0)
+        self.assertEqual(w["7d"]["used_percent"], 0.0)
+
+    def test_empty_payload_defaults_available(self):
+        w = collect.codex_windows({}, now=1000)
+        self.assertEqual(w["5h"]["used_percent"], 0.0)
+        self.assertEqual(w["7d"]["used_percent"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
