@@ -139,6 +139,20 @@ def run_setup():
         "redact_emails": redact,
         "port": port,
     })
+
+    # -- routing preference: keep a reserve so sessions start fresh -----------
+    current_reserve = (config.get("routing") or {}).get("reserve_percent", 0)
+    reserve_raw = ask(
+        "Skip an account once it drops below this % headroom left, so sessions "
+        "start fresh instead of hitting a limit mid-task (0 = use every account "
+        "to its limit)", str(current_reserve))
+    try:
+        reserve = float(reserve_raw)
+        reserve = reserve if 0 <= reserve <= 99 else 0.0
+    except ValueError:
+        reserve = 0.0
+    config.setdefault("routing", {})["reserve_percent"] = reserve
+
     registry.save(config)
     print(f"\nSaved {paths.config_path()}")
 

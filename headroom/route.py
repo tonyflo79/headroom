@@ -136,8 +136,14 @@ def scoped_window_for(fam, windows):
 CODEX_ROUTING_ENABLED = os.environ.get("HEADROOM_CODEX_ROUTING", "1") != "0"
 
 
-def block_reason(account, fam, snapshot_row, cool, now):
-    """None when the account has proven headroom; otherwise why not."""
+def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
+    """None when the account has proven headroom; otherwise why not.
+
+    `reserve` is the minimum % headroom an account must have left to route (see
+    registry.reserve_percent); None self-looks it up from config so every
+    caller honours the setting."""
+    if reserve is None:
+        reserve = registry.reserve_percent()
     if account.get("provider") == "codex" and not CODEX_ROUTING_ENABLED:
         return "Codex is dashboard-only in this release (best-effort tracking)"
     if cool is None:
@@ -199,6 +205,8 @@ def block_reason(account, fam, snapshot_row, cool, now):
             return f"{key} reading invalid"
         if percent >= 100:
             return f"{key} at 100%"
+        if reserve > 0 and percent > 100 - reserve:
+            return f"{key} below {reserve:g}% reserve ({100 - percent:g}% left)"
         if window.get("severity") == "critical" and window.get("is_active"):
             return f"{key} critical"
     # scoped weekly caps are per-MODEL (e.g. Opus); only gate on them for a
@@ -216,6 +224,9 @@ def block_reason(account, fam, snapshot_row, cool, now):
             return f"{fam} weekly cap reading invalid"
         if scoped_pct >= 100:
             return f"{fam} weekly cap at 100%"
+        if reserve > 0 and scoped_pct > 100 - reserve:
+            return (f"{fam} weekly cap below {reserve:g}% reserve "
+                    f"({100 - scoped_pct:g}% left)")
     for key in (f"{account['name']}:{fam}", f"{account['name']}:*"):
         if key not in cool:
             continue
@@ -241,13 +252,14 @@ def candidates(fam, snapshot=_UNSET):
     rows = _snapshot_accounts(snapshot)
     cool = cooldowns()
     now = time.time()
+    reserve = registry.reserve_percent()
     result = []
     for account in registry.ordered_for(fam):
         if snapshot is None:
             reason = "no fresh usage snapshot — `headroom collect` failing?"
         else:
             reason = block_reason(account, fam, rows.get(account["name"]),
-                                  cool, now)
+                                  cool, now, reserve=reserve)
         result.append((account, reason))
     return result
 

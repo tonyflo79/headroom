@@ -147,6 +147,26 @@ def ordered_for(fam, config=None):
     return [account for account in accounts(config) if account["provider"] == provider]
 
 
+def reserve_percent(config=None):
+    """Minimum % of headroom an account must have LEFT to be routable.
+
+    0 (default) = use every account down to its limit. Set e.g. 10 to skip any
+    account with under 10% left so a session starts fresh instead of hitting a
+    wall mid-task. Read from config['routing']['reserve_percent'], clamped to
+    [0, 99]. Never raises — an unreadable/absent config yields 0.0 so routing
+    degrades to the default behaviour."""
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return 0.0
+    routing = (config or {}).get("routing") or {}
+    try:
+        value = float(routing.get("reserve_percent", 0))
+    except (TypeError, ValueError):
+        return 0.0
+    return value if 0 <= value <= 99 else 0.0
+
+
 def save(config):
     validate(config)
     paths.write_json_atomic(paths.config_path(), config, mode=0o600)

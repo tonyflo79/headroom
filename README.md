@@ -42,7 +42,9 @@ headroom fixes all three problems:
 3. **Rotate** — `headroom claude` launches on the first account in your
    preference order with *proven* headroom. When a limit hits,
    `headroom rotate` (or the `/rotator` skill inside Claude Code) cools that
-   login down until its window resets and hands you the next one.
+   login down until its window resets and hands you the next one. Set a
+   **reserve** (e.g. 10%) and it skips any account already below that much
+   headroom, so a session starts fresh instead of hitting a wall mid-task.
 
 ## Quickstart
 
@@ -136,6 +138,29 @@ slots silently sharing one login is how you eat a week's quota by accident.
 See [integrations/claude-code](integrations/claude-code/) — a status line
 showing live capacity at the bottom of every session, and a `/rotator` skill
 so Claude can rotate accounts for you when a limit hits.
+
+## Keeping sessions fresh (reserve)
+
+By default headroom uses each account right down to its limit. If you'd rather
+not *start* a session on an account that's about to run out, set a reserve —
+the setup wizard asks, or add it to `~/.headroom/config.json`:
+
+```json
+{ "routing": { "reserve_percent": 10 } }
+```
+
+Now any account with less than 10% headroom left on its 5-hour, weekly, or
+model-scoped window is skipped in favour of a fuller one (and `headroom status`
+shows exactly why). `0` (the default) keeps today's use-to-the-limit behaviour.
+
+## Running across multiple machines
+
+Usage is read **per account, from the provider's side** — so it's correct no
+matter how many machines a given login is signed in on, and the reads are
+token-safe: checking your headroom never disturbs or logs out your other
+sessions. Run headroom on each machine against the logins it has, or run it on
+one box and point the others at the same dashboard. Each machine keeps its own
+cooldown ledger; there's no central coordinator to stand up.
 
 ## Hosting the dashboard somewhere else
 

@@ -172,6 +172,68 @@ class BlockReasonFailClosed(unittest.TestCase):
         self.assertIsNotNone(self.reason(row, fam="opus"))
 
 
+class ReservePercent(unittest.TestCase):
+    """`reserve_percent` skips accounts with less than N% headroom left so a
+    session starts fresh instead of hitting a wall mid-task."""
+
+    def setUp(self):
+        self.now = time.time()
+        self._orig = collect.local_binding
+        collect.local_binding = lambda provider, home: ("AAAA", "BBBB")
+
+    def tearDown(self):
+        collect.local_binding = self._orig
+
+    def reason(self, row, fam="sonnet", reserve=0.0):
+        return route.block_reason(_account(), fam, row, {}, self.now,
+                                  reserve=reserve)
+
+    def test_zero_reserve_uses_account_to_the_limit(self):
+        self.assertIsNone(self.reason(_claude_row(used5h=97), reserve=0.0))
+
+    def test_below_reserve_holds(self):
+        # 3% left < 10% reserve -> held
+        self.assertIsNotNone(self.reason(_claude_row(used5h=97), reserve=10))
+
+    def test_exactly_at_reserve_routes(self):
+        # 10% left is not < 10% reserve -> still routable
+        self.assertIsNone(self.reason(_claude_row(used5h=90), reserve=10))
+
+    def test_comfortably_above_reserve_routes(self):
+        self.assertIsNone(self.reason(_claude_row(used5h=50), reserve=10))
+
+    def test_reserve_applies_to_weekly_window(self):
+        # 5h fine, but 7d has only 5% left
+        self.assertIsNotNone(self.reason(_claude_row(used5h=10, used7d=95),
+                                         reserve=10))
+
+    def test_reserve_gates_scoped_model_cap(self):
+        row = _claude_row(used5h=10, used7d=10)
+        row["windows"]["scoped:Opus"] = {"used_percent": 95.0,
+                                         "resets_at": self.now + 8 * 86400,
+                                         "window_minutes": 10080}
+        # opus family held (5% left on its cap); generic claude unaffected
+        self.assertIsNotNone(self.reason(row, fam="opus", reserve=10))
+        self.assertIsNone(self.reason(row, fam="claude", reserve=10))
+
+
+class ReserveConfig(unittest.TestCase):
+    def cfg(self, value):
+        return {"schema_version": 1, "accounts": [
+            {"name": "a", "provider": "claude", "home": "~/.claude"}],
+            "routing": {"reserve_percent": value}}
+
+    def test_reads_and_clamps(self):
+        self.assertEqual(registry.reserve_percent(self.cfg(10)), 10.0)
+        self.assertEqual(registry.reserve_percent(self.cfg(150)), 0.0)
+        self.assertEqual(registry.reserve_percent(self.cfg("junk")), 0.0)
+
+    def test_absent_defaults_zero(self):
+        cfg = {"schema_version": 1, "accounts": [
+            {"name": "a", "provider": "claude", "home": "~/.claude"}]}
+        self.assertEqual(registry.reserve_percent(cfg), 0.0)
+
+
 class Redaction(unittest.TestCase):
     def test_redacts_email(self):
         self.assertEqual(collect.redact_email("paul@x.com"), "p***@x.com")
