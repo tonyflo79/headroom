@@ -102,12 +102,18 @@ def _dispatch(argv):
     if command in ("claude", "codex"):
         from . import route
         provider_cmd = "claude" if command == "claude" else "codex"
+        auto_flag = no_auto_flag = False
+        if command == "claude":
+            from . import supervisor
+            args, auto_flag, no_auto_flag = \
+                supervisor.strip_headroom_overrides(args)
         # honour an explicit model flag (both `--model X` and `--model=X`) so a
         # scoped weekly cap (e.g. Opus) gates the routing decision
         model = None
-        for index, arg in enumerate(args):
-            if arg == "--model" and index + 1 < len(args):
-                model = args[index + 1]
+        option_args = args[:args.index("--")] if "--" in args else args
+        for index, arg in enumerate(option_args):
+            if arg == "--model" and index + 1 < len(option_args):
+                model = option_args[index + 1]
             elif arg.startswith("--model="):
                 model = arg.split("=", 1)[1]
         fam = registry.family(model) if model else provider_cmd
@@ -117,15 +123,10 @@ def _dispatch(argv):
                   f"`headroom {registry.family_provider(fam)}`", file=sys.stderr)
             return 2
         if command == "claude":
-            from . import supervisor
-            auto_flag = "--headroom-auto-handoff" in args
-            no_auto_flag = "--headroom-no-auto-handoff" in args
             if auto_flag and no_auto_flag:
                 print("headroom: auto-handoff overrides are mutually exclusive",
                       file=sys.stderr)
                 return 2
-            args = [arg for arg in args if arg not in (
-                "--headroom-auto-handoff", "--headroom-no-auto-handoff")]
             configured = registry.auto_handoff()
             enabled = auto_flag or (configured and not no_auto_flag)
             if enabled:

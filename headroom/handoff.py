@@ -48,9 +48,13 @@ class HandoffPlan:
     target: dict
     snapshot: dict
     cap_proof: dict
+    cooldown_scope: dict
     cwd: str
     inspected: dict
     destination: str
+    source_stat: tuple
+    target_identity: dict
+    target_home_stat: tuple
     automatic: bool = False
     child_generation: int = 0
     force: bool = False
@@ -304,14 +308,14 @@ def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
     return _source(path, session_id, [account])
 
 
-def guard_source_stable(path, now=None, sleep=None):
+def guard_source_stable(path, now=None, sleep=None, quiet_seconds=5.0):
     """Require five quiet seconds and a stable follow-up stat."""
     try:
         first = os.stat(path)
     except OSError as error:
         raise HandoffError(f"cannot stat source transcript: {error}") from error
     now = time.time() if now is None else now
-    if now - first.st_mtime < 5:
+    if now - first.st_mtime < quiet_seconds:
         raise HandoffError(
             "source transcript changed recently — /exit the session first, "
             "wait 5 seconds, then hand off")
@@ -427,6 +431,10 @@ def resolve_model_family(source, override=None):
         raise HandoffError(str(error) + "; pass --model FAMILY") from error
     if registry.family_provider(family) != "claude":
         raise HandoffError("handoff requires a Claude model family")
+    if family == "claude":
+        raise HandoffError(
+            "handoff requires a scoped Claude family such as sonnet, opus, "
+            "haiku, or fable; pass --model FAMILY")
     return family
 
 
@@ -511,13 +519,47 @@ def guard_not_duplicate(session_id, digest, force=False):
             "re-run with --force and a different --to to create a second fork")
 
 
+def _transcript_stat(path):
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise HandoffError(f"cannot stat source transcript: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise HandoffError("source transcript is not a regular file")
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+            metadata.st_mtime_ns)
+
+
+def _target_snapshot_identity(snapshot, target):
+    row = _snapshot_rows(snapshot).get(target.get("name"))
+    identity = row.get("identity") if isinstance(row, dict) else None
+    if not isinstance(identity, dict):
+        raise HandoffError("target snapshot has no bound identity — recollect")
+    fingerprint = identity.get("account_fingerprint")
+    digest = identity.get("credential_digest")
+    if not isinstance(fingerprint, str) or not fingerprint \
+            or not isinstance(digest, str) or not digest:
+        raise HandoffError("target snapshot has no credential binding — recollect")
+    return {"account_fingerprint": fingerprint, "credential_digest": digest}
+
+
+def _target_home_stat(target):
+    home = registry.expand(target["home"])
+    try:
+        metadata = os.stat(home, follow_symlinks=False)
+    except OSError as error:
+        raise HandoffError(f"cannot stat target home: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise HandoffError("target home is not a real directory")
+    return (metadata.st_dev, metadata.st_ino)
+
+
 def plan_handoff(source, family, target, snapshot, cap_proof, cwd, *,
+                 cooldown_scope=None,
                  automatic=False, child_generation=0, force=False,
                  require_executable=True):
     """Build a complete, non-mutating handoff plan."""
     family = resolve_model_family(source, family)
-    if automatic and family == "claude":
-        raise HandoffError("automatic handoff requires the actual model family")
     if target.get("provider") != "claude":
         raise HandoffError("handoff target must be a Claude account")
     source = _source(source.transcript_path, source.session_id, [source.account],
@@ -529,15 +571,20 @@ def plan_handoff(source, family, target, snapshot, cap_proof, cwd, *,
         raise HandoffError("`claude` not found on PATH")
     destination = _preflight_destination(target, source.transcript_path,
                                          source.session_id)
-    allow_dangling = automatic or bool(cap_proof) or force
     inspected = inspect_transcript(source.transcript_path,
-                                   allow_dangling=allow_dangling)
+                                   allow_dangling=(force or (
+                                       automatic
+                                       and cap_proof.get("authenticated") is True)))
     guard_not_duplicate(source.session_id, inspected["sha256"], force)
     return HandoffPlan(
         handoff_id=str(uuid.uuid4()), source=source, family=family,
         target=dict(target), snapshot=snapshot or {},
-        cap_proof=dict(cap_proof or {}), cwd=cwd, inspected=inspected,
-        destination=destination, automatic=bool(automatic),
+        cap_proof=dict(cap_proof or {}),
+        cooldown_scope=dict(cooldown_scope or {}), cwd=cwd,
+        inspected=inspected, destination=destination,
+        source_stat=_transcript_stat(source.transcript_path),
+        target_identity=_target_snapshot_identity(snapshot, target),
+        target_home_stat=_target_home_stat(target), automatic=bool(automatic),
         child_generation=int(child_generation or 0), force=bool(force))
 
 
@@ -548,6 +595,7 @@ def _handoff_lock():
     try:
         os.chmod(handle.name, 0o600)
         fcntl.flock(handle, fcntl.LOCK_EX)
+        _reconcile_incomplete_unlocked()
         yield
     finally:
         fcntl.flock(handle, fcntl.LOCK_UN)
@@ -563,24 +611,271 @@ def _fsync_directory(directory):
         os.close(descriptor)
 
 
+_DIR_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+              | getattr(os, "O_NOFOLLOW", 0))
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_RECOVERY_SCHEMA = "headroom_handoff_recovery@1"
+_AUTOMATIC_ACTIONS = {"cap_confirmed", "stop_sent", "stopped", "staged",
+                      "resume_spawned", "resume_bound", "failure"}
+TARGET_RESERVATION_SECONDS = 5 * 60.0
+
+
+def _mkdir_open(parent_fd, name, create):
+    if not name or name in (".", "..") or os.sep in name:
+        raise HandoffError("target directory component is invalid")
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    try:
+        descriptor = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise HandoffError("target directory changed or is unsafe") from error
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise HandoffError("target path is not a directory")
+    return descriptor
+
+
+@contextlib.contextmanager
+def _target_dir_fd(home, slug, expected_home_stat, create):
+    descriptors = []
+    try:
+        home_fd = os.open(home, _DIR_FLAGS)
+        descriptors.append(home_fd)
+        metadata = os.fstat(home_fd)
+        if (metadata.st_dev, metadata.st_ino) != tuple(expected_home_stat):
+            raise HandoffError("target home changed since planning")
+        projects_fd = _mkdir_open(home_fd, "projects", create)
+        descriptors.append(projects_fd)
+        target_fd = _mkdir_open(projects_fd, slug, create)
+        descriptors.append(target_fd)
+        yield target_fd
+    except HandoffError:
+        raise
+    except OSError as error:
+        raise HandoffError(f"cannot open verified target directory: {error}") \
+            from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _recovery_dir():
+    return os.path.join(paths.state_dir(), "handoff-recovery")
+
+
+def _marker_path(handoff_id):
+    return os.path.join(_recovery_dir(), handoff_id + ".json")
+
+
+def _write_marker_unlocked(plan, slug, temporary, destination):
+    directory = paths.ensure_private(_recovery_dir())
+    marker = {
+        "schema": _RECOVERY_SCHEMA, "handoff_id": plan.handoff_id,
+        "target_home": registry.expand(plan.target["home"]),
+        "target_home_stat": list(plan.target_home_stat), "slug": slug,
+        "temporary": temporary, "destination": destination,
+        "transcript_sha256": plan.inspected["sha256"],
+    }
+    paths.write_json_atomic(_marker_path(plan.handoff_id), marker, mode=0o600)
+    _fsync_directory(directory)
+    return marker
+
+
+def _read_marker(path):
+    try:
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError
+        descriptor = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            marker = json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise HandoffError("handoff recovery marker is unreadable") from error
+    required_strings = ("handoff_id", "target_home", "slug", "temporary",
+                        "destination", "transcript_sha256")
+    home_stat = marker.get("target_home_stat") if isinstance(marker, dict) else None
+    if (not isinstance(marker, dict) or marker.get("schema") != _RECOVERY_SCHEMA
+            or any(not isinstance(marker.get(key), str) or not marker[key]
+                   for key in required_strings)
+            or not isinstance(home_stat, list) or len(home_stat) != 2
+            or any(not isinstance(value, int) or isinstance(value, bool)
+                   for value in home_stat)
+            or not _valid_uuid(marker.get("handoff_id"))
+            or any(value in (".", "..") or os.sep in value
+                   for value in (marker.get("slug", ""),
+                                 marker.get("temporary", ""),
+                                 marker.get("destination", "")))):
+        raise HandoffError("handoff recovery marker is malformed")
+    return marker
+
+
+def _name_stat(directory_fd, name):
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _finish_marker_unlocked(marker, committed):
+    with _target_dir_fd(marker["target_home"], marker["slug"],
+                        marker["target_home_stat"], create=False) as directory_fd:
+        temporary = _name_stat(directory_fd, marker["temporary"])
+        destination = _name_stat(directory_fd, marker["destination"])
+        if committed:
+            if destination is None or not stat.S_ISREG(destination.st_mode):
+                raise HandoffError("committed handoff destination is missing")
+            if temporary is not None and (destination.st_dev, destination.st_ino) \
+                    != (temporary.st_dev, temporary.st_ino):
+                raise HandoffError("committed handoff marker does not match destination")
+        elif destination is not None:
+            if temporary is None or (destination.st_dev, destination.st_ino) != (
+                    temporary.st_dev, temporary.st_ino):
+                raise HandoffError(
+                    "incomplete handoff destination cannot be safely reconciled")
+            os.unlink(marker["destination"], dir_fd=directory_fd)
+        if temporary is not None:
+            os.unlink(marker["temporary"], dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    os.unlink(_marker_path(marker["handoff_id"]))
+    _fsync_directory(_recovery_dir())
+
+
+def _reconcile_incomplete_unlocked():
+    directory = _recovery_dir()
+    if not os.path.exists(directory):
+        return
+    try:
+        entries = list(os.scandir(directory))
+    except OSError as error:
+        raise HandoffError("handoff recovery directory is unreadable") from error
+    markers = []
+    for entry in entries:
+        if not entry.name.endswith(".json"):
+            raise HandoffError("handoff recovery directory contains unknown state")
+        marker = _read_marker(entry.path)
+        if entry.name != marker["handoff_id"] + ".json":
+            raise HandoffError("handoff recovery marker name is malformed")
+        markers.append(marker)
+    rows = _recovery_ledger_rows(bool(markers))
+    staged = {row.get("handoff_id") for row in rows
+              if row.get("action") == "staged"
+              and isinstance(row.get("handoff_id"), str)}
+    for marker in markers:
+        _finish_marker_unlocked(marker, marker["handoff_id"] in staged)
+
+
+def _recovery_ledger_rows(has_markers):
+    ledger = _ledger_path()
+    if not os.path.exists(ledger):
+        return []
+    try:
+        with open(ledger, "rb") as handle:
+            data = handle.read()
+    except OSError as error:
+        raise HandoffError("handoff ledger is unreadable") from error
+    if not data or data.endswith(b"\n"):
+        return _read_jsonl(ledger, "handoff ledger")
+    if not has_markers:
+        raise HandoffError(f"handoff ledger is unreadable — inspect {ledger}")
+    complete = data.rpartition(b"\n")[0]
+    complete = complete + b"\n" if complete else b""
+    try:
+        for line in complete.splitlines():
+            row = json.loads(line.decode("utf-8"))
+            if not isinstance(row, dict):
+                raise ValueError
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise HandoffError(f"handoff ledger is unreadable — inspect {ledger}") \
+            from error
+    descriptor = os.open(ledger, os.O_WRONLY | _NOFOLLOW)
+    try:
+        os.ftruncate(descriptor, len(complete))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return _read_jsonl(ledger, "handoff ledger")
+
+
+def _copy_publish_pending(plan):
+    slug = os.path.basename(os.path.dirname(plan.source.transcript_path))
+    temporary = ".handoff-" + plan.handoff_id + ".tmp"
+    destination = plan.source.session_id + ".jsonl"
+    with _target_dir_fd(registry.expand(plan.target["home"]), slug,
+                        plan.target_home_stat, create=True):
+        pass
+    marker = _write_marker_unlocked(plan, slug, temporary, destination)
+    published = False
+    try:
+        with _target_dir_fd(marker["target_home"], slug, plan.target_home_stat,
+                            create=True) as directory_fd:
+            source_fd = os.open(plan.source.transcript_path,
+                                os.O_RDONLY | _NOFOLLOW)
+            target_fd = None
+            try:
+                source_stat = os.fstat(source_fd)
+                if (source_stat.st_dev, source_stat.st_ino) \
+                        != tuple(plan.source_stat[:2]):
+                    raise HandoffError("source transcript changed before copy")
+                target_fd = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                    0o600, dir_fd=directory_fd)
+                digest = hashlib.sha256()
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(target_fd, view)
+                        if written <= 0:
+                            raise HandoffError("target transcript write was incomplete")
+                        view = view[written:]
+                os.fsync(target_fd)
+                if digest.hexdigest() != plan.inspected["sha256"]:
+                    raise HandoffError("source changed during copy — handoff aborted")
+            finally:
+                os.close(source_fd)
+                if target_fd is not None:
+                    os.close(target_fd)
+            try:
+                os.link(temporary, destination, src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd, follow_symlinks=False)
+            except FileExistsError as error:
+                raise HandoffError(
+                    "target already has this session id; --force does not overwrite "
+                    "destination collisions — inspect the previous partial handoff") \
+                    from error
+            published = True
+            os.fsync(directory_fd)
+        return marker
+    except Exception:
+        if not published:
+            try:
+                _finish_marker_unlocked(marker, committed=False)
+            except (HandoffError, OSError):
+                pass
+        raise
+
+
 def _stage_transcript(source, destination, expected_sha256):
     if os.path.islink(source):
         raise HandoffError("source transcript is a symlink — refusing to copy")
     directory = os.path.dirname(destination)
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    os.chmod(directory, 0o700)
+    if os.path.islink(directory):
+        raise HandoffError("target session directory is not a real directory")
     descriptor, temporary = tempfile.mkstemp(prefix=".handoff-", suffix=".tmp",
                                               dir=directory)
-    published = False
     try:
         os.fchmod(descriptor, 0o600)
         digest = hashlib.sha256()
         with open(source, "rb") as incoming, os.fdopen(descriptor, "wb") as outgoing:
             descriptor = None
-            while True:
-                chunk = incoming.read(1024 * 1024)
-                if not chunk:
-                    break
+            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
                 digest.update(chunk)
                 outgoing.write(chunk)
             outgoing.flush()
@@ -588,22 +883,13 @@ def _stage_transcript(source, destination, expected_sha256):
         if digest.hexdigest() != expected_sha256:
             raise HandoffError("source changed during copy — handoff aborted")
         try:
-            os.link(temporary, destination)
+            os.link(temporary, destination, follow_symlinks=False)
         except FileExistsError as error:
             raise HandoffError(
                 "target already has this session id; --force does not overwrite "
                 "destination collisions — inspect the previous partial handoff") \
                 from error
-        published = True
         _fsync_directory(directory)
-    except Exception:
-        if published:
-            try:
-                os.unlink(destination)
-                _fsync_directory(directory)
-            except OSError:
-                pass
-        raise
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -611,8 +897,6 @@ def _stage_transcript(source, destination, expected_sha256):
             os.unlink(temporary)
         except FileNotFoundError:
             pass
-    if not published:
-        raise HandoffError("could not publish transcript")
 
 
 def stage_transcript(source, destination, expected_sha256):
@@ -662,6 +946,122 @@ def append_action(handoff_id, action, *, automatic=False, **fields):
     return record
 
 
+def _validated_automatic_rows(rows):
+    for row in rows:
+        safety_relevant = ("automatic" in row or row.get("action") \
+                           == "cap_confirmed")
+        if not safety_relevant:
+            continue
+        if (not isinstance(row.get("automatic"), bool)
+                or row.get("action") not in _AUTOMATIC_ACTIONS
+                or not _number(row.get("ts"))
+                or not isinstance(row.get("handoff_id"), str)
+                or not _valid_uuid(row.get("handoff_id"))):
+            raise HandoffError(
+                "handoff ledger has malformed automatic safety state — inspect "
+                + _ledger_path())
+    return rows
+
+
+def _verify_target_unlocked(plan, now=None):
+    current = collect.local_binding(plan.target["provider"], plan.target["home"])
+    expected = (plan.target_identity["account_fingerprint"],
+                plan.target_identity["credential_digest"])
+    if current != expected:
+        raise HandoffError("target identity or credential changed since planning")
+    cool = route.preflight_cooldowns()
+    row = _snapshot_rows(plan.snapshot).get(plan.target["name"])
+    reason = route.block_reason(plan.target, plan.family, row, cool,
+                                time.time() if now is None else now)
+    if reason is not None:
+        raise HandoffError(
+            f"target {plan.target['name']} no longer has proven headroom: {reason}")
+
+
+def _active_reservation(rows, plan, now):
+    released = {row.get("handoff_id") for row in rows
+                if row.get("action") in ("failure", "resume_spawned")}
+    for row in rows:
+        if (row.get("handoff_id") == plan.handoff_id
+                and row.get("action") == "cap_confirmed"
+                and row.get("target_slot") == plan.target["name"]
+                and row.get("handoff_id") not in released):
+            until = row.get("reservation_until")
+            until = until if _number(until) else \
+                row["ts"] + TARGET_RESERVATION_SECONDS
+            if until > now:
+                return row
+    return None
+
+
+def reserve_automatic(plan, now=None, *, loop_window=600.0, loop_max=3):
+    """Atomically admit one automatic cap and reserve its exact target."""
+    if not plan.automatic:
+        raise HandoffError("only automatic handoffs may reserve a target")
+    now = time.time() if now is None else float(now)
+    try:
+        with _handoff_lock():
+            rows = _validated_automatic_rows(
+                _read_jsonl(_ledger_path(), "handoff ledger"))
+            cutoff = now - loop_window
+            confirmed = [row for row in rows
+                         if row.get("automatic") is True
+                         and row.get("action") == "cap_confirmed"
+                         and row["ts"] >= cutoff]
+            if len(confirmed) >= loop_max:
+                raise HandoffError(
+                    "automatic handoff loop guard: 3 handoffs in 10 minutes")
+            released = {row.get("handoff_id") for row in rows
+                        if row.get("action") in ("failure", "resume_spawned")}
+            for row in confirmed:
+                until = row.get("reservation_until")
+                until = until if _number(until) else \
+                    row["ts"] + TARGET_RESERVATION_SECONDS
+                if (row.get("target_slot") == plan.target["name"]
+                        and row.get("handoff_id") not in released
+                        and until > now):
+                    raise HandoffError(
+                        f"target {plan.target['name']} is reserved by another "
+                        "automatic handoff")
+            _verify_target_unlocked(plan, now)
+            record = {
+                "schema": SCHEMA, "ts": now, "handoff_id": plan.handoff_id,
+                "action": "cap_confirmed", "automatic": True,
+                "source_slot": plan.source.account["name"],
+                "target_slot": plan.target["name"],
+                "old_session_id": plan.source.session_id,
+                "actual_model_family": plan.family,
+                "cap_scope": plan.cooldown_scope.get("key"),
+                "cap_used_percent": plan.cooldown_scope.get("used_percent"),
+                "cap_reset": plan.cooldown_scope.get("reset"),
+                "transcript_sha256": plan.inspected["sha256"],
+                "child_generation": plan.child_generation,
+                "reservation_until": now + TARGET_RESERVATION_SECONDS,
+            }
+            _append_ledger_unlocked(record)
+            return record
+    except HandoffError:
+        raise
+    except (OSError, RuntimeError, registry.RegistryError, ValueError) as error:
+        raise HandoffError(f"could not reserve automatic handoff: {error}") \
+            from error
+
+
+def verify_automatic_reservation(plan):
+    try:
+        with _handoff_lock():
+            rows = _validated_automatic_rows(
+                _read_jsonl(_ledger_path(), "handoff ledger"))
+            if _active_reservation(rows, plan, time.time()) is None:
+                raise HandoffError("automatic target reservation is missing")
+            _verify_target_unlocked(plan)
+    except HandoffError:
+        raise
+    except (OSError, RuntimeError, registry.RegistryError, ValueError) as error:
+        raise HandoffError(f"could not verify automatic reservation: {error}") \
+            from error
+
+
 def _snapshot_rows(snapshot):
     return {row.get("name"): row for row in (snapshot or {}).get("accounts", [])
             if isinstance(row, dict) and row.get("name")}
@@ -681,20 +1081,25 @@ def commit_handoff(plan):
     """Cool, no-clobber publish, and ledger one handoff under one lock."""
     try:
         with _handoff_lock():
+            rows = _validated_automatic_rows(
+                _read_jsonl(_ledger_path(), "handoff ledger"))
+            if plan.automatic and _active_reservation(
+                    rows, plan, time.time()) is None:
+                raise HandoffError("automatic target reservation is missing")
+            _verify_target_unlocked(plan)
             guard_not_duplicate(plan.source.session_id,
                                 plan.inspected["sha256"], plan.force)
             if os.path.lexists(plan.destination):
                 raise HandoffError(
                     "target already has this session id; --force does not overwrite "
                     "destination collisions — inspect the previous partial handoff")
-            scope = plan.cap_proof
+            scope = plan.cooldown_scope
             if scope:
                 route.mark(
                     plan.source.account["name"], plan.family, scope.get("reset"),
                     account_wide=bool(scope.get("account_wide")),
                     window="5h" if scope.get("window") == "5h" else "7d")
-            stage_transcript(plan.source.transcript_path, plan.destination,
-                             plan.inspected["sha256"])
+            marker = _copy_publish_pending(plan)
             rows = _snapshot_rows(plan.snapshot)
             source_row = rows.get(plan.source.account["name"], {})
             source_email = (source_row.get("email")
@@ -726,13 +1131,13 @@ def commit_handoff(plan):
             try:
                 _append_ledger_unlocked(record)
             except Exception:
-                os.unlink(plan.destination)
-                _fsync_directory(os.path.dirname(plan.destination))
+                _finish_marker_unlocked(marker, committed=False)
                 raise
+            _finish_marker_unlocked(marker, committed=True)
             return HandoffResult(plan, plan.destination, record)
     except HandoffError:
         raise
-    except OSError as error:
+    except (OSError, RuntimeError, registry.RegistryError, ValueError) as error:
         raise HandoffError(f"could not commit handoff: {error}") from error
 
 
@@ -783,7 +1188,7 @@ def cmd_handoff(args):
         accounts = registry.accounts()
         source = resolve_source(options["session"], accounts, cwd)
         family = resolve_model_family(source, options["model"])
-        snapshot = route.ensure_fresh_snapshot()
+        snapshot = route.ensure_fresh_snapshot(max_age=0)
         if snapshot is None:
             raise HandoffError("no fresh usage snapshot — handoff held")
         target = select_target(source.account["name"], snapshot, family,
@@ -791,8 +1196,9 @@ def cmd_handoff(args):
         guard_source_stable(source.transcript_path)
         scope = route.cap_scope(snapshot, source.account["name"], family,
                                 "usage limit reached")
-        plan = plan_handoff(source, family, target, snapshot, scope, cwd,
-                            force=options["force"])
+        plan = plan_handoff(
+            source, family, target, snapshot, {}, cwd, cooldown_scope=scope,
+            force=options["force"])
         rows = _snapshot_rows(snapshot)
         source_email = (rows.get(source.account["name"], {}).get("email")
                         or source.account.get("expected_email") or "")
@@ -809,6 +1215,24 @@ def cmd_handoff(args):
             if answer not in ("y", "yes"):
                 print("handoff cancelled; nothing copied or cooled")
                 return 0
+            refreshed = route.ensure_fresh_snapshot(max_age=0)
+            if refreshed is None:
+                raise HandoffError("post-confirmation collect failed — handoff held")
+            refreshed_target = select_target(
+                source.account["name"], refreshed, family, target["name"])
+            refreshed_identity = _target_snapshot_identity(
+                refreshed, refreshed_target)
+            if refreshed_identity != plan.target_identity:
+                raise HandoffError(
+                    "target identity or credential changed during confirmation")
+            guard_source_stable(source.transcript_path)
+            refreshed_scope = route.cap_scope(
+                refreshed, source.account["name"], family,
+                "usage limit reached")
+            plan = plan_handoff(
+                source, family, refreshed_target, refreshed, {}, cwd,
+                cooldown_scope=refreshed_scope, force=options["force"])
+            target = refreshed_target
         result = commit_handoff(plan)
         _print_baton(result.record, plan.inspected["unresolved_tool_ids"])
         if options["print"]:

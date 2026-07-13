@@ -29,8 +29,9 @@ an unresolved `tool_use`: Claude re-drives the dangling call and reaches a
 usable prompt. Automatic handoff therefore copies the capped transcript
 byte-for-byte and prints `the interrupted tool call may re-run on resume`.
 If the interrupted tool had an external side effect, that side effect may run
-twice. Manual handoff of a source that is not shown capped still refuses a
-dangling call unless `--force` is explicit.
+twice. All manual handoffs require `--force` for a dangling call: a 99–100%
+usage snapshot alone is not an authenticated cap event and does not relax this
+guard.
 
 ## Handoff carries conversation state, not process state
 
@@ -40,6 +41,14 @@ connections, pending MCP or permission approvals, permission mode, extra
 directories, IDE state, and other ephemeral launch flags are not migrated.
 The local session and handoff JSONL journals are append-only and unbounded in
 v0.2; protect the private state directory and compact them manually if needed.
+
+Per-run injected settings files and the supervisor event journal are removed
+best-effort when the supervisor exits cleanly. A hard crash, `SIGKILL`, power
+loss, or filesystem error can leave those private files under
+`state/supervisors/`; they contain hook metadata but no credentials and may be
+deleted once no matching supervisor is running. Handoff publication recovery
+markers are different: headroom reconciles those under the global handoff lock
+on the next handoff operation.
 
 ## Claude usage binding is trust-on-first-use
 

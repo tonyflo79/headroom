@@ -1,5 +1,6 @@
 """v0.2 transactional handoff and resident supervisor tests."""
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -18,7 +19,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
-    __main__, collect, handoff, registry, route, statusline, supervisor,
+    __main__, collect, handoff, paths, registry, route, statusline, supervisor,
 )
 
 
@@ -51,6 +52,14 @@ def commit_worker(plan, queue):
         queue.put(("error", str(error)))
 
 
+def reserve_worker(plan, now, queue):
+    try:
+        handoff.reserve_automatic(plan, now)
+        queue.put(("ok", plan.handoff_id))
+    except Exception as error:  # noqa: BLE001 — child reports exact refusal
+        queue.put(("error", str(error)))
+
+
 class ConfigAndScope(unittest.TestCase):
     def test_auto_handoff_is_strict_opt_in(self):
         base = {"schema_version": 1, "accounts": [
@@ -71,6 +80,9 @@ class ConfigAndScope(unittest.TestCase):
         source = handoff.SourceSession("x", "/tmp/x", {}, "mystery")
         with self.assertRaises(handoff.HandoffError):
             handoff.resolve_model_family(source)
+        generic = handoff.SourceSession("x", "/tmp/x", {}, "claude")
+        with self.assertRaisesRegex(handoff.HandoffError, "scoped Claude family"):
+            handoff.resolve_model_family(generic, "claude")
 
     def test_exact_5h_7d_and_scoped_cap_scope(self):
         now = int(time.time())
@@ -97,6 +109,46 @@ class ConfigAndScope(unittest.TestCase):
             self.assertEqual(route.cooldowns()["a:sonnet"], later)
 
 
+class RealCollectorBinding(unittest.TestCase):
+    def test_real_local_identity_and_collect_lock_fixture(self):
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {"HEADROOM_DIR": root}):
+            home = os.path.join(root, "claude-home")
+            os.makedirs(home)
+            with open(os.path.join(home, ".claude.json"), "w") as out:
+                json.dump({"oauthAccount": {
+                    "emailAddress": "seat@example.test",
+                    "organizationUuid": "fixture-org"}}, out)
+            with open(os.path.join(home, ".credentials.json"), "w") as out:
+                json.dump({"claudeAiOauth": {
+                    "accessToken": "fixture-token",
+                    "subscriptionType": "max"}}, out)
+            account = {"name": "seat", "provider": "claude", "home": home}
+            registry.save({"schema_version": 1, "accounts": [account]})
+            now = int(time.time())
+            limits = {
+                "source": "fixture", "captured_at": now, "stale": False,
+                "source_identity_fingerprint": collect.fingerprint("fixture-org"),
+                "windows": {
+                    "5h": {"used_percent": 10, "resets_at": now + 3600},
+                    "7d": {"used_percent": 20, "resets_at": now + 86400},
+                },
+            }
+            with mock.patch.object(collect, "claude_bin", return_value=None), \
+                    mock.patch.object(collect, "claude_limits",
+                                      return_value=limits):
+                snapshot = collect.run_collect(quiet=True)
+                expected = collect.local_binding("claude", home)
+                identity = snapshot["accounts"][0]["identity"]
+                self.assertEqual((identity["account_fingerprint"],
+                                  identity["credential_digest"]), expected)
+                with open(paths.collect_lock_path(), "w") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked_snapshot = collect.run_collect(quiet=True)
+                    fcntl.flock(held, fcntl.LOCK_UN)
+                self.assertEqual(locked_snapshot["run_id"], snapshot["run_id"])
+
+
 class TranscriptAndTransaction(unittest.TestCase):
     SID = "11111111-1111-4111-8111-111111111111"
 
@@ -117,10 +169,22 @@ class TranscriptAndTransaction(unittest.TestCase):
                                "home": self.source_home}
         self.target_account = {"name": "target", "provider": "claude",
                                "home": self.target_home}
+        self.binding = mock.patch.object(
+            collect, "local_binding", return_value=("AAAA", "BBBB"))
+        self.local_binding = self.binding.start()
+        registry.save({"schema_version": 1,
+                       "accounts": [self.source_account, self.target_account]})
 
     def tearDown(self):
+        self.binding.stop()
         self.env.stop()
         self.temp.cleanup()
+
+    def snapshot(self):
+        now = int(time.time())
+        return {"generated": now, "accounts": [
+            usage_row("source", captured=now),
+            usage_row("target", captured=now)]}
 
     def write(self, events):
         with open(self.transcript, "w", encoding="utf-8") as out:
@@ -170,7 +234,7 @@ class TranscriptAndTransaction(unittest.TestCase):
         source = handoff.SourceSession(
             self.SID, self.transcript, self.source_account, "Sonnet")
         plan = handoff.plan_handoff(
-            source, "sonnet", self.target_account, {"accounts": []}, None,
+            source, "sonnet", self.target_account, self.snapshot(), None,
             self.cwd, require_executable=False)
         context = multiprocessing.get_context("fork")
         queue = context.Queue()
@@ -188,7 +252,7 @@ class TranscriptAndTransaction(unittest.TestCase):
         with open(destination, "rb") as copied, open(self.transcript, "rb") as source_f:
             self.assertEqual(copied.read(), source_f.read())
 
-    def test_manual_dangling_requires_force_unless_source_is_capped(self):
+    def test_manual_dangling_requires_force_even_when_snapshot_is_capped(self):
         self.write([{"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "danger", "name": "Write"}]}}])
         source = handoff.SourceSession(
@@ -198,15 +262,115 @@ class TranscriptAndTransaction(unittest.TestCase):
                 source, "sonnet", self.target_account, {"accounts": []}, None,
                 self.cwd, require_executable=False)
         forced = handoff.plan_handoff(
-            source, "sonnet", self.target_account, {"accounts": []}, None,
+            source, "sonnet", self.target_account, self.snapshot(), None,
             self.cwd, force=True, require_executable=False)
         self.assertEqual(forced.inspected["unresolved_tool_ids"], ("danger",))
-        capped = handoff.plan_handoff(
-            source, "sonnet", self.target_account, {"accounts": []},
-            {"key": "source:*", "account_wide": True, "window": "5h",
-             "used_percent": 100, "reset": time.time() + 3600},
-            self.cwd, require_executable=False)
-        self.assertEqual(capped.inspected["unresolved_tool_ids"], ("danger",))
+        scope = {"key": "source:*", "account_wide": True, "window": "5h",
+                 "used_percent": 100, "reset": time.time() + 3600}
+        with self.assertRaisesRegex(handoff.HandoffError, "mid-tool-call"):
+            handoff.plan_handoff(
+                source, "sonnet", self.target_account, self.snapshot(), {},
+                self.cwd, cooldown_scope=scope, require_executable=False)
+        automatic = handoff.plan_handoff(
+            source, "sonnet", self.target_account, self.snapshot(),
+            {"authenticated": True}, self.cwd, cooldown_scope=scope,
+            automatic=True, require_executable=False)
+        self.assertEqual(automatic.inspected["unresolved_tool_ids"], ("danger",))
+
+    def automatic_plan(self):
+        self.write([{"type": "user", "message": {"content": []}}])
+        snapshot = self.snapshot()
+        snapshot["accounts"][0]["windows"]["5h"]["used_percent"] = 100
+        source = handoff.SourceSession(
+            self.SID, self.transcript, self.source_account, "Sonnet")
+        scope = {"key": "source:*", "account_wide": True, "window": "5h",
+                 "used_percent": 100, "reset": time.time() + 3600}
+        return handoff.plan_handoff(
+            source, "sonnet", self.target_account, snapshot,
+            {"authenticated": True}, self.cwd, cooldown_scope=scope,
+            automatic=True, require_executable=False)
+
+    def test_loop_guard_count_and_admission_are_atomic(self):
+        now = time.time()
+        for _ in range(2):
+            handoff.append_action(
+                str(__import__("uuid").uuid4()), "cap_confirmed",
+                automatic=True, source_slot="source", target_slot="old",
+                old_session_id=self.SID)
+        plans = [self.automatic_plan(), self.automatic_plan()]
+        context = multiprocessing.get_context("fork")
+        queue = context.Queue()
+        workers = [context.Process(
+            target=reserve_worker, args=(plan, now, queue)) for plan in plans]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(5)
+            self.assertEqual(worker.exitcode, 0)
+        outcomes = [queue.get(timeout=1) for _ in workers]
+        self.assertEqual(sum(outcome[0] == "ok" for outcome in outcomes), 1)
+        self.assertIn("loop guard", next(
+            outcome[1] for outcome in outcomes if outcome[0] == "error"))
+
+    def test_malformed_automatic_ledger_row_holds_admission(self):
+        handoff.append_ledger({
+            "ts": "recent", "handoff_id": str(__import__("uuid").uuid4()),
+            "automatic": "yes", "action": "cap_confirmed"})
+        with self.assertRaisesRegex(handoff.HandoffError, "malformed"):
+            handoff.reserve_automatic(self.automatic_plan())
+
+    def test_target_credential_change_or_cooldown_blocks_commit(self):
+        plan = self.automatic_plan()
+        handoff.reserve_automatic(plan)
+        self.local_binding.return_value = ("AAAA", "CHANGED")
+        with self.assertRaisesRegex(handoff.HandoffError, "identity or credential"):
+            handoff.commit_handoff(plan)
+        self.local_binding.return_value = ("AAAA", "BBBB")
+        route.mark("target", "sonnet", time.time() + 3600)
+        with self.assertRaisesRegex(handoff.HandoffError, "no longer"):
+            handoff.commit_handoff(plan)
+
+    def test_incomplete_publication_is_reconciled_on_next_lock(self):
+        plan = self.automatic_plan()
+        with handoff._handoff_lock():
+            marker = handoff._copy_publish_pending(plan)
+        self.assertTrue(os.path.exists(plan.destination))
+        self.assertTrue(os.path.exists(handoff._marker_path(plan.handoff_id)))
+        with open(handoff._ledger_path(), "wb") as ledger:
+            ledger.write(b'{"schema":')
+            ledger.flush()
+            os.fsync(ledger.fileno())
+        handoff.append_ledger({"session_id": "reconcile-sentinel"})
+        self.assertFalse(os.path.exists(plan.destination))
+        self.assertFalse(os.path.exists(handoff._marker_path(plan.handoff_id)))
+        self.assertFalse(os.path.exists(os.path.join(
+            os.path.dirname(plan.destination), marker["temporary"])))
+
+    def test_durable_publication_marker_finishes_without_rollback(self):
+        plan = self.automatic_plan()
+        with handoff._handoff_lock():
+            marker = handoff._copy_publish_pending(plan)
+            handoff._append_ledger_unlocked({
+                "handoff_id": plan.handoff_id, "action": "staged",
+                "ts": time.time()})
+        handoff.append_ledger({"session_id": "reconcile-sentinel"})
+        self.assertTrue(os.path.exists(plan.destination))
+        self.assertFalse(os.path.exists(handoff._marker_path(plan.handoff_id)))
+        self.assertFalse(os.path.exists(os.path.join(
+            os.path.dirname(plan.destination), marker["temporary"])))
+
+    def test_target_directory_swap_cannot_redirect_publication(self):
+        plan = self.automatic_plan()
+        handoff.reserve_automatic(plan)
+        outside = os.path.join(self.temp.name, "outside")
+        original = self.target_home + "-original"
+        os.makedirs(outside)
+        os.rename(self.target_home, original)
+        os.symlink(outside, self.target_home)
+        with self.assertRaisesRegex(handoff.HandoffError, "unsafe|changed"):
+            handoff.commit_handoff(plan)
+        self.assertFalse(os.path.exists(os.path.join(
+            outside, "projects", "project", self.SID + ".jsonl")))
 
 
 class HookProof(unittest.TestCase):
@@ -222,7 +386,8 @@ class HookProof(unittest.TestCase):
         os.makedirs(directory)
         self.transcript = os.path.join(directory, self.SID + ".jsonl")
         event = {"type": "assistant", "isApiErrorMessage": True,
-                 "message": {"content": [{"type": "text", "text":
+                 "message": {"model": "claude-sonnet-4-5-20250929",
+                 "content": [{"type": "text", "text":
                  "You've hit your session limit · resets 12:20pm (UTC)"}]}}
         with open(self.transcript, "w", encoding="utf-8") as out:
             out.write(json.dumps(event) + "\n")
@@ -294,6 +459,131 @@ class HookProof(unittest.TestCase):
         self.assertEqual(supervisor.cap_message(
             self.record("rate limit"), self.child), "")
 
+    def test_cap_family_comes_from_final_api_error_not_session_start(self):
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "message": {"model": "claude-fable-5-20260701", "content": [{
+                    "type": "text", "text": "You've hit your weekly limit"}]}
+            }) + "\n")
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        proof = runner._prove_cap(
+            self.child, self.record("You've hit your weekly limit"))
+        self.assertEqual(proof.family, "fable")
+        self.assertEqual(self.child.binding.model, "Sonnet")
+
+    def test_cap_family_survives_synthetic_model_on_the_cap_event(self):
+        # Observed live: the API-error event's own model is "<synthetic>"; the
+        # active model is the LAST preceding real assistant model (reflecting
+        # an in-session /model switch away from the launch model).
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant",
+                "message": {"model": "claude-opus-4-8", "content": [
+                    {"type": "text", "text": "earlier turn"}]}}) + "\n")
+            out.write(json.dumps({
+                "type": "assistant",
+                "message": {"model": "claude-fable-5", "content": [
+                    {"type": "text", "text": "later turn"}]}}) + "\n")
+            out.write(json.dumps({
+                "type": "user", "message": {"content": "more"}}) + "\n")
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "error": "rate_limit", "apiErrorStatus": 429,
+                "message": {"model": "<synthetic>", "content": [{
+                    "type": "text",
+                    "text": "You've hit your session limit · resets 12:20pm"
+                }]}}) + "\n")
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        proof = runner._prove_cap(
+            self.child, self.record("You've hit your session limit"))
+        self.assertEqual(proof.family, "fable")
+
+    def test_cap_with_only_synthetic_models_refuses_automation(self):
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "message": {"model": "<synthetic>", "content": [{
+                    "type": "text", "text": "You've hit your session limit"
+                }]}}) + "\n")
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        with self.assertRaises(supervisor.PermanentSupervisorError):
+            runner._prove_cap(
+                self.child, self.record("You've hit your session limit"))
+
+    def test_transcript_quiet_gate_runs_before_fresh_collect(self):
+        collect_fn = mock.Mock()
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, collect_fn=collect_fn,
+            supervisor_id=self.SUPERVISOR)
+        proof = runner._prove_cap(
+            self.child, self.record("You've hit your session limit"))
+        with mock.patch.object(
+                handoff, "guard_source_stable",
+                side_effect=handoff.HandoffError(
+                    "source transcript changed recently")):
+            with self.assertRaisesRegex(handoff.HandoffError, "changed recently"):
+                runner._preflight(self.child, proof)
+        collect_fn.assert_not_called()
+
+    def test_transcript_change_expires_proof_before_collect(self):
+        collect_fn = mock.Mock()
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, collect_fn=collect_fn,
+            supervisor_id=self.SUPERVISOR)
+        proof = runner._prove_cap(
+            self.child, self.record("You've hit your session limit"))
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write("{}\n")
+        old = time.time() - 20
+        os.utime(self.transcript, (old, old))
+        with self.assertRaisesRegex(supervisor.SupervisorError,
+                                   "transcript changed"):
+            runner._preflight(self.child, proof)
+        collect_fn.assert_not_called()
+
+    def test_session_transition_rebinds_and_expires_old_proof(self):
+        other_sid = "22222222-2222-4222-8222-222222222222"
+        other_path = os.path.join(os.path.dirname(self.transcript),
+                                  other_sid + ".jsonl")
+        with open(other_path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        old_proof = supervisor.CapProof(
+            self.record("You've hit your session limit"), "cap", "sonnet",
+            self.SID, self.transcript, 0,
+            handoff._transcript_stat(self.transcript))
+        end = self.record(payload={"hook_event_name": "SessionEnd"})
+        start = self.record(payload={
+            "hook_event_name": "SessionStart", "session_id": other_sid,
+            "transcript_path": other_path,
+            "model": {"display_name": "Sonnet"}})
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[end, start]):
+            proof = runner._handle_events(self.child, "", old_proof)
+        self.assertIsNone(proof)
+        self.assertEqual(self.child.binding.session_id, other_sid)
+        self.assertEqual(self.child.session_epoch, 1)
+        self.assertFalse(self.child.session_ended)
+
+    def test_malformed_matching_control_events_permanently_disable(self):
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        for malformed in (
+            self.record(payload={"hook_event_name": "CwdChanged", "cwd": None}),
+            self.record(payload={"transcript_path": None}),
+            self.record(received_at=0),
+        ):
+            self.child.automation = True
+            with mock.patch.object(supervisor, "_read_events",
+                                   return_value=[malformed]):
+                self.assertIsNone(runner._handle_events(self.child, ""))
+            self.assertFalse(self.child.automation)
+
 
 class CliWiring(unittest.TestCase):
     def test_plain_claude_with_auto_off_keeps_exec_path(self):
@@ -323,6 +613,23 @@ class CliWiring(unittest.TestCase):
                 ["claude", "--headroom-no-auto-handoff", "--model", "sonnet"])
         self.assertEqual(result, 19)
         execute.assert_called_once_with("sonnet", ["claude", "--model", "sonnet"])
+
+    def test_equals_format_flags_are_incompatible_with_supervision(self):
+        self.assertEqual(supervisor.incompatible_args(
+            ["--output-format=json"]), "--output-format=json")
+        self.assertEqual(supervisor.incompatible_args(
+            ["--input-format=stream-json"]), "--input-format=stream-json")
+
+    def test_override_stripping_respects_values_and_bare_separator(self):
+        cleaned, auto, no_auto = supervisor.strip_headroom_overrides([
+            "--model", "--headroom-auto-handoff",
+            "--headroom-no-auto-handoff", "--",
+            "--headroom-auto-handoff"])
+        self.assertEqual(cleaned, [
+            "--model", "--headroom-auto-handoff", "--",
+            "--headroom-auto-handoff"])
+        self.assertFalse(auto)
+        self.assertTrue(no_auto)
 
     def test_statusline_distinguishes_armed_supervisor(self):
         snapshot = {"accounts": [{"name": "source", "provider": "claude",
@@ -364,7 +671,9 @@ class SupervisorIntegration(unittest.TestCase):
         self.env.start()
         self.binding = mock.patch.object(
             collect, "local_binding", return_value=("AAAA", "BBBB"))
-        self.binding.start()
+        self.local_binding = self.binding.start()
+        self.quiet = mock.patch.object(supervisor, "QUIET_SECONDS", 0.1)
+        self.quiet.start()
         self.cwd_before = os.getcwd()
         self.cwd = os.path.join(self.temp.name, "work")
         os.makedirs(self.cwd)
@@ -373,6 +682,7 @@ class SupervisorIntegration(unittest.TestCase):
 
     def tearDown(self):
         os.chdir(self.cwd_before)
+        self.quiet.stop()
         self.binding.stop()
         self.env.stop()
         self.temp.cleanup()
@@ -410,8 +720,9 @@ class SupervisorIntegration(unittest.TestCase):
         changed = os.path.join(self.temp.name, "changed-cwd")
         os.makedirs(changed)
         os.environ["FAKE_CHANGED_CWD"] = changed
-        result = supervisor.Supervisor(
-            "sonnet", [], self.accounts[0], collect_fn=self.snapshot).run()
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=self.snapshot)
+        result = runner.run()
         self.assertEqual(result, 0)
         source_sid = str(__import__("uuid").uuid5(
             __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
@@ -432,6 +743,14 @@ class SupervisorIntegration(unittest.TestCase):
         bound = [row for row in self.ledger_actions()
                  if row.get("action") == "resume_bound"][-1]
         self.assertTrue(handoff._valid_uuid(bound["new_session_id"]))
+        self.assertEqual(bound["target_slot"], "target")
+        self.assertNotIn("source_slot", bound)
+        with open(destination, encoding="utf-8") as copied:
+            self.assertIn("sigterm_flush", copied.read())
+        self.assertTrue(all(not os.path.exists(path)
+                            for path in runner.settings_files))
+        self.assertFalse(os.path.exists(supervisor.event_path(
+            runner.supervisor_id)))
 
     def test_banner_alone_never_terminates(self):
         os.environ["FAKE_CLAUDE_SCENARIO"] = "banner"
@@ -465,6 +784,112 @@ class SupervisorIntegration(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertFalse(os.path.exists(
             os.path.join(self.fake_state, "sigterm-source")))
+
+    def test_cap_proof_expires_when_reset_elapses_before_preflight(self):
+        def expired_snapshot(quiet=True):
+            snapshot = self.snapshot(quiet)
+            source = next(row for row in snapshot["accounts"]
+                          if row["name"] == "source")
+            source["windows"]["5h"]["resets_at"] = time.time() - 1
+            return snapshot
+
+        result = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=expired_snapshot).run()
+        self.assertEqual(result, 0)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+
+    def test_cap_time_fable_model_refuses_fable_capped_target(self):
+        os.environ["FAKE_CAP_MODEL"] = "claude-fable-5-20260701"
+
+        def fable_snapshot(quiet=True):
+            snapshot = self.snapshot(quiet)
+            target = next(row for row in snapshot["accounts"]
+                          if row["name"] == "target")
+            target["windows"]["scoped:Fable"] = {
+                "used_percent": 100, "resets_at": time.time() + 86400}
+            return snapshot
+
+        result = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=fable_snapshot).run()
+        self.assertEqual(result, 0)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+
+    def test_clear_and_resume_transitions_never_use_stale_cap_proof(self):
+        for scenario in ("clear", "resume-transition"):
+            with self.subTest(scenario=scenario):
+                os.environ["FAKE_CLAUDE_SCENARIO"] = scenario
+                result = supervisor.Supervisor(
+                    "sonnet", [], self.accounts[0],
+                    collect_fn=self.snapshot).run()
+                self.assertEqual(result, 0)
+                self.assertFalse(os.path.exists(
+                    os.path.join(self.fake_state, "sigterm-source")))
+
+    def test_pre_stop_runtime_error_disables_automation_without_crashing(self):
+        with mock.patch.object(handoff, "select_target",
+                               side_effect=RuntimeError("registry changed")):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0],
+                collect_fn=self.snapshot).run()
+        self.assertEqual(result, 0)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+
+    def test_unreadable_cooldown_state_is_held_before_sigterm(self):
+        os.makedirs(os.path.dirname(paths.cooldowns_path()), exist_ok=True)
+        with open(paths.cooldowns_path(), "w") as out:
+            out.write("{broken")
+        result = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=self.snapshot).run()
+        self.assertEqual(result, 0)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+
+    def test_post_stop_runtime_error_always_recovers_source(self):
+        with mock.patch.object(handoff, "commit_handoff",
+                               side_effect=RuntimeError("commit exploded")):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0],
+                collect_fn=self.snapshot).run()
+        self.assertEqual(result, 0)
+        with open(os.path.join(self.fake_state, "recovered"),
+                  encoding="utf-8") as source:
+            self.assertIn("--resume", source.read())
+
+    def test_target_relogin_after_stop_recovers_source_without_publication(self):
+        original_commit = handoff.commit_handoff
+
+        def relog_then_commit(plan):
+            self.local_binding.return_value = ("OTHER", "CHANGED")
+            return original_commit(plan)
+
+        with mock.patch.object(handoff, "commit_handoff",
+                               side_effect=relog_then_commit):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0],
+                collect_fn=self.snapshot).run()
+        self.assertEqual(result, 0)
+        with open(os.path.join(self.fake_state, "recovered"),
+                  encoding="utf-8") as source:
+            self.assertIn("--resume", source.read())
+        source_sid = str(__import__("uuid").uuid5(
+            __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.accounts[1]["home"], "projects", "fake-project",
+            source_sid + ".jsonl")))
+
+    def test_post_stop_cooldown_runtime_error_always_recovers_source(self):
+        with mock.patch.object(route, "mark",
+                               side_effect=RuntimeError("cooldown corrupt")):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0],
+                collect_fn=self.snapshot).run()
+        self.assertEqual(result, 0)
+        with open(os.path.join(self.fake_state, "recovered"),
+                  encoding="utf-8") as source:
+            self.assertIn("--resume", source.read())
 
     def test_no_target_leaves_capped_child_alive(self):
         self.accounts = self.make_accounts("source")
@@ -517,38 +942,54 @@ class SupervisorIntegration(unittest.TestCase):
                      if row.get("action") == "cap_confirmed"]
         self.assertEqual(len(confirmed), 3)
 
-    def test_child_inherits_foreground_process_group_under_pty(self):
+    def test_child_inherits_foreground_group_and_receives_ctrl_c_and_term(self):
         os.environ["FAKE_CLAUDE_SCENARIO"] = "foreground"
         account = self.accounts[0]
         code = (
             "from headroom.supervisor import Supervisor; "
             f"raise SystemExit(Supervisor('sonnet', [], {account!r}).run())")
-        pid, descriptor = pty.fork()
-        if pid == 0:
-            environment = os.environ.copy()
-            environment["PYTHONPATH"] = os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__)))
-            os.execve(sys.executable, [sys.executable, "-c", code], environment)
-        output = b""
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            ready, _, _ = select.select([descriptor], [], [], 0.25)
-            if ready:
-                try:
-                    output += os.read(descriptor, 4096)
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
+
+        def exercise(kind):
+            pid, descriptor = pty.fork()
+            if pid == 0:
+                environment = os.environ.copy()
+                environment["PYTHONPATH"] = os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__)))
+                os.execve(sys.executable,
+                          [sys.executable, "-c", code], environment)
+            output = b""
+            sent = False
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                ready, _, _ = select.select([descriptor], [], [], 0.1)
+                if ready:
+                    try:
+                        output += os.read(descriptor, 4096)
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        break
+                if not sent and b"PGRP_OK" in output:
+                    if kind == "ctrl-c":
+                        os.write(descriptor, b"\x03")
+                    else:
+                        os.kill(pid, signal.SIGTERM)
+                    sent = True
+                done, status = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    self.assertTrue(os.WIFEXITED(status))
                     break
-            done, status = os.waitpid(pid, os.WNOHANG)
-            if done:
-                self.assertTrue(os.WIFEXITED(status))
-                break
-        else:
-            os.kill(pid, signal.SIGKILL)
-            self.fail("pty supervisor did not exit")
-        os.close(descriptor)
-        self.assertIn(b"PGRP_OK", output)
+            else:
+                os.kill(pid, signal.SIGKILL)
+                self.fail("pty supervisor did not exit")
+            os.close(descriptor)
+            self.assertTrue(sent)
+            self.assertIn(b"PGRP_OK", output)
+            self.assertIn(
+                b"SIGINT_OK" if kind == "ctrl-c" else b"SIGTERM_OK", output)
+
+        exercise("ctrl-c")
+        exercise("term")
 
 
 if __name__ == "__main__":

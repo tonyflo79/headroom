@@ -54,7 +54,9 @@ exact session reaches a subscription cap, headroom requires three independent
 proofs before it acts: a current-session `StopFailure` hook matched as
 `rate_limit`, a narrow session/weekly-cap message, and a new identity-bound
 usage read showing at least 99% used in the corresponding account or model
-window. Missing or ambiguous evidence leaves Claude running.
+window. The active model family comes from the final API-error transcript
+event, not the model used when the session launched. Missing or ambiguous
+evidence leaves Claude running.
 
 After every non-mutating preflight succeeds, headroom sends Claude one
 `SIGTERM`, requires its `SessionEnd` cleanup hook, verifies the final transcript
@@ -149,9 +151,12 @@ best other Claude account, cools the capped slot, and resumes from the same
 working directory with a new session id. Use `--print` to stage the handoff and
 print the exact resume command without running it; use `--yes` for a confirmed
 non-interactive handoff. If the journal lacks a model, pass `--model FAMILY`.
+`FAMILY` must name a scoped Claude family such as `sonnet`, `opus`, `haiku`, or
+`fable`; generic `claude` is not enough to enforce model-scoped caps.
 `--yes` and `--print` are mutually exclusive. The source transcript is never
-changed or deleted. A non-capped manual handoff refuses an unresolved tool call
-unless `--force` is given.
+changed or deleted. Every manual handoff refuses an unresolved tool call unless
+`--force` is given; even a 99–100% provider snapshot is cooldown evidence, not
+authenticated cap proof.
 
 ## How the reads work (and why they're safe)
 

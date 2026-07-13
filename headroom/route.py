@@ -65,6 +65,19 @@ def cooldowns():
     return _read_cooldowns()
 
 
+def preflight_cooldowns():
+    """Return readable protective state or hold before a destructive action."""
+    cool = _read_cooldowns()
+    if cool is None:
+        raise RuntimeError(
+            "cooldown ledger unreadable — inspect/delete state/cooldowns.json")
+    for key, reset in cool.items():
+        if not isinstance(key, str) or not key or not _number(reset):
+            raise RuntimeError(
+                "cooldown entry unreadable — inspect state/cooldowns.json")
+    return cool
+
+
 def save_cooldowns(value):
     paths.write_json_atomic(paths.cooldowns_path(), value)
 

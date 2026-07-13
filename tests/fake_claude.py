@@ -25,8 +25,17 @@ def hook(settings, name, payload):
                    check=True, env=os.environ.copy())
 
 
-def session_id(slot, generation):
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"headroom-fake-{slot}-{generation}"))
+def session_id(slot, generation, transition=""):
+    suffix = f"-{transition}" if transition else ""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_DNS, f"headroom-fake-{slot}-{generation}{suffix}"))
+
+
+def append_event(path, event):
+    with open(path, "a", encoding="utf-8") as out:
+        out.write(json.dumps(event) + "\n")
+        out.flush()
+        os.fsync(out.fileno())
 
 
 def main():
@@ -49,6 +58,17 @@ def main():
     if scenario == "foreground":
         ok = os.getpgrp() == os.tcgetpgrp(0)
         print("PGRP_OK" if ok else "PGRP_BAD", flush=True)
+        received = {"signal": ""}
+
+        def foreground_signal(signum, _frame):
+            received["signal"] = signal.Signals(signum).name
+
+        signal.signal(signal.SIGINT, foreground_signal)
+        signal.signal(signal.SIGTERM, foreground_signal)
+        deadline = time.time() + 3
+        while not received["signal"] and time.time() < deadline:
+            time.sleep(0.02)
+        print(received["signal"] + "_OK", flush=True)
         return 0
     if not settings:
         with open(os.path.join(state, "recovered"), "a", encoding="utf-8") as out:
@@ -65,16 +85,20 @@ def main():
     directory = os.path.join(home, "projects", slug(os.getcwd()))
     os.makedirs(directory, exist_ok=True)
     transcript = os.path.join(directory, sid + ".jsonl")
+    model_id = os.environ.get(
+        "FAKE_CAP_MODEL", "claude-sonnet-4-5-20250929")
     cap_event = {"type": "assistant", "isApiErrorMessage": True,
-                 "message": {"content": [{"type": "text", "text":
-                 "You've hit your session limit · resets 12:20pm (UTC)"}]}}
+                 "message": {"model": model_id, "content": [
+                 {"type": "text", "text":
+                  "You've hit your session limit · resets 12:20pm (UTC)"}]}}
     with open(transcript, "w", encoding="utf-8") as out:
         if scenario == "corrupt":
             out.write('{"type":')
         else:
-            out.write(json.dumps(cap_event) + "\n")
-    old = time.time() - 20
-    os.utime(transcript, (old, old))
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hello"}]}}) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
     common = {"session_id": sid, "transcript_path": transcript,
               "cwd": os.getcwd(), "model": {"display_name": "Sonnet"},
               "version": "2.1.fake"}
@@ -99,11 +123,33 @@ def main():
         time.sleep(0.35)
         return 0
 
+    if scenario != "corrupt":
+        append_event(transcript, cap_event)
+
     message = "rate limit: try again" if scenario == "transient" else \
         "You've hit your session limit · resets 12:20pm (UTC)"
     hook(settings, "StopFailure", dict(
         common, hook_event_name="StopFailure", error="rate_limit",
         last_assistant_message=message))
+
+    if scenario in ("clear", "resume-transition"):
+        hook(settings, "SessionEnd", dict(
+            common, hook_event_name="SessionEnd",
+            reason="clear" if scenario == "clear" else "resume"))
+        next_sid = session_id(slot, generation, scenario)
+        next_transcript = os.path.join(directory, next_sid + ".jsonl")
+        with open(next_transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "replacement"}]}}) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        next_common = dict(common, session_id=next_sid,
+                           transcript_path=next_transcript)
+        hook(settings, "SessionStart", dict(
+            next_common, hook_event_name="SessionStart",
+            source="clear" if scenario == "clear" else "resume"))
+        time.sleep(0.5)
+        return 0
     terminated = {"value": False, "count": 0}
 
     def on_term(_signum, _frame):
@@ -120,6 +166,8 @@ def main():
             if scenario == "ignore-term":
                 terminated["value"] = False
                 continue
+            append_event(transcript, {"type": "system",
+                                      "subtype": "sigterm_flush"})
             if scenario != "missing-end":
                 hook(settings, "SessionEnd",
                      dict(common, hook_event_name="SessionEnd", reason="other"))

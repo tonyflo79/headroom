@@ -581,8 +581,12 @@ class HandoffSafety(unittest.TestCase):
             handle.write(self.bytes)
         old = time.time() - 20
         os.utime(self.transcript, (old, old))
+        self.binding = mock.patch.object(
+            collect, "local_binding", return_value=("AAAA", "BBBB"))
+        self.binding.start()
 
     def tearDown(self):
+        self.binding.stop()
         os.chdir(self.old_cwd)
         if self.old_headroom is None:
             os.environ.pop("HEADROOM_DIR", None)
@@ -776,12 +780,11 @@ class HandoffSafety(unittest.TestCase):
 
     def test_print_handoff_writes_baton_ledger_and_cools_source(self):
         now = time.time()
-        snapshot = {"generated": now, "accounts": [
-            {"name": "source", "email": "one@example.com", "windows": {
-                "5h": {"used_percent": 100.0, "resets_at": now + 1200}}},
-            {"name": "target", "email": "two@other.test", "windows": {
-                "5h": {"used_percent": 10.0}}},
-        ]}
+        source_row = _claude_row("source", used5h=100.0)
+        source_row["email"] = "one@example.com"
+        target_row = _claude_row("target", used5h=10.0)
+        target_row["email"] = "two@other.test"
+        snapshot = {"generated": now, "accounts": [source_row, target_row]}
         output = io.StringIO()
         errors = io.StringIO()
         with mock.patch.object(handoff.registry, "accounts", return_value=self.accounts), \
@@ -824,7 +827,10 @@ class HandoffSafety(unittest.TestCase):
                 mock.patch.object(handoff.registry, "accounts",
                                   return_value=self.accounts), \
                 mock.patch.object(handoff.route, "ensure_fresh_snapshot",
-                                  return_value={"accounts": []}), \
+                                  return_value={"generated": time.time(),
+                                                "accounts": [
+                                                    _claude_row("source"),
+                                                    _claude_row("target")]}), \
                 mock.patch.object(handoff.route, "candidates",
                                   return_value=[(self.accounts[1], None)]), \
                 mock.patch.object(handoff, "guard_source_stable"), \
@@ -838,6 +844,36 @@ class HandoffSafety(unittest.TestCase):
             self.target_home, self.transcript, self.SID)
         self.assertFalse(os.path.exists(destination))
         self.assertFalse(os.path.exists(handoff._ledger_path()))
+
+    def test_target_relogin_during_confirmation_is_rejected(self):
+        initial = {"generated": time.time(), "accounts": [
+            _claude_row("source"), _claude_row("target")]}
+        changed_target = _claude_row("target")
+        changed_target["identity"] = {
+            "account_fingerprint": "OTHER", "credential_digest": "CHANGED"}
+        refreshed = {"generated": time.time(), "accounts": [
+            _claude_row("source"), changed_target]}
+        stdin = mock.Mock()
+        stdin.isatty.return_value = True
+        errors = io.StringIO()
+        with mock.patch.object(handoff.sys, "stdin", stdin), \
+                mock.patch("builtins.input", return_value="y"), \
+                mock.patch.object(handoff.registry, "accounts",
+                                  return_value=self.accounts), \
+                mock.patch.object(handoff.route, "ensure_fresh_snapshot",
+                                  side_effect=[initial, refreshed]) as recollect, \
+                mock.patch.object(handoff.route, "candidates",
+                                  return_value=[(self.accounts[0], None),
+                                                (self.accounts[1], None)]), \
+                mock.patch.object(handoff, "guard_source_stable"), \
+                redirect_stderr(errors):
+            result = handoff.cmd_handoff(
+                ["--session", self.SID, "--model", "sonnet"])
+        self.assertEqual(result, 2)
+        self.assertEqual(recollect.call_count, 2)
+        self.assertIn("changed during confirmation", errors.getvalue())
+        self.assertFalse(os.path.exists(handoff.destination_path(
+            self.target_home, self.transcript, self.SID)))
 
 
 if __name__ == "__main__":
