@@ -585,6 +585,26 @@ class DashboardHttpTests(unittest.TestCase):
                          r"sourceFailed=forceNoncurrent===true\|\|")
         self.assertRegex(fallback, r"render\(cached,true\)")
 
+    def test_dom_tone_allowlist_covers_every_projected_tone(self):
+        # every colour tone the Python projection can emit for a live window
+        # must be accepted by the browser's safeTone allowlist, or the DOM
+        # renders it gray while the server data says otherwise.
+        emitted = set()
+        for used5 in (10, 45, 65, 85, 99):
+            row = dashboard.display_snapshot(
+                usage_snapshot(usage_account(used5=used5)), NOW)[
+                    "_headroom_display"]["accounts"][0]["windows"]["5h"]
+            self.assertEqual(row["state"], "current")
+            emitted.add(row["tone"])
+        self.assertEqual(emitted, {"green", "yellow", "orange", "red"})
+        window_view = self.template_text().split(
+            "function windowView(a,key){", 1)[1].split("\n}", 1)[0]
+        allow = re.search(r'\[([^\]]*)\]\.includes\(w\.tone\)', window_view)
+        self.assertIsNotNone(allow)
+        allowed = set(re.findall(r'"(\w+)"', allow.group(1)))
+        self.assertTrue(emitted <= allowed,
+                        f"DOM allowlist {allowed} misses {emitted - allowed}")
+
     def test_static_dashboard_injects_shared_thresholds_and_projection(self):
         config = {"schema_version": 1,
                   "dashboard": {"theme": "midnight", "title": "test"},

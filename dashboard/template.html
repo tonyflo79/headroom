@@ -377,7 +377,7 @@ function windowView(a,key){
   const live=accountState==="current"&&state==="current";
   const limited=accountState==="limited"&&state==="limited";
   const left=live&&w&&Number.isFinite(w.left_percent)?w.left_percent:(limited&&w&&Number.isFinite(w.last_observed_left_percent)?w.last_observed_left_percent:null);
-  const safeTone=live&&w&&["green","orange","red"].includes(w.tone)?w.tone:(limited?"red":"unknown");
+  const safeTone=live&&w&&["green","yellow","orange","red"].includes(w.tone)?w.tone:(limited?"red":"unknown");
   return{state:state,left:left,tone:safeTone};
 }
 function isCurrent(a){return displayState(a)==="current";}
