@@ -338,12 +338,27 @@ def _active_model(lines, cap_event):
 
 
 def _last_transcript_cap_evidence(path):
+    """Locate the cap as the transcript's LATEST assistant activity.
+
+    Observed live: Claude appends trailing non-assistant records (system
+    turn_duration, last-prompt, file-history-snapshot, user, attachment)
+    after the API-error event, so the cap is rarely the final line.  Scanning
+    backward, the first assistant event must BE the cap — a successful
+    assistant turn after it means the session is not capped (fail closed).
+    """
     try:
         with open(path, "rb") as handle:
             lines = [line for line in handle.read().splitlines() if line.strip()]
-        if not lines:
-            return None
-        event = json.loads(lines[-1].decode("utf-8"))
+        event = None
+        cap_index = len(lines)
+        for index in range(len(lines) - 1, -1, -1):
+            candidate = json.loads(lines[index].decode("utf-8"))
+            if isinstance(candidate, dict) \
+                    and candidate.get("type") == "assistant" \
+                    and candidate.get("isSidechain") is not True:
+                event, cap_index = candidate, index
+                break
+        lines = lines[:cap_index + 1]
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(event, dict) or event.get("type") != "assistant":

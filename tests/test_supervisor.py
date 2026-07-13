@@ -527,6 +527,50 @@ class HookProof(unittest.TestCase):
             self.child, self.record("You've hit your session limit"))
         self.assertEqual(proof.family, "fable")
 
+    def test_cap_evidence_tolerates_trailing_non_assistant_records(self):
+        # Observed live: Claude appends system/turn_duration, last-prompt,
+        # file-history-snapshot, user, and attachment records AFTER the
+        # API-error event, so the cap is rarely the transcript's final line.
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant",
+                "message": {"model": "claude-haiku-4-5-20251001", "content": [
+                    {"type": "text", "text": "earlier turn"}]}}) + "\n")
+            out.write(json.dumps({
+                "type": "user", "message": {"content": "prompt"}}) + "\n")
+            out.write(json.dumps({"type": "attachment"}) + "\n")
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "error": "rate_limit",
+                "message": {"model": "<synthetic>", "content": [{
+                    "type": "text",
+                    "text": "You've hit your session limit · resets 3pm"
+                }]}}) + "\n")
+            out.write(json.dumps({
+                "type": "system", "subtype": "turn_duration"}) + "\n")
+            out.write(json.dumps({
+                "type": "last-prompt", "lastPrompt": "x"}) + "\n")
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        proof = runner._prove_cap(
+            self.child, self.record("You've hit your session limit"))
+        self.assertEqual(proof.family, "haiku")
+
+    def test_successful_assistant_turn_after_cap_refuses_evidence(self):
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "message": {"model": "<synthetic>", "content": [{
+                    "type": "text", "text": "You've hit your session limit"
+                }]}}) + "\n")
+            out.write(json.dumps({
+                "type": "assistant",
+                "message": {"model": "claude-haiku-4-5-20251001", "content": [
+                    {"type": "text", "text": "a later successful turn"}]}})
+                + "\n")
+        self.assertIsNone(
+            supervisor._last_transcript_cap_evidence(self.transcript))
+
     def test_cap_with_only_synthetic_models_refuses_automation(self):
         with open(self.transcript, "w", encoding="utf-8") as out:
             out.write(json.dumps({
