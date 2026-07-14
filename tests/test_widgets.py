@@ -118,6 +118,19 @@ class WidgetContractTests(unittest.TestCase):
         self.assertEqual(states, {"current": "current", "limited": "limited",
                                   "stale": "stale", "held": "held"})
 
+    def test_verified_local_renders_current_not_held(self):
+        # regression: the display layer must accept every trust state the
+        # router routes on — verified_local slots rendered as "held, never
+        # promoted to live" across the widget/SwiftBar/dashboard (2026-07-14)
+        accounts = [
+            usage_account("local", trust_state="verified_local"),
+            usage_account("other", trust_state="verified_remote"),
+        ]
+        states = {row["name"]: row["state"]
+                  for row in widget.project(usage_snapshot(*accounts), NOW)[
+                      "accounts"]}
+        self.assertEqual(states, {"local": "current", "other": "held"})
+
     def test_current_window_exposes_left_percent(self):
         window = widget.project(usage_snapshot(usage_account(used5=12.5)), NOW)[
             "accounts"][0]["windows"]["5h"]

@@ -65,7 +65,10 @@ def _account_base_state(account, freshness, evaluated_at):
         return "stale"
     if not isinstance(account, dict) or account.get("ok") is not True:
         return "held"
-    if account.get("trust_state") != "verified":
+    # the display layer must accept exactly the trust states the router
+    # routes on (route.block_reason): a slot verified via local credential
+    # binding is routable and must not render as held
+    if account.get("trust_state") not in ("verified", "verified_local"):
         return "held"
     captured_at = _epoch(account.get("captured_at"))
     if captured_at is None or captured_at > evaluated_at:
