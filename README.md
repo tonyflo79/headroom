@@ -7,7 +7,7 @@ subscription you own — *without spending a single token* — puts it on a live
 dashboard you'll actually want to look at, and rotates your tools to the next
 account with headroom the moment one hits a limit.
 
-![headroom demo](marketing/headroom-demo.gif)
+https://github.com/user-attachments/assets/71e8ec51-8f0f-4ec2-806f-221b9eb6571f
 
 Five built-in themes (Midnight, Minimal, Chrome, Paper, Terminal), switchable
 live from the dashboard. The setup wizard asks how you want it to look.
