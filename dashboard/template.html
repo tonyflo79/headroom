@@ -381,7 +381,7 @@ function windowView(a,key){
   const currentWin=state==="current"&&w;
   const left=currentWin&&Number.isFinite(w.left_percent)?w.left_percent:(limited&&w&&Number.isFinite(w.last_observed_left_percent)?w.last_observed_left_percent:null);
   const projTone=currentWin&&["green","yellow","orange","red"].includes(w.tone)?w.tone:null;
-  const safeTone=projTone||(left!=null?tone(left):(limited?"red":"unknown"));
+  const safeTone=projTone||(limited?"red":"unknown");
   return{state:state,left:left,tone:safeTone};
 }
 function isCurrent(a){return displayState(a)==="current";}
