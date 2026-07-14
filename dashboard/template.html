@@ -505,7 +505,7 @@ function render(data,forceNoncurrent){
   document.getElementById("lowest-viz").innerHTML=meterMarkup(lowest?lowest.left:null);
   document.getElementById("fleet-viz").innerHTML=accounts.map(a=>{
     const view=windowView(a,"5h"),left=view.left;
-    if(!isCurrent(a)||left==null)return'<span class="fbar is-unknown" title="'+esc(a.name)+': unknown"></span>';
+    if(view.state!=="current"||left==null)return'<span class="fbar is-unknown" title="'+esc(a.name)+': unknown"></span>';
     return'<span class="fbar tone-'+view.tone+'" style="--h:'+Math.max(4,left)+'%" title="'+esc(a.name)+": "+Math.round(left)+'% session left"></span>';
   }).join("");
   set("snapshot-age","snapshot "+age(data.generated));
