@@ -354,6 +354,114 @@ class ClaudeLimits(unittest.TestCase):
                 collect.claude_limits("/h", None, opener=opener)
 
 
+class ThrottleCarryover(unittest.TestCase):
+    """A rate-limited USAGE CHECK is not evidence of missing capacity: the
+    last verified reading is carried forward (age-bounded) instead of holding
+    the slot — a busy meter must never strand launches."""
+
+    def _account(self):
+        return {"name": "a", "provider": "claude", "home": "/tmp/h"}
+
+    def _previous_row(self, captured_at=1_000_000, **over):
+        base = captured_at if isinstance(captured_at, int) \
+            and not isinstance(captured_at, bool) else 1_000_000
+        row = {
+            "name": "a", "provider": "claude", "ok": True, "routable": True,
+            "trust_state": "verified_local", "stale": False,
+            "captured_at": captured_at,
+            "identity": {"verified": False, "method": "local",
+                         "email": "e@x.com", "account_fingerprint": "AAAA",
+                         "credential_digest": "BBBB"},
+            "windows": {
+                "5h": {"used_percent": 10.0, "resets_at": base + 3600,
+                       "observed_at": base, "window_minutes": 300},
+                "7d": {"used_percent": 20.0,
+                       "resets_at": base + 7 * 86400,
+                       "observed_at": base, "window_minutes": 10080},
+            },
+        }
+        row.update(over)
+        return row
+
+    def previous(self, **over):
+        return {"accounts": [self._previous_row(**over)]}
+
+    def test_fresh_verified_row_carries(self):
+        carried = collect._throttle_carryover(
+            self.previous(), self._account(), now=1_000_060)
+        self.assertIsNotNone(carried)
+        self.assertEqual(carried["windows"]["5h"]["used_percent"], 10.0)
+
+    def test_carried_row_is_a_copy(self):
+        previous = self.previous()
+        carried = collect._throttle_carryover(
+            previous, self._account(), now=1_000_060)
+        carried["windows"]["5h"]["used_percent"] = 99.0
+        self.assertEqual(
+            previous["accounts"][0]["windows"]["5h"]["used_percent"], 10.0)
+
+    def test_expired_row_does_not_carry(self):
+        now = 1_000_000 + collect.OBSERVATION_MAX_AGE + 1
+        self.assertIsNone(collect._throttle_carryover(
+            self.previous(), self._account(), now))
+
+    def test_less_than_verified_success_does_not_carry(self):
+        for over in ({"ok": False}, {"routable": False},
+                     {"trust_state": "held"},
+                     {"trust_state": "dashboard_only"},
+                     {"captured_at": None}, {"captured_at": True},
+                     {"captured_at": 2_000_000}):  # future = clock skew
+            self.assertIsNone(collect._throttle_carryover(
+                self.previous(**over), self._account(), 1_000_060), over)
+
+    def test_missing_or_malformed_previous_does_not_carry(self):
+        for previous in (None, {}, {"accounts": None}, {"accounts": "x"},
+                         {"accounts": []},
+                         {"accounts": [{"name": "other", "ok": True}]}):
+            self.assertIsNone(collect._throttle_carryover(
+                previous, self._account(), 1_000_060), previous)
+
+    def _throttled_collect(self, previous):
+        identity = {"verified": False, "method": "local", "email": "e@x.com"}
+        throttle = collect.ProviderThrottleError(
+            int(time.time()) + 300, provider_response=True)
+        with mock.patch.object(collect, "claude_identity",
+                               return_value=dict(identity)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="BBBB"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "claude_limits",
+                                  side_effect=throttle):
+            return collect.collect([self._account()], previous=previous)
+
+    def test_collect_serves_carryover_row_through_a_throttle(self):
+        previous = {"accounts": [
+            self._previous_row(captured_at=int(time.time()) - 60)]}
+        row = self._throttled_collect(previous)["accounts"][0]
+        self.assertIs(row["ok"], True)
+        self.assertIs(row["throttle_carryover"], True)
+        self.assertIs(row["routable"], True)
+        self.assertIn(row["trust_state"], ("verified", "verified_local"))
+        self.assertEqual(row["windows"]["5h"]["used_percent"], 10.0)
+        self.assertIn("last verified reading", row["note"])
+
+    def test_collect_still_holds_without_a_carryover_row(self):
+        row = self._throttled_collect(previous=None)["accounts"][0]
+        self.assertIs(row["ok"], False)
+        self.assertEqual(row["error_code"], "usage_source_rate_limited")
+        self.assertNotIn("throttle_carryover", row)
+
+    def test_carryover_survives_public_projection(self):
+        previous = {"accounts": [
+            self._previous_row(captured_at=int(time.time()) - 60)]}
+        snapshot = self._throttled_collect(previous)
+        public = collect.public_snapshot(snapshot, redact_emails=True)
+        row = public["accounts"][0]
+        self.assertIs(row["ok"], True)
+        self.assertIs(row["throttle_carryover"], True)
+
+
 class PublicSnapshot(unittest.TestCase):
     def test_error_never_leaks_to_public_note(self):
         snap = {"schema_version": 1, "run_id": "t", "generated": 1,

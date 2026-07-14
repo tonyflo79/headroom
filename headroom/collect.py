@@ -40,12 +40,18 @@ from . import paths, registry
 
 IDENTITY_TIMEOUT = int(os.environ.get("HEADROOM_IDENTITY_TIMEOUT", "15"))
 CODEX_STALE_AFTER = int(os.environ.get("HEADROOM_CODEX_STALE_AFTER", "1800"))
+# how long a past reading stays serviceable — keep in sync with route.py,
+# which enforces the same bound at routing time (collect must not import
+# route: route imports collect)
+OBSERVATION_MAX_AGE = int(os.environ.get("HEADROOM_OBSERVATION_MAX_AGE",
+                                         "1800"))
 SCHEMA_VERSION = 1
 
 PUBLIC_FIELDS = {
     "name", "email", "provider", "plan", "ok", "note", "error_code", "retry_at",
     "captured_at", "source", "stale", "windows", "identity_verified",
     "identity_method", "trust_state", "routable", "subscription",
+    "throttle_carryover",
 }
 
 
@@ -950,7 +956,35 @@ def apply_integrity(accounts):
     return warnings
 
 
-def collect(accounts, backoff=None, persist_backoff=None):
+def _throttle_carryover(previous, account, now):
+    """The account's row from the previous snapshot, if it is still a live,
+    verified, in-age reading worth serving through a usage-source throttle.
+
+    A 429 from the usage endpoint says the METER is busy, not that capacity
+    changed — so the last verified reading keeps the slot routable instead of
+    stranding launches (every consumer still age-bounds it via captured_at
+    against OBSERVATION_MAX_AGE, so this can never outlive a real reading's
+    normal service window). Returns a copy, or None (fail-closed) when the
+    previous row is anything less than a fresh verified success."""
+    rows = previous.get("accounts") if isinstance(previous, dict) else None
+    if not isinstance(rows, list):
+        return None
+    row = next((entry for entry in rows if isinstance(entry, dict)
+                and entry.get("name") == account["name"]), None)
+    if row is None or row.get("ok") is not True \
+            or row.get("routable") is not True:
+        return None
+    if row.get("trust_state") not in ("verified", "verified_local"):
+        return None
+    captured = row.get("captured_at")
+    if isinstance(captured, bool) or not isinstance(captured, (int, float)):
+        return None
+    if captured > now or now - captured > OBSERVATION_MAX_AGE:
+        return None
+    return json.loads(json.dumps(row))
+
+
+def collect(accounts, backoff=None, persist_backoff=None, previous=None):
     now = int(time.time())
     backoff = empty_backoff() if backoff is None else backoff
     claude_backoff_until = active_backoff(backoff, "anthropic_usage_api", now)
@@ -1079,11 +1113,23 @@ def collect(accounts, backoff=None, persist_backoff=None):
             claude_backoff_until = max(claude_backoff_until, error.retry_at)
             if error.provider_response and persist_backoff is not None:
                 persist_backoff(claude_backoff_until)
-            result["ok"] = False
-            result["error_code"] = "usage_source_rate_limited"
-            result["retry_at"] = error.retry_at
-            result["note"] = ("usage source temporarily rate-limited; "
-                              "account held until provider retry window")
+            carried = _throttle_carryover(previous, account, now)
+            if carried is not None:
+                # the rate-limit CHECK being rate-limited is not evidence of
+                # missing capacity: keep serving the last verified reading
+                # (age-bounded everywhere) instead of holding the slot
+                result = carried
+                result["throttle_carryover"] = True
+                result["retry_at"] = error.retry_at
+                result["note"] = ("usage source rate-limited; serving the "
+                                  "last verified reading until the provider "
+                                  "retry window")
+            else:
+                result["ok"] = False
+                result["error_code"] = "usage_source_rate_limited"
+                result["retry_at"] = error.retry_at
+                result["note"] = ("usage source temporarily rate-limited; "
+                                  "account held until provider retry window")
         except IdentityBindingError as error:
             result["ok"] = False
             result["error_code"] = error.code
@@ -1182,15 +1228,20 @@ def run_collect(quiet=False):
             }
             paths.write_json_atomic(paths.backoff_path(), backoff)
 
-        snapshot = collect(registry.accounts(config), backoff, persist)
+        previous = paths.load_json(paths.private_snapshot_path())
+        snapshot = collect(registry.accounts(config), backoff, persist,
+                           previous=previous)
         pins = {a["name"]: a.pop("pin_usage_org")
                 for a in snapshot["accounts"] if a.get("pin_usage_org")}
         # merge pins under the config lock against the LATEST config, so a
         # concurrent `connect` account-add is never overwritten by our stale copy
         registry.apply_pins(pins)
+        # carryover rows count as throttled for the backoff ledger: only a
+        # run with NO throttle evidence at all may clear the provider backoff
         if any(a.get("provider") == "claude" and a.get("ok")
                for a in snapshot["accounts"]) \
                 and not any(a.get("error_code") == "usage_source_rate_limited"
+                            or a.get("throttle_carryover")
                             for a in snapshot["accounts"]):
             (backoff.get("providers") or {}).pop("anthropic_usage_api", None)
             paths.write_json_atomic(paths.backoff_path(), backoff)
