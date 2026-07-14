@@ -36,6 +36,8 @@ use tauri::{
 };
 use tauri_plugin_positioner::{Position, WindowExt};
 
+mod icon;
+
 /// Default widget URL; the fleet dashboard serves `/widget` on this port.
 const DEFAULT_WIDGET_URL: &str = "http://127.0.0.1:8377/widget";
 /// Env var that overrides the widget URL (validated: loopback http only).
@@ -50,6 +52,11 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Clicking the tray icon while the panel is open fires focus-loss (hide)
 /// first and the click event second; suppress the immediate re-open.
 const REOPEN_SUPPRESS: Duration = Duration::from_millis(350);
+/// How often the tray icon's battery level re-reads the widget feed.
+const ICON_INTERVAL: Duration = Duration::from_secs(60);
+/// Reject a runaway feed body instead of buffering it (the real feed is a
+/// few KB).
+const FEED_MAX_BYTES: usize = 256 * 1024;
 
 struct AppState {
     /// Validated loopback widget URL. Never changes after startup.
@@ -214,6 +221,95 @@ fn server_reachable(url: &Url) -> bool {
     stream.read_exact(&mut buf).is_ok() && &buf == b"HTTP/"
 }
 
+/// GET a small same-origin document from the widget server over the same
+/// numeric-loopback-only raw socket the reachability probe uses (never a
+/// resolver lookup, never a non-loopback address). Returns the response body
+/// for a 200 with no transfer-encoding tricks; None on anything else.
+fn fetch_loopback(url: &Url, path: &str) -> Option<String> {
+    let host = url.host_str()?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    if !ip.is_loopback() {
+        return None;
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let mut stream =
+        TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), PROBE_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_write_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if raw.len() > FEED_MAX_BYTES {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let text = String::from_utf8(raw).ok()?;
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    let status_line = head.lines().next()?;
+    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+        return None;
+    }
+    if head.to_ascii_lowercase().contains("transfer-encoding") {
+        return None;
+    }
+    Some(body.to_owned())
+}
+
+/// The fleet's fullest CURRENT 5h tank as a fraction, from `/widget.json`
+/// on the widget server. `None` when the server is unreachable, the feed is
+/// malformed, or no account has a current 5h reading.
+fn fetch_fullest_tank(widget: &Url) -> Option<f32> {
+    let body = fetch_loopback(widget, "/widget.json")?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let accounts = value.get("accounts")?.as_array()?;
+    let mut best: Option<f64> = None;
+    for account in accounts {
+        let window = account.get("windows").and_then(|w| w.get("5h"));
+        let state = window.and_then(|w| w.get("state")).and_then(|s| s.as_str());
+        if state != Some("current") {
+            continue;
+        }
+        let Some(left) = window
+            .and_then(|w| w.get("left_percent"))
+            .and_then(|v| v.as_f64())
+        else {
+            continue;
+        };
+        if (0.0..=100.0).contains(&left) && best.is_none_or(|b| left > b) {
+            best = Some(left);
+        }
+    }
+    best.map(|left| (left / 100.0) as f32)
+}
+
+/// Redraw the tray icon (and tooltip) from the latest feed reading.
+fn update_tray_icon(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id("headroom-tray") else {
+        return;
+    };
+    let level = fetch_fullest_tank(&app.state::<AppState>().widget_url);
+    let (rgba, width, height) = icon::tray_icon_rgba(level);
+    let _ = tray.set_icon(Some(Image::new_owned(rgba, width, height)));
+    let _ = tray.set_icon_as_template(true);
+    let tooltip = match level {
+        Some(level) => format!("headroom — fullest 5h tank {}%", (level * 100.0).round()),
+        None => "headroom — no current reading".to_owned(),
+    };
+    let _ = tray.set_tooltip(Some(tooltip));
+}
+
 /// Escape a string for embedding inside a double-quoted JS string literal.
 fn js_string_literal(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -313,16 +409,38 @@ fn toggle_popover(app: &AppHandle) {
 fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWindow> {
     // The window.open stub is non-configurable, so no page script can delete
     // it to restore the native popup path: new windows are denied outright.
+    //
+    // On macOS the window itself provides the native panel chrome (HUD
+    // vibrancy + rounded corners via window effects), so the widget page's
+    // own wall — the gradient, grid, and blobs behind the glass card — is
+    // stripped with injected CSS and the glass card sits directly on the
+    // real material, like a system popover. Elsewhere the page keeps its
+    // bundled wall.
+    let embed_css = if cfg!(target_os = "macos") {
+        "html,body{background:transparent !important}\
+         .hr{background:transparent !important;padding:10px}\
+         .hr-wall{display:none !important}"
+    } else {
+        ""
+    };
     let init_script = format!(
-        "window.__HEADROOM_WIDGET_URL__ = {};\n\
+        "window.__HEADROOM_WIDGET_URL__ = {widget};\n\
          Object.defineProperty(window, \"open\", {{\n\
            value: function () {{ return null; }},\n\
            writable: false, configurable: false\n\
+         }});\n\
+         addEventListener(\"DOMContentLoaded\", function () {{\n\
+           var css = {css};\n\
+           if (!css || location.href !== window.__HEADROOM_WIDGET_URL__) return;\n\
+           var style = document.createElement(\"style\");\n\
+           style.textContent = css;\n\
+           document.head.appendChild(style);\n\
          }});",
-        js_string_literal(widget_url.as_str())
+        widget = js_string_literal(widget_url.as_str()),
+        css = js_string_literal(embed_css)
     );
     let navigation_widget = widget_url.clone();
-    WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
         .title("headroom")
         .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
         .visible(false)
@@ -334,7 +452,17 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
         .always_on_top(true)
         .skip_taskbar(true)
         .visible_on_all_workspaces(true)
-        .transparent(true)
+        .transparent(true);
+    // Native panel material: dark HUD vibrancy with system rounded corners,
+    // so the popover drops down like the built-in menu-bar panels.
+    #[cfg(target_os = "macos")]
+    let builder = builder.effects(tauri::utils::config::WindowEffectsConfig {
+        effects: vec![tauri::utils::WindowEffect::HudWindow],
+        state: None,
+        radius: Some(13.0),
+        color: None,
+    });
+    builder
         .initialization_script(&init_script)
         .on_navigation(move |url| {
             let allowed = navigation_allowed(&navigation_widget, url);
@@ -373,14 +501,21 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&refresh, &open_browser, &quit])?;
 
+    // Startup icon: the battery-head with no reading yet; the feed watcher
+    // fills the level in as soon as /widget.json answers.
+    let (rgba, width, height) = icon::tray_icon_rgba(None);
     TrayIconBuilder::with_id("headroom-tray")
-        .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+        .icon(Image::new_owned(rgba, width, height))
         .icon_as_template(true)
         .tooltip("headroom")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "refresh" => sync_view_async(app, true),
+            "refresh" => {
+                sync_view_async(app, true);
+                let icon_app = app.clone();
+                std::thread::spawn(move || update_tray_icon(&icon_app));
+            }
             "open-browser" => {
                 let url = app.state::<AppState>().widget_url.clone();
                 if let Err(err) = open::that_detached(url.as_str()) {
@@ -440,6 +575,13 @@ pub fn run() {
                 if visible && !state.widget_loaded.load(Ordering::SeqCst) {
                     sync_view(&watcher, false);
                 }
+            });
+            // Keep the tray icon's battery level current (worker thread —
+            // the feed read is a blocking loopback fetch).
+            let icon_watcher = handle.clone();
+            std::thread::spawn(move || loop {
+                update_tray_icon(&icon_watcher);
+                std::thread::sleep(ICON_INTERVAL);
             });
             Ok(())
         })

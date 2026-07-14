@@ -8,6 +8,9 @@ click-down panel — the thing a SwiftBar text menu can't do.
   panel anchored at the icon (below it on macOS, above the taskbar tray on
   Windows). Clicking anywhere else hides it, like a native popover.
 - **Right-click**: menu with **Refresh**, **Open in Browser**, **Quit**.
+- The tray icon is a little head that fills like a battery: the level is the
+  fleet's fullest *current* 5h tank, redrawn every minute from the server's
+  `/widget.json` (a dash means no current reading).
 - No Dock icon / app-switcher entry on macOS (accessory activation policy +
   `LSUIElement`).
 - If the widget server can't be reached (tunnel down), the panel shows a
@@ -29,8 +32,10 @@ This app is a **viewer, not a data path**:
   is off, and the app defines no commands.
 - The app never reads headroom auth, tokens, or account state. It renders a
   page your local server already serves — nothing more.
-- No telemetry, no network calls other than the loopback reachability probe
-  and the webview page load itself.
+- No telemetry, no network calls other than the loopback reachability probe,
+  the webview page load itself, and a loopback read of the same server's
+  `/widget.json` to draw the tray icon's battery level (same numeric-loopback
+  socket discipline as the probe; the feed is already the public projection).
 
 ## Prerequisites
 
