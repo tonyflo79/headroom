@@ -15,8 +15,14 @@ usage:
   headroom run <model> -- <cmd...>  headless run with auto-rotation on limit-hit
   headroom rotate [model]           cool the current account down, pick the next
   headroom handoff [--session UUID] [--to SLOT] [--model FAMILY]
-                   [--print | --yes] [--force]
-                                    hand a Claude conversation to another account
+                   [--provider claude|codex] [--from SLOT]
+                   [--headless BATON] [--print | --yes] [--force]
+                                    hand a Claude or Codex conversation to
+                                    another account (provider auto-detected
+                                    from where the --session UUID resolves;
+                                    --from names the codex source slot when a
+                                    UUID exists in several homes; --headless
+                                    runs `codex exec resume UUID BATON`)
   headroom mark <name> <model> [epoch]   manual cooldown
   headroom clear [name:family]      clear cooldown(s)
   headroom repin <name>             re-bind a Claude slot's usage org

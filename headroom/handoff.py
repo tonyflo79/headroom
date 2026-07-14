@@ -58,6 +58,11 @@ class HandoffPlan:
     automatic: bool = False
     child_generation: int = 0
     force: bool = False
+    # provider adapter fields: "claude" plans behave exactly as before; a
+    # "codex" plan publishes to relative_destination (a validated
+    # slash-separated path under the target home) instead of projects/<slug>.
+    provider: str = "claude"
+    relative_destination: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,34 @@ def _valid_uuid(value):
 
 def _claude_slug(path):
     return re.sub(r"[^A-Za-z0-9-]", "-", path)
+
+
+def guard_handoff_group(source_account, target_account):
+    """Data-boundary gate: conversation content may only move between slots
+    that share the same configured ``handoff_group``.  Enforced on the CODEX
+    handoff paths only (plan, commit, publish, exec) — the Claude plan path
+    deliberately does not call it, so pre-adapter Claude behaviour is
+    byte-identical.  Neither side configured passes; exactly one side
+    configured is an explicit boundary mismatch and refuses (fail closed)."""
+    source_group = source_account.get("handoff_group")
+    target_group = target_account.get("handoff_group")
+    if source_group is None and target_group is None:
+        return None
+    if source_group is None or target_group is None:
+        raise HandoffError(
+            "handoff_group mismatch: %r has %s and %r has %s — conversation "
+            "content only moves between accounts in the same handoff_group"
+            % (source_account.get("name"),
+               repr(source_group) if source_group is not None else "no group",
+               target_account.get("name"),
+               repr(target_group) if target_group is not None else "no group"))
+    if source_group != target_group:
+        raise HandoffError(
+            "handoff_group mismatch: %r is in %r but %r is in %r — refusing "
+            "to move conversation content across account data boundaries"
+            % (source_account.get("name"), source_group,
+               target_account.get("name"), target_group))
+    return source_group
 
 
 def _number(value):
@@ -615,6 +648,10 @@ _DIR_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
               | getattr(os, "O_NOFOLLOW", 0))
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _RECOVERY_SCHEMA = "headroom_handoff_recovery@1"
+# schema@2 markers carry an explicit directory-component list so non-Claude
+# adapters (codex: sessions/YYYY/MM/DD) reuse the same recovery machinery;
+# Claude keeps writing schema@1 byte-identically.
+_RECOVERY_SCHEMA_V2 = "headroom_handoff_recovery@2"
 _AUTOMATIC_ACTIONS = {"cap_confirmed", "stop_sent", "stopped", "staged",
                       "resume_spawned", "resume_bound", "failure"}
 TARGET_RESERVATION_SECONDS = 5 * 60.0
@@ -639,7 +676,9 @@ def _mkdir_open(parent_fd, name, create):
 
 
 @contextlib.contextmanager
-def _target_dir_fd(home, slug, expected_home_stat, create):
+def _target_dir_fd(home, components, expected_home_stat, create):
+    """Open home/<components...> descriptor-relative (O_NOFOLLOW throughout).
+    Claude passes ("projects", slug); codex passes its sessions date path."""
     descriptors = []
     try:
         home_fd = os.open(home, _DIR_FLAGS)
@@ -647,10 +686,12 @@ def _target_dir_fd(home, slug, expected_home_stat, create):
         metadata = os.fstat(home_fd)
         if (metadata.st_dev, metadata.st_ino) != tuple(expected_home_stat):
             raise HandoffError("target home changed since planning")
-        projects_fd = _mkdir_open(home_fd, "projects", create)
-        descriptors.append(projects_fd)
-        target_fd = _mkdir_open(projects_fd, slug, create)
-        descriptors.append(target_fd)
+        if not components:
+            raise HandoffError("target directory components are missing")
+        target_fd = home_fd
+        for name in components:
+            target_fd = _mkdir_open(target_fd, name, create)
+            descriptors.append(target_fd)
         yield target_fd
     except HandoffError:
         raise
@@ -670,18 +711,31 @@ def _marker_path(handoff_id):
     return os.path.join(_recovery_dir(), handoff_id + ".json")
 
 
-def _write_marker_unlocked(plan, slug, temporary, destination):
+def _write_marker_unlocked(plan, components, temporary, destination):
     directory = paths.ensure_private(_recovery_dir())
-    marker = {
-        "schema": _RECOVERY_SCHEMA, "handoff_id": plan.handoff_id,
-        "target_home": registry.expand(plan.target["home"]),
-        "target_home_stat": list(plan.target_home_stat), "slug": slug,
-        "temporary": temporary, "destination": destination,
-        "transcript_sha256": plan.inspected["sha256"],
-    }
+    if plan.provider == "codex":
+        marker = {
+            "schema": _RECOVERY_SCHEMA_V2, "handoff_id": plan.handoff_id,
+            "target_home": registry.expand(plan.target["home"]),
+            "target_home_stat": list(plan.target_home_stat),
+            "components": list(components),
+            "temporary": temporary, "destination": destination,
+            "transcript_sha256": plan.inspected["sha256"],
+        }
+    else:
+        # Claude keeps the exact schema@1 marker it always wrote
+        marker = {
+            "schema": _RECOVERY_SCHEMA, "handoff_id": plan.handoff_id,
+            "target_home": registry.expand(plan.target["home"]),
+            "target_home_stat": list(plan.target_home_stat),
+            "slug": components[-1],
+            "temporary": temporary, "destination": destination,
+            "transcript_sha256": plan.inspected["sha256"],
+        }
     paths.write_json_atomic(_marker_path(plan.handoff_id), marker, mode=0o600)
     _fsync_directory(directory)
-    return marker
+    # normalize the in-memory copy only (never the on-disk schema@1 bytes)
+    return dict(marker, components=list(components))
 
 
 def _read_marker(path):
@@ -694,22 +748,35 @@ def _read_marker(path):
             marker = json.load(handle)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise HandoffError("handoff recovery marker is unreadable") from error
-    required_strings = ("handoff_id", "target_home", "slug", "temporary",
-                        "destination", "transcript_sha256")
+    schema = marker.get("schema") if isinstance(marker, dict) else None
+    required_strings = ["handoff_id", "target_home", "temporary",
+                        "destination", "transcript_sha256"]
+    if schema == _RECOVERY_SCHEMA:
+        required_strings.append("slug")
+        components = ["projects", marker.get("slug")] \
+            if isinstance(marker, dict) else None
+    elif schema == _RECOVERY_SCHEMA_V2:
+        components = marker.get("components") \
+            if isinstance(marker, dict) else None
+    else:
+        raise HandoffError("handoff recovery marker is malformed")
     home_stat = marker.get("target_home_stat") if isinstance(marker, dict) else None
-    if (not isinstance(marker, dict) or marker.get("schema") != _RECOVERY_SCHEMA
+    if (not isinstance(marker, dict)
             or any(not isinstance(marker.get(key), str) or not marker[key]
                    for key in required_strings)
             or not isinstance(home_stat, list) or len(home_stat) != 2
             or any(not isinstance(value, int) or isinstance(value, bool)
                    for value in home_stat)
             or not _valid_uuid(marker.get("handoff_id"))
+            or not isinstance(components, list) or not components
+            or any(not isinstance(value, str) or not value
+                   or value in (".", "..") or os.sep in value
+                   for value in components)
             or any(value in (".", "..") or os.sep in value
-                   for value in (marker.get("slug", ""),
-                                 marker.get("temporary", ""),
+                   for value in (marker.get("temporary", ""),
                                  marker.get("destination", "")))):
         raise HandoffError("handoff recovery marker is malformed")
-    return marker
+    return dict(marker, components=components)
 
 
 def _name_stat(directory_fd, name):
@@ -720,7 +787,7 @@ def _name_stat(directory_fd, name):
 
 
 def _finish_marker_unlocked(marker, committed):
-    with _target_dir_fd(marker["target_home"], marker["slug"],
+    with _target_dir_fd(marker["target_home"], marker["components"],
                         marker["target_home_stat"], create=False) as directory_fd:
         temporary = _name_stat(directory_fd, marker["temporary"])
         destination = _name_stat(directory_fd, marker["destination"])
@@ -799,17 +866,29 @@ def _recovery_ledger_rows(has_markers):
     return _read_jsonl(ledger, "handoff ledger")
 
 
-def _copy_publish_pending(plan):
+def _publish_layout(plan):
+    """(directory components under the target home, destination filename)."""
+    if plan.provider == "codex":
+        parts = [part for part in plan.relative_destination.split("/") if part]
+        if len(parts) < 2 or any(part in (".", "..") or os.sep in part
+                                 for part in parts):
+            raise HandoffError("codex publish path is invalid")
+        return parts[:-1], parts[-1]
     slug = os.path.basename(os.path.dirname(plan.source.transcript_path))
+    return ["projects", slug], plan.source.session_id + ".jsonl"
+
+
+def _copy_publish_pending(plan):
+    components, destination = _publish_layout(plan)
     temporary = ".handoff-" + plan.handoff_id + ".tmp"
-    destination = plan.source.session_id + ".jsonl"
-    with _target_dir_fd(registry.expand(plan.target["home"]), slug,
+    with _target_dir_fd(registry.expand(plan.target["home"]), components,
                         plan.target_home_stat, create=True):
         pass
-    marker = _write_marker_unlocked(plan, slug, temporary, destination)
+    marker = _write_marker_unlocked(plan, components, temporary, destination)
     published = False
     try:
-        with _target_dir_fd(marker["target_home"], slug, plan.target_home_stat,
+        with _target_dir_fd(marker["target_home"], components,
+                            plan.target_home_stat,
                             create=True) as directory_fd:
             source_fd = os.open(plan.source.transcript_path,
                                 os.O_RDONLY | _NOFOLLOW)
@@ -841,14 +920,29 @@ def _copy_publish_pending(plan):
                 os.close(source_fd)
                 if target_fd is not None:
                     os.close(target_fd)
-            try:
-                os.link(temporary, destination, src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd, follow_symlinks=False)
-            except FileExistsError as error:
-                raise HandoffError(
-                    "target already has this session id; --force does not overwrite "
-                    "destination collisions — inspect the previous partial handoff") \
-                    from error
+            def _link_destination():
+                try:
+                    os.link(temporary, destination, src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd, follow_symlinks=False)
+                except FileExistsError as error:
+                    raise HandoffError(
+                        "target already has this session id; --force does not overwrite "
+                        "destination collisions — inspect the previous partial handoff") \
+                        from error
+            if plan.provider == "codex":
+                # P0-2: the COMPLETE target gate must be CURRENT immediately
+                # before the hard-link publication — a target re-logged-in,
+                # quarantined, capped, re-grouped, or re-configured while the
+                # (potentially long) staging copy ran must abort here, while
+                # the copy is still only an invisible temp file. We are under
+                # the global handoff lock, and the gate performs the link
+                # while STILL HOLDING the quarantine writers' lock, so a
+                # quarantine cannot land between its read and the link. A
+                # raise rolls the temp file back. (never runs for Claude)
+                from . import handoff_codex
+                handoff_codex.publish_within_gate(plan, _link_destination)
+            else:
+                _link_destination()
             published = True
             os.fsync(directory_fd)
         return marker
@@ -1097,6 +1191,11 @@ def commit_handoff(plan):
                     rows, plan, time.time()) is None:
                 raise HandoffError("automatic target reservation is missing")
             _verify_target_unlocked(plan)
+            if plan.provider == "codex":
+                # provider-specific recheck under the SAME lock: refresh-token
+                # lineage + handoff_group pins (never runs for Claude plans)
+                from . import handoff_codex
+                handoff_codex.verify_codex_commit(plan)
             guard_not_duplicate(plan.source.session_id,
                                 plan.inspected["sha256"], plan.force)
             if os.path.lexists(plan.destination):
@@ -1135,9 +1234,19 @@ def commit_handoff(plan):
                 "source_5h_used": ((source_row.get("windows") or {}).get("5h")
                                    or {}).get("used_percent"),
                 "reason": "capped" if scope else "manual",
-                "resume_command": resume_command(plan.target["home"],
-                                                  plan.source.session_id),
             }
+            if plan.provider == "codex":
+                from . import handoff_codex
+                record["provider"] = "codex"
+                record["handoff_group"] = plan.target.get("handoff_group")
+                record["resume_command"] = handoff_codex.codex_resume_command(
+                    plan.target["home"], plan.source.session_id)
+                record["resume_headless_command"] = \
+                    handoff_codex.codex_exec_resume_command(
+                        plan.target["home"], plan.source.session_id)
+            else:
+                record["resume_command"] = resume_command(
+                    plan.target["home"], plan.source.session_id)
             try:
                 _append_ledger_unlocked(record)
             except Exception:
@@ -1165,24 +1274,51 @@ def _print_baton(record, unresolved=()):
 
 
 def _parse_args(args):
-    options = {"session": None, "to": None, "model": None,
+    options = {"session": None, "to": None, "model": None, "provider": None,
+               "from": None, "headless": None,
                "print": False, "force": False, "yes": False}
     index = 0
     while index < len(args):
         arg = args[index]
         if arg in ("--print", "--force", "--yes"):
             options[arg[2:]] = True
-        elif arg in ("--session", "--to", "--model") and index + 1 < len(args):
+        elif arg in ("--session", "--to", "--model", "--provider",
+                     "--from", "--headless") \
+                and index + 1 < len(args):
             index += 1
             options[arg[2:]] = args[index]
         else:
             raise HandoffError(
                 "usage: headroom handoff [--session UUID] [--to SLOT] "
-                "[--model FAMILY] [--print | --yes] [--force]")
+                "[--model FAMILY] [--provider claude|codex] "
+                "[--from SLOT] [--headless BATON] "
+                "[--print | --yes] [--force]")
         index += 1
     if options["yes"] and options["print"]:
         raise HandoffError("--yes and --print are mutually exclusive")
+    if options["headless"] is not None and options["print"]:
+        raise HandoffError("--headless and --print are mutually exclusive")
+    if options["provider"] not in (None, "claude", "codex"):
+        raise HandoffError("--provider must be claude or codex")
     return options
+
+
+def _detect_provider(session_id, accounts):
+    """Auto-detect the provider a --session UUID belongs to: a Claude projects
+    transcript vs a Codex sessions rollout. Ambiguity fails closed."""
+    if session_id is None:
+        return "claude"
+    if not _valid_uuid(session_id):
+        raise HandoffError("--session must be a UUID")
+    from . import handoff_codex
+    codex_hits = handoff_codex.locate_rollouts(str(uuid.UUID(session_id)),
+                                               accounts)
+    claude_hits = _filesystem_matches(str(uuid.UUID(session_id)), accounts)
+    if codex_hits and claude_hits:
+        raise HandoffError(
+            f"session {session_id} exists in both a Claude home and a Codex "
+            "home — pass --provider claude|codex to disambiguate")
+    return "codex" if codex_hits else "claude"
 
 
 def cmd_handoff(args):
@@ -1196,6 +1332,15 @@ def cmd_handoff(args):
         if not os.path.isdir(cwd):
             raise HandoffError("current working directory no longer exists")
         accounts = registry.accounts()
+        provider = options["provider"] or _detect_provider(options["session"],
+                                                           accounts)
+        if provider == "codex":
+            from . import handoff_codex
+            return handoff_codex.cmd_codex_handoff(options, accounts, cwd)
+        if options["from"] is not None or options["headless"] is not None:
+            raise HandoffError(
+                "--from and --headless are codex handoff options — pass "
+                "--provider codex")
         source = resolve_source(options["session"], accounts, cwd)
         family = resolve_model_family(source, options["model"])
         snapshot = route.ensure_fresh_snapshot(max_age=0)
