@@ -27,19 +27,9 @@ from . import collect as collector
 from . import notify, paths, registry
 
 
-def _env_int(name, default):
-    """Tolerant module-level env int: a malformed value degrades to the
-    default instead of raising at import time (a launcher must never be
-    unable to even IMPORT headroom because of a stray env var)."""
-    try:
-        return int(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return int(default)
-
-
-SNAPSHOT_MAX_AGE = _env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
-OBSERVATION_MAX_AGE = _env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
-CLOCK_SKEW = _env_int("HEADROOM_CLOCK_SKEW", 300)
+SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
+OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
+CLOCK_SKEW = paths.env_int("HEADROOM_CLOCK_SKEW", 300)
 
 LIMIT_RE = re.compile(
     r"(hit your (?:session|weekly|usage|5[- ]?hour|five[- ]?hour)[^.\n]*limit"
@@ -312,13 +302,19 @@ def acquire_slot_lease(account, fam):
             return False
         raise LeaseError(
             f"cannot lock slot lease for {name}: {error}") from error
-    # keep the lock across execvp so the exec'd CLI holds it for its lifetime;
-    # the supervised child never inherits it (subprocess close_fds), so the
-    # resident supervisor stays the holder there
+    # keep the lock across execvp so the exec'd CLI holds it for its lifetime
+    # (and so a supervised child can inherit it via Popen pass_fds). If the fd
+    # cannot be made inheritable, execvp would CLOSE it and silently free the
+    # account — that is a fail-OPEN leak, so fail closed instead. (P1-3)
     try:
         os.set_inheritable(fd, True)
-    except OSError:
-        pass
+        if not os.get_inheritable(fd):
+            raise OSError("slot lease fd did not become inheritable")
+    except OSError as error:
+        _close_lease_fd(fd)
+        raise LeaseError(
+            f"cannot make slot lease for {name} inheritable: {error}") \
+            from error
     _write_lease_metadata(fd, name, fam)
     _HELD_LEASES[name] = fd
     if not _RELEASE_REGISTERED:
@@ -327,20 +323,34 @@ def acquire_slot_lease(account, fam):
     return True
 
 
-def release_slot_lease(name):
-    """Release one held lease (used when a handoff moves to a new account, or
-    before falling back to a bare CLI that uses no routed account)."""
-    fd = _HELD_LEASES.pop(name, None)
-    if fd is None:
-        return
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-        pass
+def _close_lease_fd(fd):
+    """Drop this process's hold on a lease by CLOSING the fd — never
+    fcntl.LOCK_UN. flock lives on the open file DESCRIPTION, which a supervised
+    child shares via Popen pass_fds; an explicit LOCK_UN would release that
+    shared lock out from under a still-live child. Closing releases the lock
+    only when the LAST fd on the description closes, so the lease correctly
+    rides on the child under an ambiguous spawn and frees on true last-close."""
     try:
         os.close(fd)
     except OSError:
         pass
+
+
+def held_lease_fd(name):
+    """The open flock fd this process holds for `account`, or None. Used to
+    hand the fd to a supervised child (Popen pass_fds) so the lease can ride
+    on the child under an ambiguous spawn."""
+    return _HELD_LEASES.get(name)
+
+
+def release_slot_lease(name):
+    """Release one held lease (used when a handoff moves to a new account, or
+    before falling back to a bare CLI that uses no routed account). Close-only,
+    so a lease a live child inherited stays held by that child."""
+    fd = _HELD_LEASES.pop(name, None)
+    if fd is None:
+        return
+    _close_lease_fd(fd)
 
 
 def release_slot_leases():
@@ -1008,8 +1018,12 @@ def cmd_exec(fam, command, launch_note="", fallback=False):
     before _exec_routed scrubs/pins anything."""
     if not fallback:
         return _exec_routed(fam, command, launch_note)
-    original_env = dict(os.environ)
+    # everything after the fallback intent is established runs inside the
+    # guard — including the environment snapshot — so even an env-copy failure
+    # still bare-execs when the fallback was requested (P1-4)
+    original_env = None
     try:
+        original_env = dict(os.environ)
         result = _exec_routed(fam, command, launch_note)
     except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
         return bare_fallback_exec(command, f"launch failed: {error}",

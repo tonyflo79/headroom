@@ -251,18 +251,29 @@ def _dispatch(argv):
         # prove. Each flag is confirmed against an implemented symbol; the
         # per-command map records where it is genuinely wired (e.g. `run` is
         # deliberately NOT covered by fallback/lease). (P2-10)
+        #
+        # caps must ALWAYS emit its JSON — a launcher relies on it to decide
+        # whether this binary supports a feature. Module-level env parsing is
+        # now tolerant (paths.env_int), so the heavy import no longer breaks on
+        # a stray HEADROOM_* value; if introspection fails for any other
+        # reason we still emit the declared capabilities of this build. (P2-6)
         import json
 
-        from . import notify, route
-        has_marker = callable(getattr(route, "write_launch_marker", None))
-        has_fallback = callable(getattr(route, "bare_fallback_exec", None))
-        has_lease = callable(getattr(route, "acquire_slot_lease", None))
+        has_marker = has_fallback = has_lease = has_notify = True
+        try:
+            from . import notify, route
+            has_marker = callable(getattr(route, "write_launch_marker", None))
+            has_fallback = callable(getattr(route, "bare_fallback_exec", None))
+            has_lease = callable(getattr(route, "acquire_slot_lease", None))
+            has_notify = callable(getattr(notify, "emit", None))
+        except Exception:  # noqa: BLE001 — caps must never fail to emit
+            pass
         capabilities = {
             "schema": 2,
             "launch_marker": {"claude": has_marker, "codex": has_marker},
             "launch_fallback": {"claude": has_fallback,
                                 "codex": has_fallback, "run": False},
-            "notify_cmd": callable(getattr(notify, "emit", None)),
+            "notify_cmd": has_notify,
             "slot_lease": {"claude": has_lease, "codex": has_lease,
                            "run": False,
                            # fail-closed acquisition (P1-9): with

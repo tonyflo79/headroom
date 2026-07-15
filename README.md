@@ -340,13 +340,15 @@ Six affordances make headroom composable with launch wrappers:
   — so two concurrent launches deterministically pick different accounts
   instead of both grabbing the registry-first one. The kernel drops the flock
   when the holder dies, so a crash frees the slot with no pid to reuse and no
-  stale file to clean; on the exec path the lock is inherited across `exec` so
-  the CLI holds it for its lifetime, and a supervised auto-handoff moves the
-  lease to the new account before stopping the old one. Acquisition **fails
-  closed**: if leasing is on but the lock can't be taken for an infrastructure
-  reason, headroom refuses rather than launch two sessions on one account
-  (with `--headroom-launch-fallback` also set, that refusal degrades to the
-  bare CLI — your explicit "run something over nothing").
+  stale file to clean. The lock rides on the launched CLI: on the exec path it
+  is inherited across `exec`, and a supervised launch hands it to the child
+  (so even if the supervisor exits, the lease stays held by the live session);
+  a supervised auto-handoff moves the lease to the new account before stopping
+  the old one. Acquisition **fails closed**: if leasing is on but the lock (or
+  its inheritability) can't be taken for an infrastructure reason, headroom
+  refuses rather than launch two sessions on one account (with
+  `--headroom-launch-fallback` also set, that refusal degrades to the bare CLI
+  — your explicit "run something over nothing").
 - **`headroom caps`** prints the scripting capabilities this binary supports
   as command-scoped JSON — `{"schema": 2, "launch_marker": {"claude": true,
   "codex": true}, "launch_fallback": {"claude": true, "codex": true, "run":

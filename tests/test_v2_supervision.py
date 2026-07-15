@@ -1009,5 +1009,286 @@ class CliWiringV2(TempDirCase):
         self.assertEqual(found, {"--headroom-launch-fallback"})
 
 
+# ==========================================================================
+# Round-2 red-team fixes
+# ==========================================================================
+class R2AmbiguousSpawnInRun(TempDirCase):
+    """P0-1: spawn_ambiguous protects the rotation/recovery path in run(),
+    not just cmd_claude's initial fallback — no second child, lease retained."""
+
+    def test_initial_ambiguous_spawn_retains_lease_and_never_recovers(self):
+        account = self.account("acct-a")
+        with mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"}):
+            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
+            runner = supervisor.Supervisor("sonnet", [], account)
+            calls = []
+
+            def fake_spawn(acct, args, cwd, automatic, plan=None):
+                calls.append(acct["name"])
+                runner.spawn_ambiguous = True
+                raise supervisor.SupervisorError("async in the Popen window")
+
+            with mock.patch.object(runner, "_spawn", side_effect=fake_spawn), \
+                    redirect_stderr(io.StringIO()):
+                code = runner.run()
+            self.assertEqual(code, 127)
+            self.assertEqual(calls, ["acct-a"])          # no recovery spawn
+            self.assertEqual(runner._ambiguous_account, "acct-a")
+            # the lease is RETAINED (a live child may hold it); run()'s finally
+            # must not release the ambiguous account
+            self.assertEqual(route.held_lease_names(), ["acct-a"])
+
+    def test_ambiguous_target_rotation_does_not_recover_source(self):
+        # Codex's isolated repro: the TARGET Popen creates a child, then an
+        # async exception lands before spawned_any/spawn_ambiguous update.
+        # run() must NOT start source recovery (which would double-run).
+        source = self.account("source")
+        target = self.account("target")
+        runner = supervisor.Supervisor("sonnet", [], source)
+        child1 = mock.Mock()
+        child1.account = source
+        child1.generation = 1
+        plan = mock.Mock()
+        plan.target = target
+        relaunch = supervisor.Relaunch(
+            target, ["--resume", "sid"], "/cwd", True, "hid", plan)
+        calls = []
+
+        def fake_spawn(acct, args, cwd, automatic, plan=None):
+            calls.append(acct["name"])
+            if len(calls) == 1:
+                return child1
+            runner.spawn_ambiguous = True  # target Popen window interrupted
+            raise supervisor.SupervisorError("async in target Popen window")
+
+        with mock.patch.object(runner, "_spawn", side_effect=fake_spawn), \
+                mock.patch.object(runner, "_monitor", return_value=relaunch), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(runner, "_failure"), \
+                mock.patch.object(supervisor.handoff, "append_action"), \
+                redirect_stderr(io.StringIO()):
+            code = runner.run()
+        self.assertEqual(code, 127)
+        # exactly two spawns: source, target — NEVER a third (source recovery)
+        self.assertEqual(calls, ["source", "target"])
+        self.assertEqual(runner._ambiguous_account, "target")
+
+
+class R2FailedRotationReleasesTarget(TempDirCase):
+    """P1-2: a held/failed rotation releases the unused target lease so a
+    third launcher isn't wrongly blocked."""
+
+    def test_monitor_releases_target_when_stop_and_commit_returns_none(self):
+        source = self.account("source")
+        target = self.account("target")
+        with mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"}):
+            self.assertTrue(route.acquire_slot_lease(source, "sonnet"))
+            self.assertTrue(route.acquire_slot_lease(target, "sonnet"))
+            runner = supervisor.Supervisor(
+                "sonnet", [], source, now=lambda: 1000.0,
+                sleep=lambda seconds: None)
+            child = mock.Mock()
+            child.account = source
+            child.automation = True
+            child.binding = object()          # not None -> no bind timeout
+            child.launched_at = 0.0
+            poll_seq = iter([None, 0])
+            child.process.poll.side_effect = lambda: next(poll_seq)
+            plan = mock.Mock()
+            plan.target = target
+            events = iter([object(), None])   # a proof, then nothing
+
+            with mock.patch.object(
+                    runner, "_handle_events",
+                    side_effect=lambda c, p, pr=None: next(events)), \
+                    mock.patch.object(runner, "_preflight",
+                                      return_value=plan), \
+                    mock.patch.object(runner, "_stop_and_commit",
+                                      return_value=None), \
+                    redirect_stderr(io.StringIO()):
+                returncode = runner._monitor(child)
+            self.assertEqual(returncode, 0)
+            # the source keeps running (its lease held); the unused target is
+            # released
+            self.assertEqual(route.held_lease_names(), ["source"])
+
+
+class R2LeaseFailClosed(TempDirCase):
+    """P1-3: a non-inheritable lease fd would be closed by execvp and free the
+    account — that is fail-OPEN, so acquisition must fail closed."""
+
+    def lease_env(self):
+        return mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"})
+
+    def test_set_inheritable_error_fails_closed(self):
+        with self.lease_env(), \
+                mock.patch.object(route.os, "set_inheritable",
+                                  side_effect=OSError("nope")), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(route.LeaseError):
+                route.acquire_slot_lease(self.account(), "sonnet")
+        # no lease was recorded and the fd was not leaked into the held map
+        self.assertEqual(route.held_lease_names(), [])
+
+    def test_fd_that_does_not_become_inheritable_fails_closed(self):
+        with self.lease_env(), \
+                mock.patch.object(route.os, "get_inheritable",
+                                  return_value=False), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(route.LeaseError):
+                route.acquire_slot_lease(self.account(), "sonnet")
+        self.assertEqual(route.held_lease_names(), [])
+
+
+class R2SupervisedFallbackGuard(TempDirCase):
+    """P1-4: everything after the fallback intent — including Supervisor
+    construction — is inside the pre-spawn guard."""
+
+    def test_supervisor_constructor_failure_falls_back(self):
+        with mock.patch.object(supervisor, "_initial_account",
+                               return_value=self.account()), \
+                mock.patch.object(supervisor, "Supervisor",
+                                  side_effect=RuntimeError("ctor boom")), \
+                mock.patch.object(route.os, "execvpe") as bare, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = supervisor.cmd_claude("sonnet", [],
+                                         fallback_argv=["claude"])
+        self.assertEqual(code, 0)
+        bare.assert_called_once()
+        self.assertIn("ctor boom", errors.getvalue())
+
+    def test_supervisor_constructor_failure_without_fallback_raises(self):
+        with mock.patch.object(supervisor, "_initial_account",
+                               return_value=self.account()), \
+                mock.patch.object(supervisor, "Supervisor",
+                                  side_effect=RuntimeError("ctor boom")), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                supervisor.cmd_claude("sonnet", [])
+
+
+class R2RecoveryEmitsSupervisionLost(TempDirCase):
+    """P1-5: a source recovery with automation off notifies the loss, since the
+    observer already saw the initial supervised launch."""
+
+    def test_positively_failed_target_relaunch_emits_supervision_lost(self):
+        source = self.account("source")
+        target = self.account("target")
+        runner = supervisor.Supervisor("sonnet", [], source)
+        child1 = mock.Mock()
+        child1.account = source
+        child1.generation = 1
+        plan = mock.Mock()
+        plan.target = target
+        plan.source = mock.Mock()
+        plan.source.account = source
+        relaunch = supervisor.Relaunch(
+            target, ["--resume", "sid"], "/cwd", True, "hid", plan)
+        recovered = mock.Mock()
+        recovered.account = source
+        recovered.generation = 3
+        spawn_calls = []
+
+        def fake_spawn(acct, args, cwd, automatic, plan=None):
+            spawn_calls.append(acct["name"])
+            if len(spawn_calls) == 1:
+                return child1
+            if len(spawn_calls) == 2:
+                runner.spawn_ambiguous = False  # positively no child
+                raise supervisor.SupervisorError("exec failed: not found")
+            return recovered
+
+        monitor_seq = iter([relaunch, 0])
+        with mock.patch.object(runner, "_spawn", side_effect=fake_spawn), \
+                mock.patch.object(runner, "_monitor",
+                                  side_effect=lambda *a, **k: next(monitor_seq)), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(runner, "_failure"), \
+                mock.patch.object(supervisor.handoff, "append_action"), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            code = runner.run()
+        self.assertEqual(code, 0)
+        self.assertEqual(spawn_calls, ["source", "target", "source"])
+        events = [call.args[0] for call in emit.call_args_list]
+        lost = [event for event in events
+                if event["event"] == "supervision_lost"]
+        self.assertTrue(lost)
+        self.assertEqual(lost[0]["account"], "source")
+
+
+class R2PassFdsAndCaps(TempDirCase):
+    """P0-1 (lease rides on the child via pass_fds) and P2-6 (caps + env_int)."""
+
+    def test_spawn_passes_the_lease_fd_to_the_child(self):
+        account = self.account("acct-a")
+        with mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"}):
+            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
+            fd = route.held_lease_fd("acct-a")
+            popen = mock.Mock(return_value=mock.Mock())
+            runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+            with mock.patch.object(runner, "_settings_file",
+                                   return_value=""), \
+                    redirect_stderr(io.StringIO()):
+                runner._spawn(account, [], self.temp.name, False)
+            self.assertEqual(popen.call_args.kwargs.get("pass_fds"), (fd,))
+
+    def test_lease_rides_on_the_child_and_frees_on_its_death(self):
+        # P0-1 OS-level mechanism: with pass_fds the child shares the flock's
+        # open file description, and release is CLOSE-ONLY (never LOCK_UN), so
+        # the parent dropping its copy leaves the lease held by the live child
+        # and it frees only when the last holder (the child) dies.
+        account = self.account("acct-a")
+        with mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"}):
+            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
+            fd = route.held_lease_fd("acct-a")
+            child = subprocess.Popen(["sleep", "30"], pass_fds=(fd,))
+            self.addCleanup(child.wait)
+            self.addCleanup(child.kill)
+            # the parent drops its copy the way run()'s reconcile/finally does
+            route.release_slot_lease("acct-a")
+            self.assertTrue(route._account_leased_by_other("acct-a"),
+                            "the live child should still hold the lease")
+            child.kill()
+            child.wait()
+            deadline = time.monotonic() + 3.0
+            while (route._account_leased_by_other("acct-a")
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            self.assertFalse(route._account_leased_by_other("acct-a"),
+                             "the lease should free when the child dies")
+
+    def test_spawn_omits_pass_fds_when_leasing_is_off(self):
+        # legacy-off: no pass_fds kwarg at all, so the Popen call is unchanged
+        account = self.account("acct-a")
+        popen = mock.Mock(return_value=mock.Mock())
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
+            runner._spawn(account, [], self.temp.name, False)
+        self.assertNotIn("pass_fds", popen.call_args.kwargs)
+
+    def test_env_int_tolerates_malformed_values(self):
+        with mock.patch.dict(os.environ, {"HEADROOM_TEST_X": "bad"}):
+            self.assertEqual(paths.env_int("HEADROOM_TEST_X", 7), 7)
+        with mock.patch.dict(os.environ, {"HEADROOM_TEST_X": "42"}):
+            self.assertEqual(paths.env_int("HEADROOM_TEST_X", 7), 42)
+        self.assertEqual(paths.env_int("HEADROOM_TEST_UNSET_ZZZ", 5), 5)
+
+    def test_caps_emits_json_despite_a_malformed_unrelated_env(self):
+        # P2-6: a fresh process with a bad HEADROOM_* value must still emit the
+        # caps JSON (module-level ints are now tolerant)
+        env = dict(os.environ, HEADROOM_IDENTITY_TIMEOUT="bad",
+                   HEADROOM_SNAPSHOT_MAX_AGE="nope",
+                   HEADROOM_OBSERVATION_MAX_AGE="x")
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        result = subprocess.run(
+            [sys.executable, "-m", "headroom", "caps"],
+            cwd=repo, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["schema"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
