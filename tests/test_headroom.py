@@ -6,11 +6,13 @@ Covers the load-bearing safety logic: config validation, the fail-closed
 router (`block_reason`), redaction, and the public-snapshot projection.
 """
 import json
+import fcntl
 import hashlib
 import io
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,7 +20,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from headroom import collect, connect, handoff, registry, route, statusline  # noqa: E402
+from headroom import (  # noqa: E402
+    __main__, collect, connect, dashboard, handoff, paths, registry, route,
+    statusline,
+)
 
 
 def _claude_row(name="a", used5h=10.0, used7d=20.0, ok=True, **over):
@@ -1988,6 +1993,288 @@ class LaunchMarker(unittest.TestCase):
             payload = json.load(handle)
         self.assertEqual(payload["mode"], "exec")
         self.assertEqual(payload["note"], "auto-handoff disabled: --settings")
+
+
+class CollectionLockOrdering(unittest.TestCase):
+    def test_collector_locks_before_loading_registry(self):
+        config = {"schema_version": 1, "accounts": [_account("a")]}
+        observed = []
+
+        def guarded_load():
+            with open(paths.collect_lock_path(), "a") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    observed.append(True)
+                else:
+                    observed.append(False)
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+            return config
+
+        snapshot = {"schema_version": 1, "run_id": "fixture", "generated": 1,
+                    "generated_iso": "fixture", "accounts": []}
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {"HEADROOM_DIR": root}), \
+                mock.patch.object(registry, "load", side_effect=guarded_load), \
+                mock.patch.object(collect, "collect", return_value=snapshot), \
+                mock.patch.object(registry, "dashboard_settings",
+                                  return_value={"redact_emails": True}):
+            collect.run_collect(quiet=True)
+        self.assertEqual(observed, [True])
+
+
+class AuthRefreshCommand(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"HEADROOM_DIR": self.temp.name})
+        self.env.start()
+        self.home = os.path.join(paths.homes_dir(), "claude-a")
+        os.makedirs(self.home)
+        self.config = {"schema_version": 1, "accounts": [{
+            "name": "claude-a", "provider": "claude", "home": self.home,
+            "expected_email": "owner@example.test", "pinned_usage_org": "PIN",
+        }]}
+        registry.save(self.config)
+        self.credentials = os.path.join(self.home, ".credentials.json")
+        with open(self.credentials, "w") as handle:
+            json.dump({"claudeAiOauth": {"accessToken": "old"}}, handle)
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def test_refresh_relogs_owned_slot_without_changing_registry_or_pins(self):
+        def login(_argv, env):
+            self.assertEqual(env["CLAUDE_CONFIG_DIR"], self.home)
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            with open(self.credentials, "w") as handle:
+                json.dump({"claudeAiOauth": {"accessToken": "new"}}, handle)
+            return type("Completed", (), {"returncode": 0})()
+
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "override"}), \
+                mock.patch.object(connect, "provider_binary", return_value="claude"), \
+                mock.patch.object(connect.subprocess, "run", side_effect=login), \
+                mock.patch.object(connect, "slot_identity", return_value={
+                    "email": "owner@example.test", "account_fingerprint": "same-slot"}), \
+                redirect_stdout(io.StringIO()) as output:
+            code = __main__._dispatch(["auth", "refresh", "claude-a"])
+        self.assertEqual(code, 0)
+        self.assertIn("headroom collect", output.getvalue())
+        with open(self.credentials) as handle:
+            self.assertEqual(json.load(handle)["claudeAiOauth"]["accessToken"], "new")
+        self.assertEqual(registry.load(), self.config)
+
+    def test_refresh_expected_email_mismatch_restores_credentials(self):
+        def login(_argv, env):
+            with open(self.credentials, "w") as handle:
+                json.dump({"claudeAiOauth": {"accessToken": "wrong"}}, handle)
+            return type("Completed", (), {"returncode": 0})()
+
+        errors = io.StringIO()
+        with mock.patch.object(connect, "provider_binary", return_value="claude"), \
+                mock.patch.object(connect.subprocess, "run", side_effect=login), \
+                mock.patch.object(connect, "slot_identity", return_value={
+                    "email": "other@example.test", "account_fingerprint": "other"}), \
+                redirect_stderr(errors):
+            code = connect.cmd_refresh(["claude-a"])
+        self.assertEqual(code, 1)
+        self.assertIn("expected email", errors.getvalue())
+        with open(self.credentials) as handle:
+            self.assertEqual(json.load(handle)["claudeAiOauth"]["accessToken"], "old")
+        self.assertEqual(registry.load(), self.config)
+
+    def test_refresh_refuses_keychain_backed_slot_before_login(self):
+        os.remove(self.credentials)
+        errors = io.StringIO()
+        with mock.patch.object(connect.sys, "platform", "darwin"), \
+                mock.patch.object(connect, "provider_binary") as binary, \
+                mock.patch.object(connect.subprocess, "run") as run, \
+                redirect_stderr(errors):
+            code = connect.cmd_refresh(["claude-a"])
+        self.assertEqual(code, 2)
+        binary.assert_not_called()
+        run.assert_not_called()
+        self.assertIn("Keychain-backed Claude slot", errors.getvalue())
+        self.assertIn("cannot safely roll back", errors.getvalue())
+
+    def test_refresh_rejects_external_or_non_claude_slots(self):
+        self.config["accounts"].append({
+            "name": "codex-a", "provider": "codex", "home": "/tmp/codex-a"})
+        self.config["accounts"].append({
+            "name": "adopted", "provider": "claude", "home": "/tmp/adopted"})
+        registry.save(self.config)
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(connect.cmd_refresh(["codex-a"]), 2)
+            self.assertEqual(connect.cmd_refresh(["adopted"]), 2)
+            self.assertEqual(connect.cmd_refresh([]), 2)
+        self.assertIn("only owned Claude", errors.getvalue())
+        self.assertIn("adopted or external", errors.getvalue())
+
+
+class RemoveCommand(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"HEADROOM_DIR": self.temp.name})
+        self.env.start()
+        self.home_a = os.path.join(self.temp.name, "home-a")
+        self.home_b = os.path.join(self.temp.name, "home-b")
+        os.makedirs(self.home_a)
+        os.makedirs(self.home_b)
+        self.credential = os.path.join(self.home_a, ".credentials.json")
+        with open(self.credential, "w") as handle:
+            json.dump({"claudeAiOauth": {"accessToken": "kept"}}, handle)
+        registry.save({"schema_version": 1, "dashboard": {"title": "keep"},
+                       "accounts": [
+                           {"name": "a", "provider": "claude", "home": self.home_a},
+                           {"name": "b", "provider": "claude", "home": self.home_b},
+                       ]})
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def _write_state(self):
+        private = {"schema_version": 1, "run_id": "fixture",
+                   "generated": int(time.time()), "generated_iso": "fixture",
+                   "accounts": [_claude_row("a"), _claude_row("b")],
+                   "integrity_warnings": [
+                       "duplicate claude identity: a and b are the same login; routing held",
+                       "unrelated warning"]}
+        public = collect.public_snapshot(private, redact_emails=True)
+        paths.write_json_atomic(paths.private_snapshot_path(), private)
+        paths.write_json_atomic(paths.public_snapshot_path(), public, mode=0o644)
+        paths.write_json_atomic(paths.cooldowns_path(), {
+            "a:*": 100, "a:sonnet": 200, "b:*": 300})
+        paths.write_json_atomic(paths.quarantine_path(), {
+            "a": {"reason": "rejected"}, "b": {"reason": "other"}})
+        paths.write_json_atomic(paths.backoff_path(), {
+            "schema_version": 1, "providers": {"anthropic_usage_api": {
+                "retry_at": 500, "observed_at": 400}}})
+
+    def test_remove_preserves_home_and_non_target_state(self):
+        self._write_state()
+        with mock.patch.object(collect, "collection_lock",
+                               wraps=collect.collection_lock) as locked, \
+                mock.patch.object(sys.stdin, "isatty", return_value=False), \
+                redirect_stdout(io.StringIO()):
+            code = collect.cmd_remove(["a", "--yes"])
+        self.assertEqual(code, 0)
+        locked.assert_called_once_with()
+        self.assertEqual([entry["name"] for entry in registry.load()["accounts"]],
+                         ["b"])
+        self.assertEqual(registry.load()["dashboard"], {"title": "keep"})
+        self.assertTrue(os.path.isdir(self.home_a))
+        self.assertTrue(os.path.exists(self.credential))
+        self.assertEqual([row["name"] for row in
+                          paths.load_json(paths.private_snapshot_path())["accounts"]],
+                         ["b"])
+        public = paths.load_json(paths.public_snapshot_path())
+        self.assertEqual([row["name"] for row in public["accounts"]], ["b"])
+        self.assertEqual(paths.load_json(paths.private_snapshot_path())["integrity_warnings"],
+                         ["unrelated warning"])
+        self.assertEqual(public["integrity_warnings"], ["unrelated warning"])
+        self.assertEqual(route.cooldowns(), {"b:*": 300})
+        self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
+        self.assertIn("anthropic_usage_api",
+                      paths.load_json(paths.backoff_path())["providers"])
+
+    def test_remove_rejects_noninteractive_without_yes_unknown_and_final(self):
+        with mock.patch.object(sys.stdin, "isatty", return_value=False), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(collect.cmd_remove(["a"]), 2)
+            self.assertEqual(collect.cmd_remove(["missing", "--yes"]), 2)
+        self.assertEqual(len(registry.load()["accounts"]), 2)
+        registry.save({"schema_version": 1, "accounts": [
+            {"name": "a", "provider": "claude", "home": self.home_a}]})
+        with mock.patch.object(sys.stdin, "isatty", return_value=False), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(collect.cmd_remove(["a", "--yes"]), 2)
+        self.assertEqual(len(registry.load()["accounts"]), 1)
+
+
+class DashboardRemovalOrdering(unittest.TestCase):
+    def test_dashboard_cannot_republish_snapshot_after_remove(self):
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {"HEADROOM_DIR": root}):
+            home_a = os.path.join(root, "home-a")
+            home_b = os.path.join(root, "home-b")
+            registry.save({"schema_version": 1, "accounts": [
+                {"name": "a", "provider": "claude", "home": home_a},
+                {"name": "b", "provider": "claude", "home": home_b},
+            ]})
+            private = {
+                "schema_version": 1,
+                "run_id": "fixture",
+                "generated": int(time.time()),
+                "generated_iso": "fixture",
+                "accounts": [_claude_row("a"), _claude_row("b")],
+                "integrity_warnings": [],
+            }
+            paths.write_json_atomic(paths.private_snapshot_path(), private)
+            paths.write_json_atomic(
+                paths.public_snapshot_path(),
+                collect.public_snapshot(private, redact_emails=True), mode=0o644)
+
+            loaded = threading.Event()
+            release_dashboard = threading.Event()
+            removed = threading.Event()
+            dashboard_result = []
+            remove_result = []
+            original_load = paths.load_json
+            original_remove = registry.remove_account
+
+            def delayed_load(path):
+                if path == paths.private_snapshot_path():
+                    loaded.set()
+                    self.assertTrue(release_dashboard.wait(2))
+                return original_load(path)
+
+            def marked_remove(name):
+                removed.set()
+                return original_remove(name)
+
+            with mock.patch.object(paths, "load_json", side_effect=delayed_load), \
+                    mock.patch.object(dashboard, "build"), \
+                    mock.patch.object(registry, "remove_account",
+                                      side_effect=marked_remove):
+                dashboard_thread = threading.Thread(
+                    target=lambda: dashboard_result.append(
+                        __main__._dispatch(["dashboard"])))
+                dashboard_thread.start()
+                self.assertTrue(loaded.wait(2))
+                remove_thread = threading.Thread(
+                    target=lambda: remove_result.append(collect.remove_slot("a")))
+                remove_thread.start()
+                self.assertFalse(removed.wait(0.1))
+                release_dashboard.set()
+                dashboard_thread.join(2)
+                remove_thread.join(2)
+
+            self.assertFalse(dashboard_thread.is_alive())
+            self.assertFalse(remove_thread.is_alive())
+            self.assertEqual(dashboard_result, [0])
+            self.assertEqual(remove_result[0]["name"], "a")
+            self.assertTrue(removed.is_set())
+            public = paths.load_json(paths.public_snapshot_path())
+            self.assertEqual([row["name"] for row in public["accounts"]], ["b"])
+
+
+class ActionableClaudeRefresh(unittest.TestCase):
+    def test_expired_claude_token_recommends_manual_refresh(self):
+        account = _account("a")
+        identity = {"verified": True, "email": "a@example.test",
+                    "account_fingerprint": "FP", "method": "local"}
+        with mock.patch.object(collect, "claude_identity", return_value=identity), \
+                mock.patch.object(collect, "credential_digest", return_value="digest"), \
+                mock.patch.object(collect, "claude_plan", return_value="Max"), \
+                mock.patch.object(collect, "claude_limits", side_effect=
+                                  collect.IdentityBindingError(
+                                      "claude_usage_token_expired")):
+            row = collect.collect([account])["accounts"][0]
+        self.assertEqual(row["error_code"], "claude_usage_token_expired")
+        self.assertIn("headroom auth refresh a", row["note"])
+        self.assertNotIn("headroom connect a", row["note"])
 
 
 if __name__ == "__main__":

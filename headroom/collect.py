@@ -20,6 +20,7 @@ Fail-closed rules:
     derived for the dashboard (optionally with emails redacted).
 """
 import base64
+import contextlib
 import email.utils
 import fcntl
 import glob
@@ -27,6 +28,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1156,8 +1158,8 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["note"] = (
                     f"cached Claude token {what} — headroom never refreshes "
                     "credentials itself. Run one Claude Code turn on this "
-                    "account (the CLI refreshes its token) or `headroom "
-                    f"connect {account['name']}` to re-login; readings held "
+                    "account (the CLI refreshes its token) or `headroom auth "
+                    f"refresh {account['name']}` to re-login; readings held "
                     "until then.")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
@@ -1169,7 +1171,7 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                                   "and allow `security` access when prompted "
                                   "(set HEADROOM_CLAUDE_KEYCHAIN_SERVICE if your "
                                   "CLI uses a different item name); on "
-                                  "Linux/Windows run `headroom connect "
+                                  "Linux/Windows run `headroom auth refresh "
                                   f"{account['name']}` to log in.")
             else:
                 result["note"] = ("identity could not be bound to this slot; "
@@ -1220,18 +1222,39 @@ def public_snapshot(snapshot, redact_emails=False):
     }
 
 
-def run_collect(quiet=False):
-    """Full collect run: lock, read, write both snapshots. Returns snapshot."""
-    config = registry.load()
+@contextlib.contextmanager
+def collection_lock(blocking=True):
+    """Serialize collection with commands that remove collection state.
+
+    A nonblocking collector skips rather than queues behind another collector;
+    destructive state changes wait so a collector can never republish a slot
+    after it was removed.
+    """
     lock_path = paths.collect_lock_path()
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with open(lock_path, "w") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+            fcntl.flock(lock, flags)
         except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def run_collect(quiet=False):
+    """Full collect run: lock, read, write both snapshots. Returns snapshot."""
+    with collection_lock(blocking=False) as locked:
+        if not locked:
             if not quiet:
                 print("collector already running; skipped")
             return paths.load_json(paths.private_snapshot_path())
+        # Load only after the collection lock: a concurrent remove must not
+        # race a stale registry into a freshly written snapshot.
+        config = registry.load()
         backoff = paths.load_json(paths.backoff_path()) or empty_backoff()
 
         def persist(retry_at, provider="anthropic_usage_api"):
@@ -1271,6 +1294,107 @@ def run_collect(quiet=False):
         if not quiet:
             print_snapshot(snapshot)
         return snapshot
+
+
+def _warning_mentions_slot(warning, name):
+    """Whether an integrity-warning name token refers to this exact slot."""
+    return (isinstance(warning, str)
+            and name in re.findall(r"[a-z0-9_-]+", warning))
+
+
+def _prune_snapshot_slot(snapshot, name):
+    """Remove only one slot's rows and duplicate warning references in-place."""
+    if not isinstance(snapshot, dict):
+        return False
+    changed = False
+    accounts = snapshot.get("accounts")
+    if isinstance(accounts, list):
+        kept = [row for row in accounts
+                if not (isinstance(row, dict) and row.get("name") == name)]
+        if len(kept) != len(accounts):
+            snapshot["accounts"] = kept
+            changed = True
+    warnings = snapshot.get("integrity_warnings")
+    if isinstance(warnings, list):
+        kept = [warning for warning in warnings
+                if not _warning_mentions_slot(warning, name)]
+        if len(kept) != len(warnings):
+            snapshot["integrity_warnings"] = kept
+            changed = True
+    return changed
+
+
+def _load_snapshot_for_removal(path):
+    snapshot = paths.load_json(path)
+    if snapshot is None and os.path.exists(path):
+        raise RuntimeError(f"snapshot unreadable — inspect {path}")
+    return snapshot
+
+
+def remove_slot(name):
+    """Remove a registry slot and its per-slot collection/routing state.
+
+    Credential homes are intentionally out of scope: removal only un-registers
+    a slot, preserving any provider login for the operator to manage directly.
+    """
+    from . import route
+
+    with collection_lock():
+        private = _load_snapshot_for_removal(paths.private_snapshot_path())
+        public = _load_snapshot_for_removal(paths.public_snapshot_path())
+        # Refuse before mutating the registry if a protective ledger cannot be
+        # read and therefore cannot be safely scrubbed.
+        route.preflight_remove_slot_state()
+        # The registry mutation runs before the cooldown/quarantine scrub,
+        # preserving the established config -> cooldown -> quarantine order.
+        # The collection lock covers the full sequence, so a collector cannot
+        # start from the old registry and later overwrite these pruned feeds.
+        removed = registry.remove_account(name)
+        if _prune_snapshot_slot(private, name):
+            paths.write_json_atomic(paths.private_snapshot_path(), private)
+        if _prune_snapshot_slot(public, name):
+            paths.write_json_atomic(paths.public_snapshot_path(), public,
+                                    mode=0o644)
+        route.remove_slot_state(name)
+        return removed
+
+
+def cmd_remove(args):
+    """CLI: `headroom remove <slot> [--yes]`."""
+    yes = False
+    if len(args) == 2 and args[1] == "--yes" and not args[0].startswith("-"):
+        name, yes = args[0], True
+    elif len(args) == 1 and not args[0].startswith("-"):
+        name = args[0]
+    else:
+        print("usage: headroom remove <slot> [--yes]", file=sys.stderr)
+        return 2
+    accounts = registry.accounts()
+    if not any(account["name"] == name for account in accounts):
+        print(f"headroom: no connected account named {name!r}", file=sys.stderr)
+        return 2
+    if len(accounts) == 1:
+        print("headroom: refusing to remove the final connected account",
+              file=sys.stderr)
+        return 2
+    if not sys.stdin.isatty() and not yes:
+        print("headroom: --yes is required when stdin is not a TTY",
+              file=sys.stderr)
+        return 2
+    if not yes:
+        answer = input(
+            f"Remove slot '{name}' from Headroom? Its credential home will be kept. "
+            "[y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("remove cancelled")
+            return 1
+    try:
+        remove_slot(name)
+    except registry.RegistryError as error:
+        print(f"headroom: {error}", file=sys.stderr)
+        return 2
+    print(f"removed: {name} (credential home kept)")
+    return 0
 
 
 def display_percent(window):

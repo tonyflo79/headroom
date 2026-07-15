@@ -238,6 +238,26 @@ def mutate(fn):
         return config
 
 
+def remove_account(name):
+    """Atomically remove one non-final slot and return its former entry."""
+    removed = []
+
+    def _remove(config):
+        accounts = config["accounts"]
+        match = next((account for account in accounts
+                      if account.get("name") == name), None)
+        if match is None:
+            raise RegistryError(f"no connected account named {name!r}")
+        if len(accounts) == 1:
+            raise RegistryError("refusing to remove the final connected account")
+        config["accounts"] = [account for account in accounts
+                              if account.get("name") != name]
+        removed.append(dict(match))
+
+    mutate(_remove)
+    return removed[0]
+
+
 def apply_pins(pins):
     """Record usage-org pins WITHOUT clobbering a concurrent account add:
     take the config lock, reload the latest config, merge pins by slot name,
