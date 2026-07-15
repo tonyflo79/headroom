@@ -69,6 +69,17 @@ class TempDirCase(unittest.TestCase):
         self.addCleanup(patcher.stop)
         # never leak a held flock between tests
         self.addCleanup(route.release_slot_leases)
+        # _spawn now installs the signal guard before the window and leaves it
+        # for _monitor to restore; a direct _spawn call (no _monitor) would
+        # otherwise leak the guard's handlers — snapshot and restore them.
+        saved_handlers = {s: signal.getsignal(s)
+                          for s in (signal.SIGINT, signal.SIGHUP,
+                                    signal.SIGTERM)}
+
+        def _restore_signals():
+            for signum, handler in saved_handlers.items():
+                signal.signal(signum, handler)
+        self.addCleanup(_restore_signals)
         # _spawn now pre-validates the executable with shutil.which; make every
         # name resolve by default so these unit tests don't depend on the host
         # PATH. Tests that want a "missing binary" override this locally.
@@ -1519,6 +1530,134 @@ class R6SignalForwardOnLatch(TempDirCase):
             guard._shutdown(signal.SIGTERM, None)
             guard._shutdown(signal.SIGHUP, None)  # second signal: ignored
         self.assertEqual(kills, [signal.SIGTERM])  # forwarded exactly once
+
+    def test_attach_forwards_a_pre_latched_signal_once(self):
+        # a signal latched BEFORE a child attaches (e.g. during the Popen fork
+        # window, _process still None) is forwarded the instant attach binds
+        # the child — and attach is idempotent.
+        process = mock.Mock()
+        process.pid = 333
+        guard = supervisor._SignalGuard()  # no child yet
+        kills = []
+        with mock.patch.object(supervisor.os, "kill",
+                               side_effect=lambda pid, sig: kills.append(
+                                   (pid, sig))):
+            guard._shutdown(signal.SIGTERM, None)   # latched, no child -> no kill
+            self.assertEqual(kills, [])
+            self.assertFalse(guard.forwarded)
+            guard.attach(process)                    # now forward
+            guard.attach(process)                    # idempotent
+        self.assertTrue(guard.forwarded)
+        self.assertEqual(kills, [(333, signal.SIGTERM)])  # exactly once
+
+    def test_signal_in_attach_to_notify_window_forwards_no_orphan(self):
+        # the r7 gap: a SIGTERM delivered AFTER Popen success but while the
+        # launch notifier runs must be forwarded to the now-attached child.
+        # Exactly one child signal, no orphan.
+        account = self.account()
+        process = mock.Mock()
+        process.pid = 555555
+        forwards = []
+        captured = {}
+        real_guard = supervisor._SignalGuard
+
+        class CapturingGuard(real_guard):
+            def __init__(self, proc=None):
+                super().__init__(proc)
+                captured["guard"] = self
+
+            def install(self):        # don't touch the real process handlers
+                pass
+
+            def restore(self):
+                pass
+
+        def popen(argv, env=None, cwd=None, **kw):
+            return process
+
+        def emit(event):
+            # SIGTERM delivered during the launch notify (post Popen + attach)
+            if event.get("event") == "launch":
+                captured["guard"]._shutdown(signal.SIGTERM, None)
+            return True
+
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        with mock.patch.object(supervisor, "_SignalGuard", CapturingGuard), \
+                mock.patch.object(
+                    supervisor.os, "kill",
+                    side_effect=lambda pid, sig: forwards.append((pid, sig))), \
+                mock.patch.object(runner, "_settings_file", return_value=""), \
+                mock.patch.object(notify, "emit", side_effect=emit), \
+                redirect_stderr(io.StringIO()):
+            runner._spawn(account, [], self.temp.name, False)
+        # the child was attached before notify, so the mid-notify signal was
+        # forwarded to it exactly once — no orphaned, unforwarded child
+        self.assertEqual(forwards, [(555555, signal.SIGTERM)])
+        self.assertTrue(captured["guard"].forwarded)
+
+    def test_signal_before_attach_during_popen_forwards_at_attach(self):
+        # a SIGTERM delivered WHILE Popen runs (child forked, not yet attached)
+        # is latched and forwarded the instant the child attaches — no orphan.
+        account = self.account()
+        process = mock.Mock()
+        process.pid = 888
+        forwards = []
+        captured = {}
+        real_guard = supervisor._SignalGuard
+
+        class CapturingGuard(real_guard):
+            def __init__(self, proc=None):
+                super().__init__(proc)
+                captured["guard"] = self
+
+            def install(self):
+                pass
+
+            def restore(self):
+                pass
+
+        def popen(argv, env=None, cwd=None, **kw):
+            # signal arrives mid-Popen: latched, but no child attached yet
+            captured["guard"]._shutdown(signal.SIGTERM, None)
+            return process
+
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        with mock.patch.object(supervisor, "_SignalGuard", CapturingGuard), \
+                mock.patch.object(
+                    supervisor.os, "kill",
+                    side_effect=lambda pid, sig: forwards.append((pid, sig))), \
+                mock.patch.object(runner, "_settings_file", return_value=""), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            runner._spawn(account, [], self.temp.name, False)
+        self.assertEqual(forwards, [(888, signal.SIGTERM)])  # forwarded at attach
+
+    def test_spawn_failure_restores_handlers_and_clears_guard(self):
+        # a pre-spawn failure restores the installed handlers (no leak) and
+        # clears self._signals so run()'s recovery runs with normal disposition
+        account = self.account()
+        popen = mock.Mock(return_value=mock.Mock())
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        restores = {"n": 0}
+        real_guard = supervisor._SignalGuard
+
+        class CountingGuard(real_guard):
+            def install(self):
+                pass
+
+            def restore(self):
+                restores["n"] += 1
+
+        with mock.patch.object(supervisor, "_SignalGuard", CountingGuard), \
+                mock.patch.object(supervisor.shutil, "which",
+                                  return_value=None), \
+                mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.SupervisorError):
+                runner._spawn(account, [], self.temp.name, False)
+        self.assertEqual(restores["n"], 1)     # handlers restored on failure
+        self.assertIsNone(runner._signals)     # guard cleared
+        popen.assert_not_called()
 
     def test_signal_during_handle_events_forwards_before_any_notify(self):
         # the real risk: a signal arrives WHILE _handle_events runs and calls

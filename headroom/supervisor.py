@@ -679,6 +679,19 @@ class _SignalGuard:
             self.shutdown_signal = signum
             self._forward(signum)  # forward immediately, before returning
 
+    def attach(self, process):
+        """Bind the live child to this already-installed guard (P1, r7).
+
+        Called the instant Popen returns a child, BEFORE any post-spawn work.
+        Idempotent. Set _process FIRST so a signal delivered during attach is
+        forwarded by the handler; then forward any signal that was already
+        latched while there was no child (e.g. during the Popen fork window)."""
+        if self._process is not None:
+            return
+        self._process = process
+        if self.shutdown_signal is not None and not self.forwarded:
+            self._forward(self.shutdown_signal)
+
     def install(self):
         for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
             self.original[signum] = signal.getsignal(signum)
@@ -727,6 +740,10 @@ class Supervisor:
         # the account whose most recent spawn was left ambiguous — its lease
         # must NOT be released on unwind, since a live child may hold it (P0-1)
         self._ambiguous_account = None
+        # the signal guard for the CURRENT spawn cycle: installed by _spawn
+        # BEFORE the spawn window and reused by _monitor, so no instant after a
+        # child exists is ever unguarded (P1, r7)
+        self._signals = None
 
     def _settings_file(self, generation):
         directory = paths.ensure_private(_supervisors_dir())
@@ -769,63 +786,88 @@ class Supervisor:
         argv.extend(args)
         environment = self._environment(account, self.generation, automatic)
         launched_at = self.now()
-        # ---- PRE-SPAWN validation (OUTSIDE the ambiguous window) ----
-        # Everything that can POSITIVELY prove "no child will exist" is checked
-        # here, synchronously, BEFORE spawn_ambiguous is set. A failure here is
-        # an unambiguous pre-spawn failure: no fork has happened, so run() may
-        # safely recover / the caller may fall back.
+        # Install the signal guard BEFORE the spawn window and reuse it in
+        # _monitor, so no instant after a child could exist is ever unguarded
+        # (P1, r7). A signal before any child attaches just latches with
+        # nothing to forward; if a child then attaches it is forwarded then,
+        # and if the spawn fails the guard is restored below with no orphan.
+        guard = _SignalGuard()
+        guard.install()
+        self._signals = guard
         try:
-            if plan is not None:
-                handoff.verify_target_binding(plan)
-        except handoff.HandoffError as error:
-            raise SupervisorError(str(error)) from error
-        # resolve the executable up-front so a missing binary is a POSITIVE
-        # pre-spawn failure (preserving the missing-binary fallback nicety)
-        # instead of being inferred from catching Popen's OSError inside the
-        # window. (r5)
-        if shutil.which(argv[0]) is None:
-            raise SupervisorError(
-                f"`{argv[0]}` not found on PATH; nothing was started")
-        # the wrapper handshake means "launch committed": it must be the LAST
-        # fallible pre-spawn operation, AFTER every other pre-spawn check
-        # (settings/argv/env, verify_target_binding, which) — so an external
-        # marker-based wrapper sees a marker only when the spawn is truly
-        # imminent (P2-a, r6). A marker with no child would suppress the
-        # wrapper's bare-CLI fallback.
-        if self.generation == 1:
-            if not route.write_launch_marker("supervised", account):
+            # ---- PRE-SPAWN validation (OUTSIDE the ambiguous window) ----
+            # Everything that can POSITIVELY prove "no child will exist" is
+            # checked here, synchronously, BEFORE spawn_ambiguous is set. A
+            # failure here is an unambiguous pre-spawn failure: no fork has
+            # happened, so run() may safely recover / the caller may fall back.
+            try:
+                if plan is not None:
+                    handoff.verify_target_binding(plan)
+            except handoff.HandoffError as error:
+                raise SupervisorError(str(error)) from error
+            # resolve the executable up-front so a missing binary is a POSITIVE
+            # pre-spawn failure (preserving the missing-binary fallback nicety)
+            # instead of being inferred from catching Popen's OSError inside the
+            # window. (r5)
+            if shutil.which(argv[0]) is None:
                 raise SupervisorError(
-                    "launch marker could not be written; nothing was started")
-        # hand the account's lease fd to the child so the flock rides on the
-        # child (survives an ambiguous spawn / a supervisor exit); no-op unless
-        # HEADROOM_SLOT_LEASE=1 (then held_lease_fd is None and no pass_fds
-        # kwarg is added, so legacy-off Popen calls are byte-identical) (P0-1)
-        popen_kwargs = {}
-        lease_fd = route.held_lease_fd(account.get("name"))
-        if lease_fd is not None:
-            popen_kwargs["pass_fds"] = (lease_fd,)
-        # ---- the ambiguous window: ONLY the Popen call (r5) ----
-        # Conservative by type-INDEPENDENCE: set spawn_ambiguous=True right
-        # before Popen and, on ANY exception escaping Popen (OSError,
-        # KeyboardInterrupt, a trace/profile hook raising, anything), LEAVE it
-        # True — a child MAY be live, so the run() gate must suppress fallback
-        # and source recovery and retain the lease. We do NOT classify the
-        # exception; nothing inside this window ever clears the flag. No signal
-        # masking, no preexec_fn — trace hooks and signals are both moot.
-        #
-        # Accepted tiny trade: if the binary vanishes in the microsecond
-        # between which() and Popen (TOCTOU), the launch exits 127 without
-        # falling back. That is SAFE (never a double-brain), just a missed
-        # fallback in an astronomically rare case — safety beats the nicety.
-        self.spawn_ambiguous = True
-        process = self.popen(argv, env=environment, cwd=cwd, **popen_kwargs)
-        # Popen succeeded: a child IS live. Do NOT clear spawn_ambiguous or set
-        # spawned_any here — leave the window OPEN across the ENTIRE successful
-        # return (the notify below AND the Child construction). run() closes
-        # the window only once it has safely received this Child and taken
-        # ownership, so any failure between Popen-success and run()-holds-Child
-        # (e.g. Child construction) keeps spawn_ambiguous True → the run() gate
-        # suppresses source recovery and retains the lease. (P0-1)
+                    f"`{argv[0]}` not found on PATH; nothing was started")
+            # the wrapper handshake means "launch committed": it must be the
+            # LAST fallible pre-spawn operation, AFTER every other pre-spawn
+            # check (settings/argv/env, verify_target_binding, which) — so an
+            # external marker-based wrapper sees a marker only when the spawn is
+            # truly imminent (P2-a, r6). A marker with no child would suppress
+            # the wrapper's bare-CLI fallback.
+            if self.generation == 1:
+                if not route.write_launch_marker("supervised", account):
+                    raise SupervisorError(
+                        "launch marker could not be written; nothing was "
+                        "started")
+            # hand the account's lease fd to the child so the flock rides on
+            # the child (survives an ambiguous spawn / a supervisor exit);
+            # no-op unless HEADROOM_SLOT_LEASE=1 (then held_lease_fd is None and
+            # no pass_fds kwarg is added, so legacy-off Popen calls are
+            # byte-identical) (P0-1)
+            popen_kwargs = {}
+            lease_fd = route.held_lease_fd(account.get("name"))
+            if lease_fd is not None:
+                popen_kwargs["pass_fds"] = (lease_fd,)
+            # ---- the ambiguous window: ONLY the Popen call (r5) ----
+            # Conservative by type-INDEPENDENCE: set spawn_ambiguous=True right
+            # before Popen and, on ANY exception escaping Popen (OSError,
+            # KeyboardInterrupt, a trace/profile hook raising, anything), LEAVE
+            # it True — a child MAY be live, so the run() gate must suppress
+            # fallback and source recovery and retain the lease. We do NOT
+            # classify the exception; nothing inside this window ever clears the
+            # flag. No signal masking, no preexec_fn — trace hooks and signals
+            # are both moot.
+            #
+            # Accepted tiny trade: if the binary vanishes in the microsecond
+            # between which() and Popen (TOCTOU), the launch exits 127 without
+            # falling back. That is SAFE (never a double-brain), just a missed
+            # fallback in an astronomically rare case — safety beats the nicety.
+            self.spawn_ambiguous = True
+            process = self.popen(argv, env=environment, cwd=cwd,
+                                 **popen_kwargs)
+        except BaseException:
+            # No child was attached to this guard (a pre-spawn failure, or an
+            # ambiguous Popen exception whose possible orphan we have no handle
+            # for — the accepted r5 trade). Restore the handlers so run()'s
+            # recovery / fallback / stop runs with normal signal disposition.
+            guard.restore()
+            self._signals = None
+            raise
+        # Popen succeeded: a child IS live. ATTACH it to the already-installed
+        # guard IMMEDIATELY, before ANY post-spawn work (the notify below, the
+        # Child construction) — so from this instant a delivered signal is
+        # forwarded to the child, closing the r6 attach gap (P1, r7).
+        guard.attach(process)
+        # Do NOT clear spawn_ambiguous or set spawned_any here — leave the
+        # window OPEN across the ENTIRE successful return. run() closes it only
+        # once it has safely received this Child and taken ownership, so any
+        # failure between Popen-success and run()-holds-Child (e.g. Child
+        # construction) keeps spawn_ambiguous True → the run() gate suppresses
+        # source recovery and retains the lease. (P0-1)
         # launch notify only AFTER a real child exists, so a lost `fallback`
         # event can never leave a dispatcher believing "supervised and started"
         # when nothing did (P1-5)
@@ -1355,10 +1397,15 @@ class Supervisor:
         return proof
 
     def _monitor(self, child, pending_handoff_id=""):
-        # give the guard the child handle so a shutdown signal is forwarded the
-        # instant it is latched (P1, r6)
-        signals = _SignalGuard(child.process)
-        signals.install()
+        # REUSE the guard _spawn installed+attached before/around the spawn
+        # window, so there is no unguarded instant between spawn-success and
+        # here (P1, r7). Fall back to constructing one only for a direct call
+        # that did not go through _spawn (tests).
+        signals = self._signals
+        if signals is None:
+            signals = _SignalGuard(child.process)
+            signals.install()
+            self._signals = signals
         proof = None
         try:
             while True:
@@ -1440,6 +1487,7 @@ class Supervisor:
                 self.sleep(POLL_SECONDS)
         finally:
             signals.restore()
+            self._signals = None
 
     def run(self):
         account = self.account
@@ -1565,6 +1613,12 @@ class Supervisor:
                 clean_exit = True
                 return last_exit
         finally:
+            # defensively restore signal handlers if a guard was installed by
+            # _spawn but _monitor never got to restore it (P1, r7); normal
+            # flow already restored it in _monitor's finally.
+            if self._signals is not None:
+                self._signals.restore()
+                self._signals = None
             # the supervised launch is ending: release every lease this
             # supervisor holds so a waiting launch can take the account —
             # EXCEPT an account whose spawn was left ambiguous, whose lease

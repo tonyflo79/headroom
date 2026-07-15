@@ -855,6 +855,14 @@ class HookProof(unittest.TestCase):
 
 
 class CliWiring(unittest.TestCase):
+    def setUp(self):
+        # a direct _spawn call installs the signal guard and leaves it for
+        # _monitor; with no _monitor here, restore handlers after each test
+        saved = {s: signal.getsignal(s)
+                 for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)}
+        self.addCleanup(
+            lambda: [signal.signal(s, h) for s, h in saved.items()])
+
     def test_plain_claude_with_auto_off_keeps_exec_path(self):
         with mock.patch.object(registry, "auto_handoff", return_value=False), \
                 mock.patch("headroom.route.cmd_exec", return_value=17) as execute:
