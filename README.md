@@ -1,11 +1,15 @@
 # headroom
 
-**Never hit a Claude or Codex usage limit mid-flight again.**
+**A live dashboard for every Claude and Codex subscription you own — read
+straight from the providers *without spending a single token* — that rotates
+you to the next account with headroom the moment one hits a limit.**
 
-headroom tracks the remaining capacity of every Claude and ChatGPT/Codex
-subscription you own — *without spending a single token* — puts it on a live
-dashboard you'll actually want to look at, and rotates your tools to the next
-account with headroom the moment one hits a limit.
+The heart of headroom is a **live web dashboard you run locally**. Run
+`headroom serve`, open `http://127.0.0.1:8377`, and every account's 5-hour,
+weekly, and model-scoped capacity is on one page, updating in real time. It's
+an ordinary local web page, so it works in any browser on any OS — you're not
+tied to one machine. A menu-bar app and pinnable desktop widgets are optional
+extras layered on the same data, for a glance without opening a tab.
 
 https://github.com/user-attachments/assets/71e8ec51-8f0f-4ec2-806f-221b9eb6571f
 
