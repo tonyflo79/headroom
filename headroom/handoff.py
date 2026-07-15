@@ -25,6 +25,12 @@ from . import collect, paths, registry, route
 
 SCHEMA = "headroom_handoff@2"
 MAX_SCAN_AGE = 48 * 3600
+# Freshness tolerance for the manual handoff's target snapshot. Not zero:
+# a running `headroom serve` holds the single-flight collect lock, so a
+# zero-second demand made every manual handoff fail while the dashboard was
+# up. The launch still re-verifies the target's live credential binding.
+HANDOFF_SNAPSHOT_MAX_AGE = int(
+    os.environ.get("HEADROOM_HANDOFF_SNAPSHOT_MAX_AGE", "60"))
 
 
 class HandoffError(RuntimeError):
@@ -1343,7 +1349,14 @@ def cmd_handoff(args):
                 "--provider codex")
         source = resolve_source(options["session"], accounts, cwd)
         family = resolve_model_family(source, options["model"])
-        snapshot = route.ensure_fresh_snapshot(max_age=0)
+        # A modest tolerance, NOT max_age=0: a running dashboard collects on
+        # every poll and holds the single-flight collect lock, so demanding a
+        # zero-second snapshot made the manual handoff fail with "no fresh
+        # snapshot" whenever `headroom serve` was up. A reading this recent is
+        # a sound basis for choosing the target — the target's bound identity
+        # is re-verified from the snapshot here and the account's live
+        # credential binding is re-checked again at the actual launch.
+        snapshot = route.ensure_fresh_snapshot(max_age=HANDOFF_SNAPSHOT_MAX_AGE)
         if snapshot is None:
             raise HandoffError("no fresh usage snapshot — handoff held")
         target = select_target(source.account["name"], snapshot, family,
