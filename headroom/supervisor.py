@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 
-from . import collect, handoff, paths, registry, route
+from . import collect, handoff, notify, paths, registry, route
 
 POLL_SECONDS = 0.25
 BIND_TIMEOUT = 30.0
@@ -53,7 +53,8 @@ CLAUDE_VALUE_FLAGS = {
 # is the boolean complement.  Unknown flags are boolean too; only this known
 # value-taking list may consume the following argument.
 HEADROOM_OVERRIDE_FLAGS = {
-    "--headroom-auto-handoff", "--headroom-no-auto-handoff"}
+    "--headroom-auto-handoff", "--headroom-no-auto-handoff",
+    "--headroom-launch-fallback"}
 
 
 class SupervisorError(RuntimeError):
@@ -121,6 +122,7 @@ class Child:
     session_epochs: dict = field(default_factory=dict)
     last_received_at: float = 0.0
     pending_cap: PendingCap = None
+    supervision_loss_notified: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,20 @@ class Relaunch:
     automatic: bool
     handoff_id: str = ""
     plan: object = None
+
+
+def _lose_supervision(child, reason):
+    """Turn automation off for this child and (once per child) notify the
+    loss. Post-spawn supervision loss is exactly what an external dispatcher
+    cannot see on its own: the launch looked supervised, but auto-handoff
+    will silently not fire. The notify is a no-op unless HEADROOM_NOTIFY_CMD
+    is set; the stderr diagnostics at each call site are unchanged."""
+    child.automation = False
+    if not child.supervision_loss_notified:
+        child.supervision_loss_notified = True
+        notify.emit({"event": "supervision_lost",
+                     "account": child.account.get("name", ""),
+                     "reason": str(reason)})
 
 
 def _supervisors_dir():
@@ -260,11 +276,14 @@ def incompatible_args(args):
     return ""
 
 
-def strip_headroom_overrides(args):
-    """Remove only real headroom options from Claude's option segment."""
+def split_headroom_flags(args):
+    """Remove every headroom-owned flag from Claude's option segment.
+
+    Returns (cleaned_args, flags_found). Values of known value-taking Claude
+    flags and everything after `--` pass through untouched, exactly like the
+    original override stripping."""
     cleaned = []
-    auto = False
-    no_auto = False
+    found = set()
     value_expected = False
     after_separator = False
     for arg in args:
@@ -279,16 +298,20 @@ def strip_headroom_overrides(args):
             cleaned.append(arg)
             after_separator = True
             continue
-        if arg == "--headroom-auto-handoff":
-            auto = True
-            continue
-        if arg == "--headroom-no-auto-handoff":
-            no_auto = True
+        if arg in HEADROOM_OVERRIDE_FLAGS:
+            found.add(arg)
             continue
         cleaned.append(arg)
         if arg in CLAUDE_VALUE_FLAGS:
             value_expected = True
-    return cleaned, auto, no_auto
+    return cleaned, found
+
+
+def strip_headroom_overrides(args):
+    """Remove only real headroom options from Claude's option segment."""
+    cleaned, found = split_headroom_flags(args)
+    return (cleaned, "--headroom-auto-handoff" in found,
+            "--headroom-no-auto-handoff" in found)
 
 
 def _strings(value):
@@ -678,6 +701,11 @@ class Supervisor:
         self.supervisor_id = supervisor_id or str(uuid.uuid4())
         self.generation = 0
         self.settings_files = []
+        # True once ANY child CLI process has been successfully spawned —
+        # the hard boundary for the opt-in launch fallback (see cmd_claude):
+        # a failure after this point is normal supervision/exit, never a
+        # "no CLI was ever started" condition
+        self.spawned_any = False
 
     def _settings_file(self, generation):
         directory = paths.ensure_private(_supervisors_dir())
@@ -724,10 +752,13 @@ class Supervisor:
         # thing before the spawn, after every piece of preparation that could
         # still fail (settings file, argv, env) — a marker with no child
         # would suppress the wrapper's bare-CLI fallback
-        if self.generation == 1 and not route.write_launch_marker(
-                "supervised", account):
-            raise SupervisorError(
-                "launch marker could not be written; nothing was started")
+        if self.generation == 1:
+            if not route.write_launch_marker("supervised", account):
+                raise SupervisorError(
+                    "launch marker could not be written; nothing was started")
+            notify.emit({"event": "launch", "mode": "supervised",
+                         "account": account.get("name", ""),
+                         "model": self.family, "note": ""})
         try:
             if plan is not None:
                 handoff.verify_target_binding(plan)
@@ -736,6 +767,7 @@ class Supervisor:
             raise SupervisorError(str(error)) from error
         except OSError as error:
             raise SupervisorError(f"cannot start Claude: {error}") from error
+        self.spawned_any = True
         return Child(process, account, self.generation,
                      event_path(self.supervisor_id), settings, launched_at,
                      automatic)
@@ -810,11 +842,11 @@ class Supervisor:
                 print("[headroom] rate-limit hook was not a subscription cap; "
                       "child continues", file=sys.stderr)
         except PendingCapTimeout as error:
-            child.automation = False
+            _lose_supervision(child, f"cap-time model unavailable: {error}")
             print(f"[headroom] {error}; automatic handoff disabled — /exit then "
                   "`headroom handoff` to move manually", file=sys.stderr)
         except PermanentSupervisorError as error:
-            child.automation = False
+            _lose_supervision(child, f"cap not corroborated: {error}")
             child.pending_cap = None
             print(f"[headroom] cap not corroborated ({error}); automatic "
                   "handoff disabled for this child", file=sys.stderr)
@@ -1090,7 +1122,7 @@ class Supervisor:
             self._failure(plan, "stop_failed: " + reason)
             print("[headroom] Claude did not exit after one SIGTERM; automatic "
                   "handoff disabled for this child", file=sys.stderr)
-            child.automation = False
+            _lose_supervision(child, "Claude did not exit after one SIGTERM")
             return None
         try:
             if stop_error is not None:
@@ -1125,7 +1157,7 @@ class Supervisor:
         except SupervisorError as error:
             print(f"[headroom] {error}; automatic handoff disabled for this child",
                   file=sys.stderr)
-            child.automation = False
+            _lose_supervision(child, f"hook event journal unreadable: {error}")
             child.pending_cap = None
             return None
         _remember_binding(child)
@@ -1152,7 +1184,7 @@ class Supervisor:
             except SupervisorError as error:
                 print(f"[headroom] malformed hook event ({error}); automatic "
                       "handoff disabled for this child", file=sys.stderr)
-                child.automation = False
+                _lose_supervision(child, f"malformed hook event: {error}")
                 child.pending_cap = None
                 return None
             if hook_name == "SessionStart":
@@ -1176,7 +1208,7 @@ class Supervisor:
                         child.resume_bound = True
                 except (SupervisorError, handoff.HandoffError, RuntimeError,
                         OSError) as error:
-                    child.automation = False
+                    _lose_supervision(child, f"session binding failed: {error}")
                     print(f"[headroom] {error}; automatic handoff disabled for "
                           "this child", file=sys.stderr)
                     return None
@@ -1191,7 +1223,8 @@ class Supervisor:
                         child.pending_cap.session_id, child.pending_cap.epoch):
                     child.pending_cap = None
                 if epoch is None:
-                    child.automation = False
+                    _lose_supervision(
+                        child, "SessionEnd has no known session epoch")
                     print("[headroom] SessionEnd has no known session epoch; "
                           "automatic handoff disabled for this child",
                           file=sys.stderr)
@@ -1244,7 +1277,9 @@ class Supervisor:
                               "automatic handoff disabled for this child",
                               file=sys.stderr)
                         child.hint_printed = True
-                    child.automation = False
+                    _lose_supervision(
+                        child, "SessionStart hook never bound within "
+                        f"{BIND_TIMEOUT:g}s — auto-handoff is not armed")
                 if proof is not None and child.automation:
                     try:
                         plan = self._preflight(child, proof)
@@ -1254,12 +1289,14 @@ class Supervisor:
                         if "changed recently" not in str(error):
                             print(f"[headroom] automatic handoff held: {error}; "
                                   "child continues", file=sys.stderr)
-                            child.automation = False
+                            _lose_supervision(
+                                child, f"automatic handoff held: {error}")
                             proof = None
                     except SupervisorError as error:
                         print(f"[headroom] automatic handoff held: {error}; child "
                               "continues", file=sys.stderr)
-                        child.automation = False
+                        _lose_supervision(
+                            child, f"automatic handoff held: {error}")
                         proof = None
                     else:
                         try:
@@ -1269,7 +1306,8 @@ class Supervisor:
                             print(f"[headroom] automatic handoff held: {error}; "
                                   "automatic handoff disabled for this child",
                                   file=sys.stderr)
-                            child.automation = False
+                            _lose_supervision(
+                                child, f"handoff stop failed: {error}")
                             proof = None
                             relaunch = None
                         if relaunch is not None:
@@ -1327,7 +1365,8 @@ class Supervisor:
                     except handoff.HandoffError as error:
                         print(f"[headroom] could not ledger resume spawn: {error}; "
                               "automatic handoff disabled", file=sys.stderr)
-                        child.automation = False
+                        _lose_supervision(
+                            child, f"resume spawn could not be ledgered: {error}")
                         automatic = False
                 outcome = self._monitor(child, pending_handoff_id)
                 if isinstance(outcome, Relaunch):
@@ -1382,9 +1421,37 @@ def _initial_account(family):
     return account if reason is None else None
 
 
-def cmd_claude(family, args):
-    account = _initial_account(family)
+def cmd_claude(family, args, fallback_argv=None):
+    """Supervised launch. `fallback_argv` (opt-in, from
+    --headroom-launch-fallback / HEADROOM_LAUNCH_FALLBACK=1) is the bare CLI
+    argv to exec in-process when ANYTHING fails strictly BEFORE the first
+    child CLI process was successfully spawned. Once a child has started
+    (Supervisor.spawned_any), a later child exit — clean, capped, or a
+    supervised handoff that runs out of accounts — is a normal exit and
+    NEVER triggers the fallback."""
+    try:
+        account = _initial_account(family)
+        # commit: claim the slot lease (no-op unless HEADROOM_SLOT_LEASE=1);
+        # on the rare claim race, re-pick once — the lease check inside
+        # block_reason now skips the account the other launch holds
+        if account is not None \
+                and not route.acquire_slot_lease(account, family):
+            print(f"[headroom] {account['name']} is leased by another live "
+                  f"launch — picking another", file=sys.stderr)
+            account = _initial_account(family)
+            if account is not None \
+                    and not route.acquire_slot_lease(account, family):
+                account = None
+    except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
+        if fallback_argv is not None:
+            return route.bare_fallback_exec(
+                fallback_argv, f"launch preparation failed: {error}")
+        raise
     if account is None:
+        if fallback_argv is not None:
+            return route.bare_fallback_exec(
+                fallback_argv,
+                f"no account for '{family}' has proven headroom")
         print(f"[headroom] no account for '{family}' has proven headroom; "
               f"try `headroom status {family}`", file=sys.stderr)
         return 2
@@ -1394,4 +1461,17 @@ def cmd_claude(family, args):
     # _spawn, immediately before the first Popen — after settings/argv/env
     # preparation, so a marker can never exist without a child having been
     # given its chance to start
-    return Supervisor(family, args, account).run()
+    runner = Supervisor(family, args, account)
+    try:
+        result = runner.run()
+    except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
+        if fallback_argv is not None and not runner.spawned_any:
+            return route.bare_fallback_exec(
+                fallback_argv, f"failed before Claude started: {error}")
+        raise
+    if fallback_argv is not None and not runner.spawned_any:
+        # run() returned without ever spawning a child (e.g. the very first
+        # spawn failed) — strictly before-first-spawn, so fall back
+        return route.bare_fallback_exec(
+            fallback_argv, "Claude never started (details on stderr)")
+    return result
