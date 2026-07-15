@@ -1659,6 +1659,43 @@ class R6SignalForwardOnLatch(TempDirCase):
         self.assertIsNone(runner._signals)     # guard cleared
         popen.assert_not_called()
 
+    def test_latched_shutdown_during_pre_spawn_failure_is_replayed(self):
+        # a kill latched DURING the pre-spawn window (which() / marker) that
+        # then fails must be honoured with the restored disposition, NOT
+        # dropped into fallback/recovery — a requested kill never yields a new
+        # launch (P1, r8). raise_signal is mocked so the test isn't killed.
+        account = self.account()
+        popen = mock.Mock(return_value=mock.Mock())
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        real_guard = supervisor._SignalGuard
+        captured = {}
+
+        class CapturingGuard(real_guard):
+            def __init__(self, proc=None):
+                super().__init__(proc)
+                captured["guard"] = self
+
+            def install(self):
+                pass
+
+            def restore(self):
+                pass
+
+        def latch_then_miss(_name):
+            captured["guard"]._shutdown(signal.SIGTERM, None)
+            return None  # which() reports the binary missing -> pre-spawn fail
+
+        with mock.patch.object(supervisor, "_SignalGuard", CapturingGuard), \
+                mock.patch.object(supervisor.shutil, "which",
+                                  side_effect=latch_then_miss), \
+                mock.patch.object(supervisor.signal, "raise_signal") as replay, \
+                mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.SupervisorError):
+                runner._spawn(account, [], self.temp.name, False)
+        replay.assert_called_once_with(signal.SIGTERM)  # kill honoured
+        popen.assert_not_called()                       # no child launched
+
     def test_signal_during_handle_events_forwards_before_any_notify(self):
         # the real risk: a signal arrives WHILE _handle_events runs and calls
         # a (blocking) notifier. The forward must have already happened in the

@@ -854,8 +854,16 @@ class Supervisor:
             # ambiguous Popen exception whose possible orphan we have no handle
             # for — the accepted r5 trade). Restore the handlers so run()'s
             # recovery / fallback / stop runs with normal signal disposition.
+            latched = guard.shutdown_signal
             guard.restore()
             self._signals = None
+            # If a shutdown was requested DURING the pre-spawn window (which()
+            # / marker write) and that op then failed, honour the kill with the
+            # now-restored disposition instead of propagating into fallback /
+            # source recovery — a requested kill must never result in a NEW
+            # launch. Replay it before re-raising (P1, r8).
+            if latched is not None:
+                signal.raise_signal(latched)
             raise
         # Popen succeeded: a child IS live. ATTACH it to the already-installed
         # guard IMMEDIATELY, before ANY post-spawn work (the notify below, the
