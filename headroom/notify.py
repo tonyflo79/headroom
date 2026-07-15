@@ -9,16 +9,24 @@ transitions with a single JSON argument describing the event:
     {"event": "supervision_lost", "account": ..., "reason": ...}
     {"event": "fallback", "reason": ...}
 
-Delivery is best-effort and bounded: the command gets a hard timeout
-(default 10s, override with ``HEADROOM_NOTIFY_TIMEOUT``) and is killed when
-it exceeds it. A broken, missing, or hung notify command is swallowed with a
-stderr line — it must never block, materially delay, or kill the launch.
-This replaces external marker-polling with events; it composes with, and is
-independent of, the ``HEADROOM_LAUNCH_MARKER`` handshake.
+Delivery is best-effort and bounded: the command runs in its own process
+group with a hard timeout (default 10s, override with
+``HEADROOM_NOTIFY_TIMEOUT``); on timeout the WHOLE group is SIGKILLed so a
+``worker & wait`` observer can't leave descendants alive. A broken, missing,
+or hung notify command is swallowed with a stderr line — it must never block,
+materially delay, or kill the launch. This replaces external marker-polling
+with events; it composes with, and is independent of, the
+``HEADROOM_LAUNCH_MARKER`` handshake.
+
+SECURITY: ``HEADROOM_NOTIFY_CMD`` is TRUSTED code — it runs as the invoking
+user with that user's privileges and environment. The timeout bounds latency
+and reaps runaways; it is NOT a sandbox. Only set this to a command you
+control, exactly as you would any other command in your launch script.
 """
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -52,8 +60,9 @@ def emit(event):
         if not argv:
             return False
         payload = json.dumps(event, sort_keys=True, allow_nan=False)
-        # start_new_session so a hung command can be killed without touching
-        # the launch's terminal/process group; all stdio detached so a chatty
+        # start_new_session makes the command its own session/group leader
+        # (pgid == pid), so a hung command is killed without touching the
+        # launch's terminal/process group; all stdio detached so a chatty
         # observer can never corrupt the CLI's screen
         process = subprocess.Popen(
             argv + [payload],
@@ -62,13 +71,19 @@ def emit(event):
         try:
             process.wait(timeout=_timeout())
         except subprocess.TimeoutExpired:
-            process.kill()
+            # SIGKILL the WHOLE group, not just the direct child: a shell that
+            # backgrounded workers (`worker & wait`) would otherwise leave them
+            # alive to accumulate. Then reap the leader so it isn't a zombie.
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                process.kill()  # group gone/unavailable — fall back to the pid
             try:
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 pass
-            print("[headroom] notify command timed out and was killed "
-                  "(launch continues)", file=sys.stderr)
+            print("[headroom] notify command timed out; its process group was "
+                  "killed (launch continues)", file=sys.stderr)
             return False
         return True
     except Exception as error:  # noqa: BLE001 — an observer can never be fatal

@@ -706,6 +706,9 @@ class Supervisor:
         # a failure after this point is normal supervision/exit, never a
         # "no CLI was ever started" condition
         self.spawned_any = False
+        # True only inside the Popen window (P0-3): while set, the spawn
+        # outcome is unknown and the launch fallback must be suppressed
+        self.spawn_ambiguous = False
 
     def _settings_file(self, generation):
         directory = paths.ensure_private(_supervisors_dir())
@@ -756,18 +759,34 @@ class Supervisor:
             if not route.write_launch_marker("supervised", account):
                 raise SupervisorError(
                     "launch marker could not be written; nothing was started")
-            notify.emit({"event": "launch", "mode": "supervised",
-                         "account": account.get("name", ""),
-                         "model": self.family, "note": ""})
+        # validation that can still positively identify a PRE-spawn failure
+        # (no child could exist) happens here, OUTSIDE the ambiguous window
         try:
             if plan is not None:
                 handoff.verify_target_binding(plan)
-            process = self.popen(argv, env=environment, cwd=cwd)
         except handoff.HandoffError as error:
             raise SupervisorError(str(error)) from error
+        # From just before Popen until the outcome is known the spawn is
+        # AMBIGUOUS: an async failure (signal/trace handler raising) in this
+        # window may leave a LIVE child while spawned_any is still False, so
+        # the fallback MUST be suppressed. spawn_ambiguous stays True through
+        # any such escape; it is cleared to "definitely no child" only on a
+        # positively-identified pre-spawn OSError from Popen. (P0-3)
+        self.spawn_ambiguous = True
+        try:
+            process = self.popen(argv, env=environment, cwd=cwd)
         except OSError as error:
+            self.spawn_ambiguous = False  # Popen raised — no child exists
             raise SupervisorError(f"cannot start Claude: {error}") from error
         self.spawned_any = True
+        self.spawn_ambiguous = False
+        # launch notify only AFTER a real child exists and the no-fallback
+        # boundary is recorded, so a lost `fallback` event can never leave a
+        # dispatcher believing "supervised and started" when nothing did (P1-5)
+        if self.generation == 1:
+            notify.emit({"event": "launch", "mode": "supervised",
+                         "account": account.get("name", ""),
+                         "model": self.family, "note": ""})
         return Child(process, account, self.generation,
                      event_path(self.supervisor_id), settings, launched_at,
                      automatic)
@@ -1044,6 +1063,29 @@ class Supervisor:
         except Exception:  # recovery must proceed even if the ledger is broken
             pass
 
+    def _lease_target(self, plan):
+        """Acquire the TARGET account's flock BEFORE stopping the source, so a
+        concurrent launch can't double-book the account we're moving to. The
+        source lease is deliberately kept until the target child spawns (run()
+        reconciliation drops it), and on any failure here the handoff is held
+        with the source still running AND still leased. No-op unless
+        HEADROOM_SLOT_LEASE=1. (P0-2)"""
+        try:
+            if not route.acquire_slot_lease(plan.target, plan.family):
+                raise SupervisorError(
+                    "target slot is leased by another live launch")
+        except route.LeaseError as error:
+            raise SupervisorError(
+                f"target slot lease unavailable: {error}") from error
+
+    def _reconcile_leases(self, active_name):
+        """Hold exactly the ACTIVE child's lease: release every other lease
+        this supervisor took (the old source after a rotation, or a target we
+        acquired for a handoff that then failed). No-op unless leasing is on."""
+        for name in route.held_lease_names():
+            if name != active_name:
+                route.release_slot_lease(name)
+
     @staticmethod
     def _source_relaunch(plan):
         return Relaunch(plan.source.account,
@@ -1086,6 +1128,10 @@ class Supervisor:
             raise SupervisorError("cap reset elapsed before stop")
         print(f"[headroom] cap confirmed; {plan.source.account['name']} -> "
               f"{plan.target['name']}", file=sys.stderr)
+        # take the target lease before we stop the source (P0-2); on failure
+        # this raises SupervisorError and the caller keeps the source running
+        # and leased
+        self._lease_target(plan)
         saved = self._save_terminal()
         stop_error = None
         stop_sent_at = 0.0
@@ -1248,11 +1294,13 @@ class Supervisor:
                 and child.automation:
             proof = self._attempt_cap(child, child.pending_cap.event)
         if _binding_key(child.binding) in child.dead_sessions:
-            child.automation = False
             child.pending_cap = None
             print("[headroom] current session ended without a replacement "
                   "SessionStart; automatic handoff disabled for this child",
                   file=sys.stderr)
+            _lose_supervision(
+                child, "current session ended without a replacement "
+                "SessionStart")
             return None
         return proof
 
@@ -1355,6 +1403,12 @@ class Supervisor:
                     return 127
                 pending_plan = None
                 recovery_plan = None
+                # the active child now exists on `child.account`: hold exactly
+                # its lease. After a rotation this releases the OLD source
+                # lease (kept until the target spawned, per _lease_target);
+                # after a failed rotation it releases the unused target lease.
+                # (P0-2)
+                self._reconcile_leases(child.account["name"])
                 if pending_handoff_id:
                     try:
                         handoff.append_action(
@@ -1391,6 +1445,10 @@ class Supervisor:
                 clean_exit = True
                 return last_exit
         finally:
+            # the supervised launch is ending: release every lease this
+            # supervisor holds so a waiting launch can take the account (crash
+            # exits rely on the kernel dropping the flock instead)
+            route.release_slot_leases()
             if clean_exit:
                 self._cleanup_files()
 
@@ -1426,14 +1484,16 @@ def cmd_claude(family, args, fallback_argv=None):
     --headroom-launch-fallback / HEADROOM_LAUNCH_FALLBACK=1) is the bare CLI
     argv to exec in-process when ANYTHING fails strictly BEFORE the first
     child CLI process was successfully spawned. Once a child has started
-    (Supervisor.spawned_any), a later child exit — clean, capped, or a
-    supervised handoff that runs out of accounts — is a normal exit and
-    NEVER triggers the fallback."""
+    (Supervisor.spawned_any) — or while the spawn outcome is even AMBIGUOUS
+    (Supervisor.spawn_ambiguous, P0-3) — a later exit or crash is a normal
+    supervision/exit path and NEVER triggers the fallback, so a live child is
+    never duplicated by a bare relaunch."""
     try:
         account = _initial_account(family)
-        # commit: claim the slot lease (no-op unless HEADROOM_SLOT_LEASE=1);
+        # commit: take the slot flock (no-op unless HEADROOM_SLOT_LEASE=1);
         # on the rare claim race, re-pick once — the lease check inside
-        # block_reason now skips the account the other launch holds
+        # block_reason now skips the account the other launch holds. A
+        # LeaseError (infra failure) propagates to fail closed below.
         if account is not None \
                 and not route.acquire_slot_lease(account, family):
             print(f"[headroom] {account['name']} is leased by another live "
@@ -1442,6 +1502,16 @@ def cmd_claude(family, args, fallback_argv=None):
             if account is not None \
                     and not route.acquire_slot_lease(account, family):
                 account = None
+    except route.LeaseError as error:
+        # HEADROOM_SLOT_LEASE=1 fails closed: refuse the routed launch. With
+        # the explicit fallback opt-in, still degrade to a bare CLI (the
+        # caller asked to always run something).
+        print(f"[headroom] slot lease unavailable ({error}); refusing to "
+              f"launch — HEADROOM_SLOT_LEASE=1 fails closed", file=sys.stderr)
+        if fallback_argv is not None:
+            return route.bare_fallback_exec(
+                fallback_argv, f"slot lease unavailable: {error}")
+        return 2
     except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
         if fallback_argv is not None:
             return route.bare_fallback_exec(
@@ -1462,14 +1532,21 @@ def cmd_claude(family, args, fallback_argv=None):
     # preparation, so a marker can never exist without a child having been
     # given its chance to start
     runner = Supervisor(family, args, account)
+
+    def _may_fall_back():
+        # strictly before-first-spawn AND the spawn outcome is unambiguous:
+        # a live-but-unacknowledged child (spawn_ambiguous) must NOT fall back
+        return (fallback_argv is not None and not runner.spawned_any
+                and not runner.spawn_ambiguous)
+
     try:
         result = runner.run()
     except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
-        if fallback_argv is not None and not runner.spawned_any:
+        if _may_fall_back():
             return route.bare_fallback_exec(
                 fallback_argv, f"failed before Claude started: {error}")
         raise
-    if fallback_argv is not None and not runner.spawned_any:
+    if _may_fall_back():
         # run() returned without ever spawning a child (e.g. the very first
         # spawn failed) — strictly before-first-spawn, so fall back
         return route.bare_fallback_exec(

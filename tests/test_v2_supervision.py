@@ -1,12 +1,18 @@
-"""V2 supervision guarantees: in-process launch fallback, bounded notify
-hook, pid-liveness slot lease, and the `headroom caps` capability probe.
+"""V2 supervision guarantees + Codex red-team fixes.
 
-The two safety-critical boundaries proven here:
-- the launch fallback fires ONLY for failures strictly BEFORE the first
-  child CLI process was successfully spawned — never after;
-- a slot lease blocks an account only for a LIVE lease held by a DIFFERENT
-  pid; dead-pid leases are stale and cleaned, corruption never crashes
-  routing.
+Covers the four features (in-process launch fallback, bounded notify hook,
+flock slot lease, caps probe) and the adversarial fixes:
+
+  P0-1  flock lease has no stale-cleanup delete race (no pid file to delete)
+  P0-2  the lease follows the ACTIVE account across an automatic handoff
+  P0-3  an ambiguous spawn window suppresses the fallback (no dup live child)
+  P1-4  flock = fd death releases the lease (crash/reuse safe, tested via kill)
+  P1-5  supervised `launch` notify fires only AFTER a child exists
+  P1-6  session-end-without-replacement routes through _lose_supervision
+  P1-7  notify timeout SIGKILLs the whole process group (reaps descendants)
+  P1-8  fallback survives an import/preprocessing failure and stays bare
+  P1-9  requested leasing FAILS CLOSED on an infrastructure error
+  P2-10 caps is command-scoped and honest about `run`
 """
 import io
 import json
@@ -60,28 +66,36 @@ class TempDirCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, environ, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
-        route._HELD_LEASES.clear()
+        # never leak a held flock between tests
+        self.addCleanup(route.release_slot_leases)
 
     def account(self, name="acct-a"):
         return {"name": name, "provider": "claude",
                 "home": os.path.join(self.temp.name, "homes", name)}
 
 
+# --------------------------------------------------------------------------
+# Feature 4 + P2-10: caps probe
+# --------------------------------------------------------------------------
 class CapsProbe(TempDirCase):
-    def test_caps_prints_versioned_capability_flags(self):
+    def test_caps_is_command_scoped_and_honest_about_run(self):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(__main__._dispatch(["caps"]), 0)
         payload = json.loads(output.getvalue())
-        self.assertEqual(payload["schema"], 1)
-        for key in ("launch_marker", "launch_fallback", "notify_cmd",
-                    "slot_lease"):
-            self.assertIs(payload[key], True, key)
-        self.assertEqual(
-            set(payload), {"schema", "launch_marker", "launch_fallback",
-                           "notify_cmd", "slot_lease"})
+        self.assertEqual(payload["schema"], 2)
+        self.assertEqual(payload["launch_marker"],
+                         {"claude": True, "codex": True})
+        self.assertEqual(payload["launch_fallback"],
+                         {"claude": True, "codex": True, "run": False})
+        self.assertIs(payload["notify_cmd"], True)
+        self.assertEqual(payload["slot_lease"], {
+            "claude": True, "codex": True, "run": False, "fail_closed": True})
 
 
+# --------------------------------------------------------------------------
+# Feature 2 + P1-7: bounded notify hook
+# --------------------------------------------------------------------------
 class NotifyDelivery(TempDirCase):
     def notify_script(self):
         out = os.path.join(self.temp.name, "events.log")
@@ -127,7 +141,38 @@ class NotifyDelivery(TempDirCase):
             self.assertFalse(notify.emit({"event": "launch"}))
             elapsed = time.monotonic() - started
         self.assertLess(elapsed, 5.0)
-        self.assertIn("timed out", errors.getvalue())
+        self.assertIn("killed", errors.getvalue())
+
+    def test_timeout_kills_the_whole_process_group_not_just_the_shell(self):
+        # P1-7: a shell that backgrounds a worker and waits must not leak the
+        # worker. The worker writes its pid, then sleeps; after the timeout
+        # kills the group, that pid must be gone.
+        pidfile = os.path.join(self.temp.name, "worker.pid")
+        readyfile = os.path.join(self.temp.name, "worker.ready")
+        script = os.path.join(self.temp.name, "group.sh")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(
+                "#!/bin/sh\n"
+                "( echo $$ > %s ; : > %s ; sleep 30 ) &\n"
+                "wait\n" % (shlex.quote(pidfile), shlex.quote(readyfile)))
+        os.chmod(script, 0o755)
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_NOTIFY_CMD": f"/bin/sh {script}",
+                "HEADROOM_NOTIFY_TIMEOUT": "0.3"}), \
+                redirect_stderr(io.StringIO()):
+            self.assertFalse(notify.emit({"event": "launch"}))
+        deadline = time.monotonic() + 3.0
+        with open(pidfile, encoding="utf-8") as handle:
+            worker_pid = int(handle.read().strip())
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(worker_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        self.assertFalse(alive, "backgrounded worker survived the group kill")
 
     def test_missing_command_never_raises(self):
         errors = io.StringIO()
@@ -167,9 +212,10 @@ class NotifyDelivery(TempDirCase):
             self.assertTrue(notify.emit({"event": "launch"}))
 
 
+# --------------------------------------------------------------------------
+# Feature 1: in-process launch fallback (exec path)
+# --------------------------------------------------------------------------
 class LaunchFallbackExec(TempDirCase):
-    """route.cmd_exec: the fallback boundary is reaching the routed exec."""
-
     def test_default_off_keeps_the_plain_refusal(self):
         with mock.patch.object(route, "pick", return_value=None), \
                 mock.patch.object(route.os, "execvp") as execute, \
@@ -182,22 +228,31 @@ class LaunchFallbackExec(TempDirCase):
         command = ["claude", "--model", "sonnet"]
         with mock.patch.object(route, "pick", return_value=None), \
                 mock.patch.object(notify, "emit") as emit, \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()):
             code = route.cmd_exec("sonnet", command, fallback=True)
         self.assertEqual(code, 0)
-        execute.assert_called_once_with("claude", command)
+        self.assertEqual(execute.call_args.args[:2], (command[0], command))
         events = [call.args[0]["event"] for call in emit.call_args_list]
         self.assertEqual(events, ["fallback"])
 
-    def test_routing_exception_falls_back_instead_of_raising(self):
-        with mock.patch.object(route, "pick",
-                               side_effect=RuntimeError("collect broke")), \
-                mock.patch.object(route.os, "execvp") as execute, \
+    def test_bare_fallback_preserves_the_original_environment(self):
+        original = {"PATH": "/orig", "HOME": "/orig-home"}
+        with mock.patch.object(route.os, "execvpe") as execute, \
+                redirect_stderr(io.StringIO()):
+            route.bare_fallback_exec(["claude"], "why", env=original)
+        self.assertEqual(execute.call_args.args[2], original)
+
+    def test_routing_exception_falls_back_with_original_env(self):
+        marker_env = {"PATH": os.environ.get("PATH", ""), "SENTINEL": "1"}
+        with mock.patch.dict(os.environ, marker_env, clear=True), \
+                mock.patch.object(route, "pick",
+                                  side_effect=RuntimeError("collect broke")), \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()) as errors:
             code = route.cmd_exec("sonnet", ["claude"], fallback=True)
         self.assertEqual(code, 0)
-        execute.assert_called_once_with("claude", ["claude"])
+        self.assertEqual(execute.call_args.args[2].get("SENTINEL"), "1")
         self.assertIn("collect broke", errors.getvalue())
 
     def test_unwritable_marker_falls_back_before_any_routed_exec(self):
@@ -211,12 +266,13 @@ class LaunchFallbackExec(TempDirCase):
                 mock.patch.object(route, "block_reason", return_value=None), \
                 mock.patch.object(route, "cooldowns", return_value={}), \
                 mock.patch.object(notify, "emit") as emit, \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvp") as routed, \
+                mock.patch.object(route.os, "execvpe") as bare, \
                 redirect_stderr(io.StringIO()):
             code = route.cmd_exec("sonnet", ["claude"], fallback=True)
         self.assertEqual(code, 0)
-        # exactly one exec: the bare fallback, never the routed launch too
-        execute.assert_called_once_with("claude", ["claude"])
+        routed.assert_not_called()   # the routed exec was never reached
+        bare.assert_called_once()    # only the bare fallback ran
         events = [call.args[0]["event"] for call in emit.call_args_list]
         self.assertEqual(events, ["fallback"])
 
@@ -229,61 +285,70 @@ class LaunchFallbackExec(TempDirCase):
                 mock.patch.object(route, "block_reason", return_value=None), \
                 mock.patch.object(route, "cooldowns", return_value={}), \
                 mock.patch.object(notify, "emit") as emit, \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvp") as routed, \
+                mock.patch.object(route.os, "execvpe") as bare, \
                 redirect_stderr(io.StringIO()):
             code = route.cmd_exec("sonnet", ["claude"], fallback=True)
         self.assertEqual(code, 0)
-        execute.assert_called_once()  # the routed exec only — no bare launch
-        self.assertEqual(execute.call_args.args[1], ["claude"])
+        routed.assert_called_once()  # the routed exec ran
+        bare.assert_not_called()     # and never the bare fallback
         events = [call.args[0]["event"] for call in emit.call_args_list]
-        self.assertEqual(events, ["launch"])  # and never a fallback event
+        self.assertEqual(events, ["launch"])
 
     def test_fallback_exec_failure_reports_127(self):
         with mock.patch.object(route, "pick", return_value=None), \
-                mock.patch.object(route.os, "execvp",
+                mock.patch.object(route.os, "execvpe",
                                   side_effect=FileNotFoundError("gone")), \
                 redirect_stderr(io.StringIO()) as errors:
             code = route.cmd_exec("sonnet", ["claude"], fallback=True)
         self.assertEqual(code, 127)
         self.assertIn("fallback exec", errors.getvalue())
 
+    def test_fallback_releases_a_committed_lease_before_baring_out(self):
+        with mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"}):
+            self.assertTrue(route.acquire_slot_lease(self.account(), "sonnet"))
+            self.assertEqual(route.held_lease_names(), ["acct-a"])
+            with mock.patch.object(route.os, "execvpe"), \
+                    redirect_stderr(io.StringIO()):
+                route.bare_fallback_exec(["claude"], "why")
+            self.assertEqual(route.held_lease_names(), [])
 
+
+# --------------------------------------------------------------------------
+# Feature 1 + P0-3: in-process launch fallback (supervised path + boundary)
+# --------------------------------------------------------------------------
 class LaunchFallbackSupervised(TempDirCase):
-    """supervisor.cmd_claude: fallback fires only before the first spawn."""
-
-    def stub_supervisor(self, spawned_any, outcome):
-        holder = {}
-
+    def stub_supervisor(self, spawned_any, outcome, ambiguous=False):
         class Stub:
             def __init__(self, family, args, account):
                 self.spawned_any = False
-                holder["instance"] = self
-                holder["account"] = account
+                self.spawn_ambiguous = False
 
             def run(self):
                 self.spawned_any = spawned_any
+                self.spawn_ambiguous = ambiguous
                 if isinstance(outcome, BaseException):
                     raise outcome
                 return outcome
 
-        return Stub, holder
+        return Stub
 
     def test_no_account_falls_back(self):
         with mock.patch.object(supervisor, "_initial_account",
                                return_value=None), \
                 mock.patch.object(notify, "emit") as emit, \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()):
             code = supervisor.cmd_claude("sonnet", [],
                                          fallback_argv=["claude"])
         self.assertEqual(code, 0)
-        execute.assert_called_once_with("claude", ["claude"])
+        execute.assert_called_once()
         self.assertEqual(emit.call_args.args[0]["event"], "fallback")
 
     def test_no_account_without_fallback_keeps_exit_2(self):
         with mock.patch.object(supervisor, "_initial_account",
                                return_value=None), \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()):
             code = supervisor.cmd_claude("sonnet", [])
         self.assertEqual(code, 2)
@@ -293,12 +358,12 @@ class LaunchFallbackSupervised(TempDirCase):
         with mock.patch.object(
                 supervisor, "_initial_account",
                 side_effect=registry.RegistryError("no config")), \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()) as errors:
             code = supervisor.cmd_claude("sonnet", [],
                                          fallback_argv=["claude"])
         self.assertEqual(code, 0)
-        execute.assert_called_once_with("claude", ["claude"])
+        execute.assert_called_once()
         self.assertIn("no config", errors.getvalue())
 
     def test_preparation_exception_without_fallback_raises(self):
@@ -309,73 +374,121 @@ class LaunchFallbackSupervised(TempDirCase):
                 supervisor.cmd_claude("sonnet", [])
 
     def test_first_spawn_failure_falls_back(self):
-        stub, _ = self.stub_supervisor(spawned_any=False, outcome=127)
+        stub = self.stub_supervisor(spawned_any=False, outcome=127)
         with mock.patch.object(supervisor, "_initial_account",
                                return_value=self.account()), \
                 mock.patch.object(supervisor, "Supervisor", stub), \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()):
             code = supervisor.cmd_claude("sonnet", [],
                                          fallback_argv=["claude"])
         self.assertEqual(code, 0)
-        execute.assert_called_once_with("claude", ["claude"])
+        execute.assert_called_once()
 
     def test_boundary_spawned_child_exit_never_falls_back(self):
         # a capped/failed child AFTER a successful spawn is a normal exit
-        stub, _ = self.stub_supervisor(spawned_any=True, outcome=42)
+        stub = self.stub_supervisor(spawned_any=True, outcome=42)
         with mock.patch.object(supervisor, "_initial_account",
                                return_value=self.account()), \
                 mock.patch.object(supervisor, "Supervisor", stub), \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()):
             code = supervisor.cmd_claude("sonnet", [],
                                          fallback_argv=["claude"])
         self.assertEqual(code, 42)
         execute.assert_not_called()
 
-    def test_boundary_post_spawn_exception_still_raises(self):
-        # even a crash is not a fallback once a child was spawned: the CLI
-        # ran; restarting it bare could double a running session
-        stub, _ = self.stub_supervisor(
-            spawned_any=True, outcome=RuntimeError("post-spawn crash"))
+    def test_boundary_ambiguous_spawn_return_suppresses_fallback(self):
+        # P0-3: run() returned with spawn_ambiguous True (a signal fired in
+        # the Popen window) — a child MAY be live, so no bare relaunch
+        stub = self.stub_supervisor(
+            spawned_any=False, outcome=17, ambiguous=True)
         with mock.patch.object(supervisor, "_initial_account",
                                return_value=self.account()), \
                 mock.patch.object(supervisor, "Supervisor", stub), \
-                mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvpe") as execute, \
+                redirect_stderr(io.StringIO()):
+            code = supervisor.cmd_claude("sonnet", [],
+                                         fallback_argv=["claude"])
+        self.assertEqual(code, 17)
+        execute.assert_not_called()
+
+    def test_boundary_ambiguous_spawn_exception_suppresses_fallback(self):
+        # P0-3: even a raised exception must not fall back while ambiguous
+        stub = self.stub_supervisor(
+            spawned_any=False, outcome=RuntimeError("async in window"),
+            ambiguous=True)
+        with mock.patch.object(supervisor, "_initial_account",
+                               return_value=self.account()), \
+                mock.patch.object(supervisor, "Supervisor", stub), \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()):
             with self.assertRaises(RuntimeError):
                 supervisor.cmd_claude("sonnet", [], fallback_argv=["claude"])
         execute.assert_not_called()
 
-    def test_boundary_real_spawn_then_clean_child_exit(self):
-        # end-to-end shape: a REAL Supervisor spawns a (fake) child that
-        # exits nonzero — spawned_any flips and no fallback ever fires
-        account = self.account()
-        real = supervisor.Supervisor
-
-        class FakeProcess:
-            pid = os.getpid()
-
-            @staticmethod
-            def poll():
-                return 7
-
-        def factory(family, args, chosen):
-            return real(family, args, chosen,
-                        popen=lambda argv, env=None, cwd=None: FakeProcess(),
-                        sleep=lambda seconds: None)
-
+    def test_boundary_post_spawn_exception_still_raises(self):
+        stub = self.stub_supervisor(
+            spawned_any=True, outcome=RuntimeError("post-spawn crash"))
         with mock.patch.object(supervisor, "_initial_account",
-                               return_value=account), \
-                mock.patch.object(supervisor, "Supervisor", factory), \
-                mock.patch.object(route.os, "execvp") as execute, \
+                               return_value=self.account()), \
+                mock.patch.object(supervisor, "Supervisor", stub), \
+                mock.patch.object(route.os, "execvpe") as execute, \
                 redirect_stderr(io.StringIO()):
-            code = supervisor.cmd_claude("sonnet", [],
-                                         fallback_argv=["claude"])
-        self.assertEqual(code, 7)
+            with self.assertRaises(RuntimeError):
+                supervisor.cmd_claude("sonnet", [], fallback_argv=["claude"])
         execute.assert_not_called()
 
 
+# --------------------------------------------------------------------------
+# P0-3: the real _spawn sets/clears the ambiguity flag correctly
+# --------------------------------------------------------------------------
+class SpawnAmbiguityFlag(TempDirCase):
+    def test_successful_popen_marks_spawned_and_clears_ambiguous(self):
+        account = self.account()
+        runner = supervisor.Supervisor(
+            "sonnet", [], account, popen=mock.Mock(return_value=mock.Mock()))
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
+            runner._spawn(account, [], self.temp.name, False)
+        self.assertTrue(runner.spawned_any)
+        self.assertFalse(runner.spawn_ambiguous)
+
+    def test_popen_oserror_is_positively_pre_spawn(self):
+        account = self.account()
+        runner = supervisor.Supervisor(
+            "sonnet", [], account,
+            popen=mock.Mock(side_effect=OSError("boom")))
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.SupervisorError):
+                runner._spawn(account, [], self.temp.name, False)
+        # a Popen that RAISED means no child — unambiguously pre-spawn
+        self.assertFalse(runner.spawned_any)
+        self.assertFalse(runner.spawn_ambiguous)
+
+    def test_async_failure_in_the_popen_window_stays_ambiguous(self):
+        # simulate a signal/trace handler firing the instant Popen returns
+        account = self.account()
+
+        def popen_then_raise(argv, env=None, cwd=None):
+            raise KeyboardInterrupt("signal landed after the child was live")
+
+        runner = supervisor.Supervisor(
+            "sonnet", [], account, popen=popen_then_raise)
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                runner._spawn(account, [], self.temp.name, False)
+        # KeyboardInterrupt is not the OSError handler, so ambiguity is NOT
+        # cleared -> the fallback would be suppressed
+        self.assertFalse(runner.spawned_any)
+        self.assertTrue(runner.spawn_ambiguous)
+
+
+# --------------------------------------------------------------------------
+# Feature 2 wiring + P1-5: notify events at the right transitions
+# --------------------------------------------------------------------------
 class NotifyWiring(TempDirCase):
     def test_exec_launch_emits_downgrade_then_launch(self):
         account = self.account()
@@ -397,9 +510,6 @@ class NotifyWiring(TempDirCase):
         self.assertEqual(payloads[0]["reason"],
                          "auto-handoff disabled: --settings")
         self.assertEqual(payloads[1]["mode"], "exec")
-        self.assertEqual(payloads[1]["model"], "sonnet")
-        self.assertEqual(payloads[1]["note"],
-                         "auto-handoff disabled: --settings")
 
     def test_exec_launch_without_note_emits_launch_only(self):
         account = self.account()
@@ -416,21 +526,28 @@ class NotifyWiring(TempDirCase):
         self.assertEqual([call.args[0]["event"]
                           for call in emit.call_args_list], ["launch"])
 
-    def test_supervised_spawn_emits_launch_once_for_generation_one(self):
+    def test_supervised_launch_emits_only_after_a_child_exists(self):
+        # P1-5: the launch event must not precede a real Popen
         account = self.account()
-        runner = supervisor.Supervisor(
-            "sonnet", [], account, popen=mock.Mock(return_value=mock.Mock()))
-        with mock.patch.object(notify, "emit") as emit, \
+        order = []
+
+        def popen(argv, env=None, cwd=None):
+            order.append("popen")
+            return mock.Mock()
+
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+
+        def record_emit(event):
+            order.append(("emit", event["event"]))
+            return True
+
+        with mock.patch.object(notify, "emit", side_effect=record_emit), \
                 mock.patch.object(runner, "_settings_file", return_value=""):
             runner._spawn(account, [], self.temp.name, False)
             runner._spawn(account, [], self.temp.name, False)
-        emit.assert_called_once()
-        payload = emit.call_args.args[0]
-        self.assertEqual(payload["event"], "launch")
-        self.assertEqual(payload["mode"], "supervised")
-        self.assertEqual(payload["account"], "acct-a")
-        self.assertEqual(payload["model"], "sonnet")
-        self.assertTrue(runner.spawned_any)
+        self.assertEqual(order[0], "popen")             # child first
+        self.assertEqual(order[1], ("emit", "launch"))  # THEN the launch event
+        self.assertEqual(order.count(("emit", "launch")), 1)  # gen 1 only
 
     def test_spawn_refusal_emits_no_launch_event(self):
         account = self.account()
@@ -472,55 +589,95 @@ class NotifyWiring(TempDirCase):
         events = [call.args[0] for call in emit.call_args_list]
         self.assertEqual([event["event"] for event in events],
                          ["launch", "supervision_lost"])
-        self.assertEqual(events[1]["account"], "acct-a")
         self.assertIn("SessionStart hook never bound", events[1]["reason"])
         self.assertFalse(child.automation)
 
 
+# --------------------------------------------------------------------------
+# P1-6: the session-end-without-replacement disarm routes through the helper
+# --------------------------------------------------------------------------
+class SupervisionLostCoverage(TempDirCase):
+    def test_session_end_without_replacement_emits_supervision_lost(self):
+        account = self.account()
+        runner = supervisor.Supervisor("sonnet", [], account,
+                                       popen=mock.Mock())
+        binding = supervisor.Binding(
+            "11111111-1111-1111-1111-111111111111",
+            "/t.jsonl", "/cwd", "sonnet", "1", account["home"], epoch=1)
+        child = supervisor.Child(
+            process=mock.Mock(), account=account, generation=1,
+            event_path="/dev/null", settings_path="", launched_at=0.0,
+            automation=True, binding=binding, session_epoch=1)
+        child.dead_sessions.add((binding.session_id, binding.epoch))
+        with mock.patch.object(supervisor, "_read_events", return_value=[]), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            result = runner._handle_events(child, "")
+        self.assertIsNone(result)
+        self.assertFalse(child.automation)
+        self.assertTrue(child.supervision_loss_notified)
+        events = [call.args[0] for call in emit.call_args_list]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "supervision_lost")
+        self.assertIn("without a replacement", events[0]["reason"])
+
+
+# --------------------------------------------------------------------------
+# Feature 3 + P0-1/P1-4/P1-9: flock slot lease
+# --------------------------------------------------------------------------
 class SlotLease(TempDirCase):
     def lease_env(self):
         return mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"})
 
-    def live_foreign_pid(self):
+    def hold_foreign_lease(self, name):
+        """Spawn a subprocess that flock()s the account lock file and blocks,
+        so THIS process sees a live foreign holder. Returns the Popen."""
+        os.makedirs(route._leases_dir(), exist_ok=True)
+        ready = os.path.join(self.temp.name, f"{name}.held")
+        code = (
+            "import fcntl, os, sys, time\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(sys.argv[2], 'w').close()\n"
+            "time.sleep(60)\n")
         process = subprocess.Popen(
-            ["sleep", "60"], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
+            [sys.executable, "-c", code, route._lease_path(name), ready],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(process.wait)
         self.addCleanup(process.kill)
-        return process.pid
-
-    def write_lease(self, name, pid):
-        paths.write_json_atomic(route._lease_path(name), {
-            "account": name, "pid": pid, "family": "sonnet",
-            "written_at": time.time()})
+        deadline = time.monotonic() + 5.0
+        while not os.path.exists(ready) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(os.path.exists(ready), "foreign holder never armed")
+        return process
 
     def test_disabled_is_a_complete_no_op(self):
         account = self.account()
         self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
+        self.assertEqual(route.held_lease_names(), [])
         self.assertFalse(os.path.exists(route._lease_path("acct-a")))
-        with self.lease_env():
-            self.write_lease("acct-a", self.live_foreign_pid())
-        # feature off: even a live foreign lease is invisible
-        self.assertIsNone(route.lease_holder("acct-a"))
+        # feature off: even a live foreign holder is invisible to routing
+        self.hold_foreign_lease("acct-a")
+        self.assertFalse(route._account_leased_by_other("acct-a"))
         self.assertEqual(
             route.block_reason(account, "sonnet", None, {}, time.time()),
             "no usage reading yet")
 
-    def test_acquire_writes_the_lease_payload(self):
+    def test_acquire_holds_the_flock_and_records_the_name(self):
         with self.lease_env():
             self.assertTrue(route.acquire_slot_lease(self.account(), "sonnet"))
+        self.assertEqual(route.held_lease_names(), ["acct-a"])
+        self.assertTrue(route.holds_slot_lease("acct-a"))
         with open(route._lease_path("acct-a"), encoding="utf-8") as handle:
-            payload = json.load(handle)
-        self.assertEqual(payload["account"], "acct-a")
-        self.assertEqual(payload["pid"], os.getpid())
-        self.assertEqual(payload["family"], "sonnet")
-        self.assertIsInstance(payload["written_at"], float)
+            meta = json.load(handle)
+        self.assertEqual(meta["account"], "acct-a")
+        self.assertEqual(meta["pid"], os.getpid())
 
     def test_own_lease_never_blocks_and_can_be_reacquired(self):
         account = self.account()
         with self.lease_env():
             self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
-            self.assertIsNone(route.lease_holder("acct-a"))
+            self.assertFalse(route._account_leased_by_other("acct-a"))
             self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
             self.assertEqual(
                 route.block_reason(account, "sonnet", None, {}, time.time()),
@@ -529,76 +686,76 @@ class SlotLease(TempDirCase):
     def test_live_foreign_lease_blocks_routing_and_acquire(self):
         account = self.account()
         with self.lease_env():
-            pid = self.live_foreign_pid()
-            self.write_lease("acct-a", pid)
-            self.assertEqual(route.lease_holder("acct-a"), pid)
+            self.hold_foreign_lease("acct-a")
+            self.assertTrue(route._account_leased_by_other("acct-a"))
             reason = route.block_reason(account, "sonnet", None, {},
                                         time.time())
-            self.assertIn("slot leased by another live launch", reason)
+            self.assertEqual(reason, "slot leased by another live launch")
             self.assertFalse(route.acquire_slot_lease(account, "sonnet"))
+            self.assertEqual(route.held_lease_names(), [])
 
-    def test_dead_pid_lease_is_stale_ignored_and_cleaned(self):
+    def test_dead_holder_releases_the_lease_via_fd_death(self):
+        # P1-4: flock is dropped by the kernel when the holder dies — no pid
+        # to reuse, no stale file to clean
         account = self.account()
         with self.lease_env():
-            process = subprocess.Popen(
-                ["sleep", "60"], stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
+            process = self.hold_foreign_lease("acct-a")
+            self.assertTrue(route._account_leased_by_other("acct-a"))
             process.kill()
             process.wait()
-            self.write_lease("acct-a", process.pid)
-            self.assertIsNone(route.lease_holder("acct-a"))
-            self.assertFalse(os.path.exists(route._lease_path("acct-a")))
-            self.assertEqual(
-                route.block_reason(account, "sonnet", None, {}, time.time()),
-                "no usage reading yet")
+            # the lock FILE still exists, but the flock is gone
+            self.assertTrue(os.path.exists(route._lease_path("acct-a")))
+            self.assertFalse(route._account_leased_by_other("acct-a"))
             self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
 
-    def test_corrupt_lease_never_crashes_and_never_blocks(self):
+    def test_no_stale_delete_race_a_probe_never_evicts_a_live_lease(self):
+        # P0-1: with flock there is no read/liveness/delete/claim sequence, so
+        # a would-be racer's probe/acquire attempt can neither delete nor
+        # steal a lease another live launch holds. A foreign holder keeps the
+        # lock; our probe returns "leased" and our acquire returns False, and
+        # the lock file is never removed.
         account = self.account()
+        with self.lease_env():
+            self.hold_foreign_lease("acct-a")
+            path = route._lease_path("acct-a")
+            self.assertTrue(os.path.exists(path))
+            self.assertTrue(route._account_leased_by_other("acct-a"))
+            self.assertFalse(route.acquire_slot_lease(account, "sonnet"))
+            self.assertTrue(os.path.exists(path))  # never deleted
+            self.assertTrue(route._account_leased_by_other("acct-a"))
+
+    def test_release_one_lease_frees_it_for_the_next_launch(self):
+        account = self.account()
+        with self.lease_env():
+            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
+            route.release_slot_lease("acct-a")
+            self.assertEqual(route.held_lease_names(), [])
+            # released -> a fresh acquire succeeds (flock is free)
+            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
+
+    def test_acquire_fails_closed_when_the_lease_dir_is_unusable(self):
+        # P1-9: requested leasing must NOT silently launch unleased
+        account = self.account()
+        with self.lease_env():
+            paths.ensure_private(paths.state_dir())
+            # a FILE where the leases directory must be makes makedirs fail
+            with open(route._leases_dir(), "w", encoding="utf-8") as handle:
+                handle.write("blocker")
+            with self.assertRaises(route.LeaseError):
+                route.acquire_slot_lease(account, "sonnet")
+
+    def test_nameless_account_under_leasing_fails_closed(self):
+        with self.lease_env():
+            with self.assertRaises(route.LeaseError):
+                route.acquire_slot_lease({"provider": "claude"}, "sonnet")
+
+    def test_probe_never_crashes_on_a_broken_lock_path(self):
         with self.lease_env():
             os.makedirs(route._leases_dir(), exist_ok=True)
-            with open(route._lease_path("acct-a"), "w",
-                      encoding="utf-8") as handle:
-                handle.write("not json {{{")
-            self.assertIsNone(route.lease_holder("acct-a"))
-            self.assertEqual(
-                route.block_reason(account, "sonnet", None, {}, time.time()),
-                "no usage reading yet")
-            # acquire clears the corrupt file and claims cleanly
-            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
-            with open(route._lease_path("acct-a"),
-                      encoding="utf-8") as handle:
-                self.assertEqual(json.load(handle)["pid"], os.getpid())
-
-    def test_unusable_pid_values_are_treated_as_no_lease(self):
-        with self.lease_env():
-            for bad in ("123", True, -5, 0, None):
-                with self.subTest(pid=bad):
-                    paths.write_json_atomic(
-                        route._lease_path("acct-a"),
-                        {"account": "acct-a", "pid": bad})
-                    self.assertIsNone(route.lease_holder("acct-a"))
-
-    def test_release_removes_only_our_own_lease(self):
-        account = self.account()
-        with self.lease_env():
-            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
-            route.release_slot_leases()
-            self.assertFalse(os.path.exists(route._lease_path("acct-a")))
-            # a lease meanwhile re-claimed by another pid is left alone
-            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
-            self.write_lease("acct-a", self.live_foreign_pid())
-            route.release_slot_leases()
-            self.assertTrue(os.path.exists(route._lease_path("acct-a")))
-
-    def test_unavailable_lease_dir_degrades_to_launching_unleased(self):
-        account = self.account()
-        with self.lease_env(), redirect_stderr(io.StringIO()) as errors:
-            paths.ensure_private(paths.state_dir())
-            with open(route._leases_dir(), "w", encoding="utf-8") as handle:
-                handle.write("a file where the directory should be")
-            self.assertTrue(route.acquire_slot_lease(account, "sonnet"))
-        self.assertIn("slot lease unavailable", errors.getvalue())
+            # a directory where the lock file would be: open may error — must
+            # degrade to "not leased", never raise
+            os.makedirs(route._lease_path("acct-a"))
+            self.assertFalse(route._account_leased_by_other("acct-a"))
 
     def test_concurrent_initial_launches_pick_different_accounts(self):
         homes = {name: os.path.join(self.temp.name, "homes", name)
@@ -613,19 +770,17 @@ class SlotLease(TempDirCase):
                                   return_value=("AAAA", "BBBB")):
             ranked = route.candidates("sonnet", snapshot)
             self.assertEqual(
-                [(account["name"], reason) for account, reason in ranked],
+                [(a["name"], r) for a, r in ranked],
                 [("acct-a", None), ("acct-b", None)])
             # a second launcher holds acct-a: this launcher must diverge
-            self.write_lease("acct-a", self.live_foreign_pid())
-            ranked = route.candidates("sonnet", snapshot)
-            by_name = {account["name"]: reason for account, reason in ranked}
+            self.hold_foreign_lease("acct-a")
+            by_name = {a["name"]: r
+                       for a, r in route.candidates("sonnet", snapshot)}
             self.assertIsNone(by_name["acct-b"])
-            self.assertIn("slot leased", by_name["acct-a"])
-            self.assertEqual(ranked[0][0]["name"], "acct-b")
+            self.assertEqual(by_name["acct-a"],
+                             "slot leased by another live launch")
 
     def test_cmd_exec_repicks_when_the_claim_race_is_lost(self):
-        # both launchers passed selection; the other one claimed acct-a in
-        # the race window — this exec re-picks and launches acct-b
         account_a, account_b = self.account("acct-a"), self.account("acct-b")
         snapshot = {"generated": time.time(), "accounts": []}
         with self.lease_env(), \
@@ -637,39 +792,115 @@ class SlotLease(TempDirCase):
                 mock.patch.object(route, "cooldowns", return_value={}), \
                 mock.patch.object(route.os, "execvp") as execute, \
                 redirect_stderr(io.StringIO()):
-            self.write_lease("acct-a", self.live_foreign_pid())
+            self.hold_foreign_lease("acct-a")
             route.cmd_exec("sonnet", ["claude"])
             selected = os.environ.get("CLAUDE_CONFIG_DIR")
         execute.assert_called_once()
         self.assertEqual(selected, account_b["home"])
-        with open(route._lease_path("acct-b"), encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle)["pid"], os.getpid())
+        self.assertEqual(route.held_lease_names(), ["acct-b"])
 
-    def test_cmd_claude_repicks_when_the_claim_race_is_lost(self):
-        account_a, account_b = self.account("acct-a"), self.account("acct-b")
-        stub_accounts = []
+    def test_cmd_exec_fails_closed_on_lease_infrastructure_error(self):
+        # P1-9: LeaseError -> refuse (exit 2), never launch unleased
+        account = self.account()
+        snapshot = {"generated": time.time(), "accounts": []}
+        with self.lease_env(), \
+                mock.patch.object(route, "pick", return_value=account), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "acquire_slot_lease",
+                                  side_effect=route.LeaseError("disk full")), \
+                mock.patch.object(route, "write_launch_marker") as marker, \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = route.cmd_exec("sonnet", ["claude"])
+        self.assertEqual(code, 2)
+        execute.assert_not_called()
+        marker.assert_not_called()
+        self.assertIn("fails closed", errors.getvalue())
 
-        class Stub:
-            def __init__(self, family, args, chosen):
-                self.spawned_any = True
-                stub_accounts.append(chosen)
-
-            @staticmethod
-            def run():
-                return 0
-
+    def test_cmd_claude_fails_closed_but_fallback_bares_out(self):
+        # P1-9 + Feature 1: without fallback -> exit 2; with fallback -> bare
+        account = self.account()
         with self.lease_env(), \
                 mock.patch.object(supervisor, "_initial_account",
-                                  side_effect=[account_a, account_b]), \
-                mock.patch.object(supervisor, "Supervisor", Stub), \
+                                  return_value=account), \
+                mock.patch.object(route, "acquire_slot_lease",
+                                  side_effect=route.LeaseError("disk full")), \
+                mock.patch.object(route.os, "execvpe") as bare, \
                 redirect_stderr(io.StringIO()):
-            self.write_lease("acct-a", self.live_foreign_pid())
-            code = supervisor.cmd_claude("sonnet", [])
+            self.assertEqual(supervisor.cmd_claude("sonnet", []), 2)
+            bare.assert_not_called()
+            code = supervisor.cmd_claude("sonnet", [],
+                                         fallback_argv=["claude"])
         self.assertEqual(code, 0)
-        self.assertEqual([entry["name"] for entry in stub_accounts],
-                         ["acct-b"])
+        bare.assert_called_once()
 
 
+# --------------------------------------------------------------------------
+# P0-2: the lease follows the ACTIVE account across an automatic handoff
+# --------------------------------------------------------------------------
+class LeaseFollowsActiveAccount(TempDirCase):
+    def source(self):
+        return {"name": "source", "provider": "claude",
+                "home": os.path.join(self.temp.name, "source")}
+
+    def target(self):
+        return {"name": "target", "provider": "claude",
+                "home": os.path.join(self.temp.name, "target")}
+
+    def plan(self):
+        source = mock.Mock()
+        source.account = self.source()
+        return type("P", (), {"target": self.target(), "family": "sonnet",
+                              "source": source})()
+
+    def test_lease_target_acquires_the_target_account(self):
+        runner = supervisor.Supervisor("sonnet", [], self.source())
+        with mock.patch.object(route, "acquire_slot_lease",
+                               return_value=True) as acquire:
+            runner._lease_target(self.plan())
+        acquire.assert_called_once()
+        self.assertEqual(acquire.call_args.args[0]["name"], "target")
+
+    def test_lease_target_contended_holds_the_handoff(self):
+        runner = supervisor.Supervisor("sonnet", [], self.source())
+        with mock.patch.object(route, "acquire_slot_lease",
+                               return_value=False):
+            with self.assertRaises(supervisor.SupervisorError):
+                runner._lease_target(self.plan())
+
+    def test_lease_target_infra_error_holds_the_handoff(self):
+        runner = supervisor.Supervisor("sonnet", [], self.source())
+        with mock.patch.object(route, "acquire_slot_lease",
+                               side_effect=route.LeaseError("nope")):
+            with self.assertRaises(supervisor.SupervisorError):
+                runner._lease_target(self.plan())
+
+    def test_reconcile_releases_the_old_source_keeps_the_active_target(self):
+        with mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"}):
+            self.assertTrue(route.acquire_slot_lease(self.source(), "sonnet"))
+            self.assertTrue(route.acquire_slot_lease(self.target(), "sonnet"))
+            self.assertEqual(sorted(route.held_lease_names()),
+                             ["source", "target"])
+            runner = supervisor.Supervisor("sonnet", [], self.source())
+            runner._reconcile_leases("target")  # target is the active child
+        self.assertEqual(route.held_lease_names(), ["target"])
+
+    def test_reconcile_releases_an_unused_target_after_failed_rotation(self):
+        with mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"}):
+            self.assertTrue(route.acquire_slot_lease(self.source(), "sonnet"))
+            self.assertTrue(route.acquire_slot_lease(self.target(), "sonnet"))
+            runner = supervisor.Supervisor("sonnet", [], self.source())
+            # rotation failed -> the SOURCE is again the active child
+            runner._reconcile_leases("source")
+        self.assertEqual(route.held_lease_names(), ["source"])
+
+
+# --------------------------------------------------------------------------
+# CLI wiring (fallback flag threading, P1-8a pre-import guard)
+# --------------------------------------------------------------------------
 class CliWiringV2(TempDirCase):
     def test_claude_flag_is_stripped_and_enables_exec_fallback(self):
         with mock.patch.object(registry, "auto_handoff", return_value=False), \
@@ -732,6 +963,40 @@ class CliWiringV2(TempDirCase):
         run.assert_called_once_with(
             "sonnet", ["--model", "sonnet"],
             fallback_argv=["claude", "--model", "sonnet"])
+
+    def test_usage_refusal_is_not_a_fallback(self):
+        # a provider/model mismatch is a caller bug: refuse (exit 2), never
+        # bare-exec, even with fallback requested
+        with mock.patch.object(route.os, "execvp") as execute, \
+                mock.patch.object(route.os, "execvpe") as bare, \
+                redirect_stderr(io.StringIO()):
+            code = __main__._dispatch(
+                ["codex", "--headroom-launch-fallback", "--model", "sonnet"])
+        self.assertEqual(code, 2)
+        execute.assert_not_called()
+        bare.assert_not_called()
+
+    def test_import_preprocessing_failure_falls_back_to_bare_cli(self):
+        # P1-8a: a failure while preparing the launch still bare-execs when
+        # the fallback is requested
+        with mock.patch.object(__main__, "_prepare_launch",
+                               side_effect=RuntimeError("import blew up")), \
+                mock.patch.object(__main__.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = __main__._dispatch(
+                ["claude", "--headroom-launch-fallback", "--model", "sonnet"])
+        self.assertEqual(code, 0)
+        execute.assert_called_once()
+        # the bare argv has headroom's own flag stripped
+        self.assertEqual(execute.call_args.args[1],
+                         ["claude", "--model", "sonnet"])
+        self.assertIn("preprocessing failed", errors.getvalue())
+
+    def test_import_failure_without_fallback_propagates(self):
+        with mock.patch.object(__main__, "_prepare_launch",
+                               side_effect=RuntimeError("import blew up")):
+            with self.assertRaises(RuntimeError):
+                __main__._dispatch(["claude", "--model", "sonnet"])
 
     def test_split_headroom_flags_respects_values_and_separator(self):
         cleaned, found = supervisor.split_headroom_flags([

@@ -328,21 +328,32 @@ Six affordances make headroom composable with launch wrappers:
   child's auto-handoff disarms after launch (e.g. the SessionStart hook never
   bound), and `{"event": "fallback", …}` when the bare-CLI fallback fires.
   Delivery is bounded (10s hard timeout, override with
-  `HEADROOM_NOTIFY_TIMEOUT`); a broken or hung command is swallowed with a
-  stderr line and never delays or kills the launch. Events replace external
-  marker-polling and are independent of `HEADROOM_LAUNCH_MARKER`.
-- **`HEADROOM_SLOT_LEASE=1`** writes a small pid lease under
-  `~/.headroom/state/leases/` at the moment routing commits to an account, and
-  treats an account whose lease is held by a *live different pid* as
-  unavailable — so two concurrent launches deterministically pick different
-  accounts instead of both grabbing the registry-first one. A lease whose pid
-  is dead is stale (ignored and cleaned); the lease is released on normal
-  exit and pid-death covers crashes and exec'd CLIs. Corrupt lease files are
-  treated as "no lease" and can never crash routing.
+  `HEADROOM_NOTIFY_TIMEOUT`); on timeout the command's whole process group is
+  killed, and a broken or hung command is swallowed with a stderr line and
+  never delays or kills the launch. Events replace external marker-polling and
+  are independent of `HEADROOM_LAUNCH_MARKER`. `HEADROOM_NOTIFY_CMD` is trusted
+  code — it runs as you, with your environment; the timeout bounds it, it is
+  not a sandbox.
+- **`HEADROOM_SLOT_LEASE=1`** takes an exclusive `flock()` on a per-account
+  lock file under `~/.headroom/state/leases/` at the moment routing commits to
+  an account, and treats an account another *live* launch holds as unavailable
+  — so two concurrent launches deterministically pick different accounts
+  instead of both grabbing the registry-first one. The kernel drops the flock
+  when the holder dies, so a crash frees the slot with no pid to reuse and no
+  stale file to clean; on the exec path the lock is inherited across `exec` so
+  the CLI holds it for its lifetime, and a supervised auto-handoff moves the
+  lease to the new account before stopping the old one. Acquisition **fails
+  closed**: if leasing is on but the lock can't be taken for an infrastructure
+  reason, headroom refuses rather than launch two sessions on one account
+  (with `--headroom-launch-fallback` also set, that refusal degrades to the
+  bare CLI — your explicit "run something over nothing").
 - **`headroom caps`** prints the scripting capabilities this binary supports
-  as JSON — `{"schema": 1, "launch_marker": true, "launch_fallback": true,
-  "notify_cmd": true, "slot_lease": true}` — so a launcher can refuse or
-  adapt to an older binary instead of assuming a feature exists.
+  as command-scoped JSON — `{"schema": 2, "launch_marker": {"claude": true,
+  "codex": true}, "launch_fallback": {"claude": true, "codex": true, "run":
+  false}, "notify_cmd": true, "slot_lease": {"claude": true, "codex": true,
+  "run": false, "fail_closed": true}}` — so a launcher can see which surface
+  each feature is wired into and refuse or adapt to an older binary instead of
+  assuming a feature exists.
 
 ## Running across multiple machines
 
