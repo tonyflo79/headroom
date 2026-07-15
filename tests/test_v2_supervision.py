@@ -1696,6 +1696,42 @@ class R6SignalForwardOnLatch(TempDirCase):
         replay.assert_called_once_with(signal.SIGTERM)  # kill honoured
         popen.assert_not_called()                       # no child launched
 
+    def test_shutdown_arriving_during_restore_is_still_replayed(self):
+        # r9: the latch MUST be sampled AFTER guard.restore(). The guard's
+        # handler stays live until restore() reinstalls the originals, so a
+        # SIGTERM landing DURING restore still latches into the guard —
+        # sampling before restore() would read None and let fallback/recovery
+        # launch. Here which() fails WITHOUT pre-latching and the signal
+        # arrives inside restore(); the replay must still fire.
+        account = self.account()
+        popen = mock.Mock(return_value=mock.Mock())
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        real_guard = supervisor._SignalGuard
+        captured = {}
+
+        class LatchOnRestoreGuard(real_guard):
+            def __init__(self, proc=None):
+                super().__init__(proc)
+                captured["guard"] = self
+
+            def install(self):
+                pass
+
+            def restore(self):
+                # SIGTERM delivered while restore() runs, handler still live
+                self._shutdown(signal.SIGTERM, None)
+
+        with mock.patch.object(supervisor, "_SignalGuard", LatchOnRestoreGuard), \
+                mock.patch.object(supervisor.shutil, "which",
+                                  return_value=None), \
+                mock.patch.object(supervisor.signal, "raise_signal") as replay, \
+                mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.SupervisorError):
+                runner._spawn(account, [], self.temp.name, False)
+        replay.assert_called_once_with(signal.SIGTERM)  # sampled after restore
+        popen.assert_not_called()
+
     def test_signal_during_handle_events_forwards_before_any_notify(self):
         # the real risk: a signal arrives WHILE _handle_events runs and calls
         # a (blocking) notifier. The forward must have already happened in the

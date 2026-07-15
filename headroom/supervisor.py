@@ -854,8 +854,14 @@ class Supervisor:
             # ambiguous Popen exception whose possible orphan we have no handle
             # for — the accepted r5 trade). Restore the handlers so run()'s
             # recovery / fallback / stop runs with normal signal disposition.
-            latched = guard.shutdown_signal
             guard.restore()
+            # Sample the latch AFTER restore(): the guard's handler stays
+            # installed until restore() reinstalls the originals, so a SIGTERM
+            # arriving DURING restore still latches into the guard — reading
+            # shutdown_signal before restore() would miss it (P1, r9). Once
+            # restored, a further signal reaches the original disposition, not
+            # the guard, so this read captures exactly what the guard latched.
+            latched = guard.shutdown_signal
             self._signals = None
             # If a shutdown was requested DURING the pre-spawn window (which()
             # / marker write) and that op then failed, honour the kill with the
