@@ -293,7 +293,7 @@ teammate, a pinned service) that automatic rotation must not consume.
 
 ## Driving headroom from scripts
 
-Two affordances make headroom composable with launch wrappers:
+Six affordances make headroom composable with launch wrappers:
 
 - **An exported config home is honoured.** If `CLAUDE_CONFIG_DIR` (or
   `CODEX_HOME`) is already set and names a registered account, that account is
@@ -311,6 +311,38 @@ Two affordances make headroom composable with launch wrappers:
   racing a CLI headroom did start. If a requested marker cannot be written,
   headroom refuses to launch (exit 2) rather than leave the handshake
   dangling.
+- **`--headroom-launch-fallback`** (or `HEADROOM_LAUNCH_FALLBACK=1`) makes
+  `headroom claude`/`codex` exec the *bare* CLI in-process — same passthrough
+  args, headroom's own flags removed — when anything fails strictly **before**
+  the first CLI process was started: no routable account, a failed usage
+  collect, an unwritable settings file or marker, a failed spawn. Once a CLI
+  has started, a later exit — clean or capped — is a normal exit and never a
+  fallback; a supervised session that eventually runs out of accounts isn't
+  one either. Off by default; with it on, a wrapper can simply `exec headroom
+  claude …` and never needs an external bare-CLI fallback of its own.
+- **`HEADROOM_NOTIFY_CMD=<command>`** invokes your command at launch
+  transitions with one JSON argument: `{"event": "launch", "mode":
+  "supervised"|"exec", "account": …, "model": …, "note": …}` when the launch
+  commits, `{"event": "downgrade", …}` when supervision was requested but the
+  run is exec-only, `{"event": "supervision_lost", …}` when a supervised
+  child's auto-handoff disarms after launch (e.g. the SessionStart hook never
+  bound), and `{"event": "fallback", …}` when the bare-CLI fallback fires.
+  Delivery is bounded (10s hard timeout, override with
+  `HEADROOM_NOTIFY_TIMEOUT`); a broken or hung command is swallowed with a
+  stderr line and never delays or kills the launch. Events replace external
+  marker-polling and are independent of `HEADROOM_LAUNCH_MARKER`.
+- **`HEADROOM_SLOT_LEASE=1`** writes a small pid lease under
+  `~/.headroom/state/leases/` at the moment routing commits to an account, and
+  treats an account whose lease is held by a *live different pid* as
+  unavailable — so two concurrent launches deterministically pick different
+  accounts instead of both grabbing the registry-first one. A lease whose pid
+  is dead is stale (ignored and cleaned); the lease is released on normal
+  exit and pid-death covers crashes and exec'd CLIs. Corrupt lease files are
+  treated as "no lease" and can never crash routing.
+- **`headroom caps`** prints the scripting capabilities this binary supports
+  as JSON — `{"schema": 1, "launch_marker": true, "launch_fallback": true,
+  "notify_cmd": true, "slot_lease": true}` — so a launcher can refuse or
+  adapt to an older binary instead of assuming a feature exists.
 
 ## Running across multiple machines
 
