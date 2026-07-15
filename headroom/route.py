@@ -145,25 +145,72 @@ def quarantines():
     return _read_quarantine()
 
 
+@contextlib.contextmanager
+def _quarantine_lock():
+    """Exclusive lock shared by all quarantine read-modify-write paths."""
+    lock_path = paths.quarantine_path() + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
 def quarantine_mark(name, reason):
     """Quarantine a seat after an explicit auth rejection: unroutable until
     re-login. Auth is NOT capacity, so no cooldown is written — the seat
     comes back via `headroom connect`, never via a timer. Locked
     read-modify-write; no secrets stored."""
-    lock_path = paths.quarantine_path() + ".lock"
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    with open(lock_path, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            ledger = _read_quarantine()
-            if ledger is None:
+    with _quarantine_lock():
+        ledger = _read_quarantine()
+        if ledger is None:
+            raise RuntimeError(
+                "quarantine ledger unreadable — inspect state/quarantine.json")
+        ledger[name] = {"reason": str(reason), "ts": int(time.time())}
+        paths.write_json_atomic(paths.quarantine_path(), ledger)
+    return ledger[name]
+
+
+def preflight_remove_slot_state():
+    """Fail before a registry removal when protective state is unreadable."""
+    with _cooldown_lock():
+        if _read_cooldowns() is None:
+            raise RuntimeError(
+                "cooldown ledger unreadable — inspect state/cooldowns.json")
+        with _quarantine_lock():
+            if _read_quarantine() is None:
                 raise RuntimeError(
                     "quarantine ledger unreadable — inspect state/quarantine.json")
-            ledger[name] = {"reason": str(reason), "ts": int(time.time())}
-            paths.write_json_atomic(paths.quarantine_path(), ledger)
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-    return ledger[name]
+
+
+def remove_slot_state(name):
+    """Drop only one slot's cooldown and quarantine records.
+
+    Callers that also change the registry must acquire the collection lock
+    first. The state lock order stays cooldown, then quarantine, matching the
+    handoff transaction's registry/cooldown/quarantine order.
+    """
+    with _cooldown_lock():
+        cooldown = _read_cooldowns()
+        if cooldown is None:
+            raise RuntimeError(
+                "cooldown ledger unreadable — inspect state/cooldowns.json")
+        keys = [key for key in cooldown if key.startswith(name + ":")]
+        for key in keys:
+            cooldown.pop(key)
+        if keys:
+            paths.write_json_atomic(paths.cooldowns_path(), cooldown)
+        with _quarantine_lock():
+            quarantine = _read_quarantine()
+            if quarantine is None:
+                raise RuntimeError(
+                    "quarantine ledger unreadable — inspect state/quarantine.json")
+            if name in quarantine:
+                quarantine.pop(name)
+                paths.write_json_atomic(paths.quarantine_path(), quarantine)
 
 
 def _snapshot_fresh(snapshot, now, max_age):

@@ -139,10 +139,10 @@ def restore_credentials(home, provider, backup_dir, saved):
             os.remove(target)
 
 
-def existing_fingerprints(config, provider):
+def existing_fingerprints(config, provider, exclude_name=None):
     result = {}
     for account in registry.accounts(config):
-        if account["provider"] != provider:
+        if account["provider"] != provider or account["name"] == exclude_name:
             continue
         identity = slot_identity(provider, account["home"])
         if identity and identity.get("account_fingerprint"):
@@ -176,31 +176,25 @@ def add_account(config, name, provider, home, expected_email=None):
     return entry
 
 
-def connect_fresh(config, name, provider, quiet=False):
-    """Isolated home + interactive provider login + verify + rollback."""
+def _interactive_login(config, name, provider, home, expected_email=None,
+                       exclude_name=None, quiet=False):
+    """Run one provider-owned interactive login with rollback protections.
+
+    Both fresh connects and an explicit Claude refresh use this path. Headroom
+    never invokes it from collection or routing.
+    """
     binary = provider_binary(provider)
     if not binary:
         print(f"cannot find the `{'claude' if provider == 'claude' else 'codex'}` "
               f"CLI on PATH — install it first", file=sys.stderr)
-        return None
-    if not registry.NAME_RE.fullmatch(name):
-        print(f"slot name {name!r} invalid: lowercase letters, digits, - and _ "
-              f"only (max 32 chars)", file=sys.stderr)
-        return None
-    home = os.path.join(paths.homes_dir(), name)
-    if os.path.realpath(home) != os.path.realpath(
-            os.path.join(paths.homes_dir(), os.path.basename(name))):
-        print("slot name resolves outside the homes directory; refused",
-              file=sys.stderr)
         return None
     # BEFORE the login runs: on macOS a new claude login clobbers the shared
     # Keychain token that an existing slot may depend on — refusing afterwards
     # would be too late to undo the damage.
     if not darwin_keychain_guard(config, provider, quiet=quiet):
         return None
-    os.makedirs(home, mode=0o700, exist_ok=True)
     backup_dir, saved = backup_credentials(home, provider)
-    duplicates = existing_fingerprints(config, provider)
+    duplicates = existing_fingerprints(config, provider, exclude_name=exclude_name)
 
     def rollback():
         if backup_dir:
@@ -220,42 +214,66 @@ def connect_fresh(config, name, provider, quiet=False):
     try:
         code = subprocess.run(login_argv(provider, binary), env=env).returncode
         if code != 0:
-            print(f"login exited {code}; slot unchanged", file=sys.stderr)
+            print(f"login exited {code}; credentials restored", file=sys.stderr)
             return None
         identity = slot_identity(provider, home)
         if not identity or not identity.get("email"):
             print("login completed but no identity could be read; rolled back",
                   file=sys.stderr)
             return None
+        if expected_email and identity["email"].lower() != expected_email.lower():
+            print(f"REFUSED: that login ({identity['email']}) does not match "
+                  f"this slot's expected email ({expected_email}). Slot rolled "
+                  "back.", file=sys.stderr)
+            return None
         fingerprint = identity.get("account_fingerprint")
-        if fingerprint in duplicates:
+        if fingerprint and fingerprint in duplicates:
             print(f"REFUSED: that login ({identity['email']}) is already "
                   f"connected as slot '{duplicates[fingerprint]}'. Slot rolled "
                   f"back.\nLog in with a different account, or use the "
                   f"existing slot.", file=sys.stderr)
             return None
-        entry = add_account(config, name, provider, home, identity["email"])
         completed = True
-        if not quiet:
-            print(f"connected: {name} -> {identity['email']} ({provider})")
-            if provider == "claude" and sys.platform == "darwin" \
-                    and not os.path.exists(os.path.join(home, ".credentials.json")):
-                print("note: this login is stored in the macOS Keychain (shared "
-                      "machine-wide).\nheadroom reads it directly — but it is "
-                      "the ONE Claude account this Mac\ncan hold; connecting a "
-                      "second Claude account here is refused to protect it.")
-        return entry
+        return identity
     finally:
         if not completed:
             rollback()
-            # tidy the slot dir we created if the connect was refused and it's
-            # now empty (credentials were rolled back)
-            try:
-                if os.path.isdir(home) and not os.listdir(home):
-                    os.rmdir(home)
-            except OSError:
-                pass
         discard_backup(backup_dir)
+
+
+def connect_fresh(config, name, provider, quiet=False):
+    """Isolated home + interactive provider login + verify + rollback."""
+    if not registry.NAME_RE.fullmatch(name):
+        print(f"slot name {name!r} invalid: lowercase letters, digits, - and _ "
+              f"only (max 32 chars)", file=sys.stderr)
+        return None
+    home = os.path.join(paths.homes_dir(), name)
+    if os.path.realpath(home) != os.path.realpath(
+            os.path.join(paths.homes_dir(), os.path.basename(name))):
+        print("slot name resolves outside the homes directory; refused",
+              file=sys.stderr)
+        return None
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    identity = _interactive_login(config, name, provider, home, quiet=quiet)
+    if identity is None:
+        # tidy the slot dir we created if the connect was refused and it's now
+        # empty (credentials were rolled back)
+        try:
+            if os.path.isdir(home) and not os.listdir(home):
+                os.rmdir(home)
+        except OSError:
+            pass
+        return None
+    entry = add_account(config, name, provider, home, identity["email"])
+    if not quiet:
+        print(f"connected: {name} -> {identity['email']} ({provider})")
+        if provider == "claude" and sys.platform == "darwin" \
+                and not os.path.exists(os.path.join(home, ".credentials.json")):
+            print("note: this login is stored in the macOS Keychain (shared "
+                  "machine-wide).\nheadroom reads it directly — but it is "
+                  "the ONE Claude account this Mac\ncan hold; connecting a "
+                  "second Claude account here is refused to protect it.")
+    return entry
 
 
 def connect_adopt(config, name, provider, home, quiet=False):
@@ -274,6 +292,51 @@ def connect_adopt(config, name, provider, home, quiet=False):
     if not quiet:
         print(f"connected: {name} -> {identity['email']} ({provider}, adopted {home})")
     return entry
+
+
+def cmd_refresh(args):
+    """CLI: `headroom auth refresh <slot>` for an owned Claude slot only."""
+    if len(args) != 1:
+        print("usage: headroom auth refresh <slot>", file=sys.stderr)
+        return 2
+    name = args[0]
+    config = registry.load()
+    account = next((item for item in registry.accounts(config)
+                    if item["name"] == name), None)
+    if account is None:
+        print(f"headroom: no connected account named {name!r}", file=sys.stderr)
+        return 2
+    if account["provider"] != "claude":
+        print(f"headroom: slot {name!r} is {account['provider']}; "
+              "only owned Claude slots can be refreshed", file=sys.stderr)
+        return 2
+    # Resolve the homes root, but do not resolve the slot component again:
+    # a symlink at homes/<slot> pointing outside must remain an external home,
+    # not become eligible merely because both paths resolve to the same target.
+    owned_home = os.path.join(registry.expand(paths.homes_dir()), name)
+    if account["home"] != owned_home:
+        print(f"headroom: slot {name!r} uses an adopted or external home; "
+              "refusing to re-login outside Headroom-owned homes", file=sys.stderr)
+        return 2
+    credential_path = os.path.join(account["home"], ".credentials.json")
+    if sys.platform == "darwin" and not os.path.isfile(credential_path):
+        print(
+            "headroom: refusing to refresh a Keychain-backed Claude slot: "
+            "Headroom cannot safely roll back a failed or mismatched macOS "
+            "Keychain login. Run `claude auth login` directly for this slot, "
+            "then verify its identity before collecting.",
+            file=sys.stderr,
+        )
+        return 2
+    identity = _interactive_login(
+        config, name, "claude", account["home"],
+        expected_email=account.get("expected_email"), exclude_name=name,
+    )
+    if identity is None:
+        return 1
+    print(f"refreshed: {name} -> {identity['email']} (claude)")
+    print("run `headroom collect` to update this slot's usage reading")
+    return 0
 
 
 def cmd_connect(args):

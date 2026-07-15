@@ -5,6 +5,9 @@ usage:
   headroom setup                    first-run wizard (accounts + dashboard style)
   headroom connect [name] [--provider claude|codex] [--adopt PATH]
                                     add an account (fresh login or adopt existing)
+  headroom auth refresh <slot>     interactively re-login an owned Claude slot
+                                    (then run `headroom collect`; never automatic)
+  headroom remove <slot> [--yes]   unregister one non-final slot; keeps its home
   headroom collect                  read usage for every account (no tokens spent)
   headroom status [model]           who has headroom right now (default: claude)
   headroom pick <model>             print the best account name (exit 2 if none)
@@ -83,6 +86,15 @@ def _dispatch(argv):
     if command == "connect":
         from . import connect
         return connect.cmd_connect(args)
+    if command == "auth":
+        from . import connect
+        if not args or args[0] != "refresh":
+            print("usage: headroom auth refresh <slot>", file=sys.stderr)
+            return 2
+        return connect.cmd_refresh(args[1:])
+    if command == "remove":
+        from . import collect
+        return collect.cmd_remove(args)
     if command == "collect":
         from . import collect
         collect.run_collect()
@@ -233,17 +245,21 @@ def _dispatch(argv):
             out = dashboard.build_demo()
             print(f"demo dashboard built: {out}/index.html")
         else:
-            # re-derive the public feed from the private snapshot with the
-            # CURRENT redaction setting, so a redaction change is reflected
-            private = paths.load_json(paths.private_snapshot_path())
-            if private:
-                settings = registry.dashboard_settings()
-                paths.write_json_atomic(
-                    paths.public_snapshot_path(),
-                    collect.public_snapshot(private,
-                                            settings.get("redact_emails", True)),
-                    mode=0o644)
-            dashboard.build(snapshot_file=paths.public_snapshot_path())
+            # Re-derive the public feed from the private snapshot with the
+            # CURRENT redaction setting, so a redaction change is reflected.
+            # Keep both reads and publications under the collection lifecycle
+            # lock: otherwise a remove can prune a slot and this command can
+            # republish its pre-removal snapshot afterwards.
+            with collect.collection_lock():
+                private = paths.load_json(paths.private_snapshot_path())
+                if private:
+                    settings = registry.dashboard_settings()
+                    paths.write_json_atomic(
+                        paths.public_snapshot_path(),
+                        collect.public_snapshot(
+                            private, settings.get("redact_emails", True)),
+                        mode=0o644)
+                dashboard.build(snapshot_file=paths.public_snapshot_path())
         return 0
     if command == "serve":
         from . import dashboard
