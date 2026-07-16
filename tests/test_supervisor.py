@@ -320,6 +320,16 @@ class TranscriptAndTransaction(unittest.TestCase):
         with self.assertRaisesRegex(handoff.HandoffError, "malformed"):
             handoff.reserve_automatic(self.automatic_plan())
 
+    def test_loop_guard_has_a_stable_health_error_type(self):
+        now = time.time()
+        for _ in range(3):
+            handoff.append_action(
+                str(__import__("uuid").uuid4()), "cap_confirmed",
+                automatic=True, source_slot="source", target_slot="old",
+                old_session_id=self.SID)
+        with self.assertRaises(handoff.HandoffLoopGuardError):
+            handoff.reserve_automatic(self.automatic_plan(), now)
+
     def test_target_credential_change_or_cooldown_blocks_commit(self):
         plan = self.automatic_plan()
         handoff.reserve_automatic(plan)
@@ -785,12 +795,18 @@ class HookProof(unittest.TestCase):
         runner = supervisor.Supervisor(
             "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
         with mock.patch.object(supervisor, "_read_events",
-                               return_value=[end, start]):
+                               return_value=[end, start]), \
+                mock.patch.object(supervisor.notify, "emit") as emit:
             proof = runner._handle_events(self.child, "", old_proof)
         self.assertIsNone(proof)
         self.assertEqual(self.child.binding.session_id, other_sid)
         self.assertEqual(self.child.session_epoch, 1)
         self.assertFalse(self.child.session_ended)
+        armed = [call.args[0] for call in emit.call_args_list
+                 if call.args[0]["event"] == "supervision_armed"]
+        self.assertEqual(len(armed), 1)
+        self.assertEqual(armed[0]["account"], "source")
+        self.assertEqual(armed[0]["supervisor_id"], self.SUPERVISOR)
 
     def test_session_end_then_delayed_stop_failure_cannot_rearm_proof(self):
         base = time.time() - 2

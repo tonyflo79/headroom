@@ -101,6 +101,7 @@ const COLLECTION_INTERVAL_MIN_SECONDS: u64 = 60;
 const COLLECTION_INTERVAL_MAX_SECONDS: u64 = 3600;
 const ROUTING_SCHEMA: &str = "headroom_desktop_routing@1";
 const LAUNCH_INTENT_SCHEMA: &str = "headroom_provider_launch_intent@1";
+const HANDOFF_HEALTH_SCHEMA: &str = "headroom_handoff_health@1";
 const ROUTING_FAMILIES: &[&str] = &["claude", "opus", "sonnet", "haiku", "fable", "codex"];
 const ROUTING_CODES: &[&str] = &[
     "selected",
@@ -1316,6 +1317,142 @@ fn object_has_only(value: &serde_json::Value, allowed: &[&str]) -> bool {
         .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
 }
 
+fn stable_handoff_token(value: &str, maximum: usize) -> bool {
+    (1..=maximum).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_handoff_health(value: &serde_json::Value) -> Result<(), String> {
+    let fields = [
+        "schema",
+        "configured",
+        "supported",
+        "state",
+        "code",
+        "explanation",
+        "action",
+        "active_session",
+        "account",
+        "model",
+        "observed_at",
+        "preference_effect",
+    ];
+    if !object_has_only(value, &fields)
+        || value
+            .as_object()
+            .map_or(true, |object| object.len() != fields.len())
+        || value.get("schema").and_then(serde_json::Value::as_str) != Some(HANDOFF_HEALTH_SCHEMA)
+    {
+        return Err("desktop handoff health contains unknown or missing fields".into());
+    }
+    let configured = value
+        .get("configured")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "desktop handoff preference is invalid".to_string())?;
+    let supported = value
+        .get("supported")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "desktop handoff capability is invalid".to_string())?;
+    let state = value
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .filter(|state| {
+            [
+                "configured",
+                "unavailable",
+                "downgraded",
+                "armed",
+                "supervision_lost",
+                "loop_guard",
+                "disabled",
+            ]
+            .contains(state)
+        })
+        .ok_or_else(|| "desktop handoff state is invalid".to_string())?;
+    let _code = value
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| stable_handoff_token(code, 64))
+        .ok_or_else(|| "desktop handoff code is invalid".to_string())?;
+    let _explanation = value
+        .get("explanation")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| (1..=256).contains(&text.len()))
+        .ok_or_else(|| "desktop handoff explanation is invalid".to_string())?;
+    let _action = value
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .filter(|action| {
+            [
+                "none",
+                "upgrade_engine",
+                "install_claude_cli",
+                "inspect_diagnostics",
+                "use_compatible_interactive_launch",
+                "inspect_handoff_health",
+                "start_new_session",
+                "enable_handoff",
+                "wait_for_session",
+            ]
+            .contains(action)
+        })
+        .ok_or_else(|| "desktop handoff action is invalid".to_string())?;
+    let active = value
+        .get("active_session")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "desktop handoff activity is invalid".to_string())?;
+    let account_valid = value.get("account").is_some_and(|account| {
+        account.is_null() || account.as_str().is_some_and(valid_account_name)
+    });
+    let model_valid = value.get("model").is_some_and(|model| {
+        model.is_null()
+            || model.as_str().is_some_and(|model| {
+                (1..=32).contains(&model.len())
+                    && model.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'_'
+                            || byte == b'-'
+                    })
+            })
+    });
+    let observed_valid = value.get("observed_at").is_some_and(|observed| {
+        observed.is_null()
+            || observed
+                .as_f64()
+                .is_some_and(|observed| observed.is_finite() && observed >= 0.0)
+    });
+    if !account_valid
+        || !model_valid
+        || !observed_valid
+        || value
+            .get("preference_effect")
+            .and_then(serde_json::Value::as_str)
+            != Some("next_launch_only")
+        || (!supported && state != "unavailable")
+        || (active
+            && ![
+                "configured",
+                "armed",
+                "downgraded",
+                "supervision_lost",
+                "loop_guard",
+            ]
+            .contains(&state))
+        || (active
+            && state == "configured"
+            && (_code != "awaiting_session_start" || _action != "wait_for_session"))
+        || (["armed", "downgraded", "supervision_lost", "loop_guard"].contains(&state) && !active)
+        || (state == "disabled" && configured)
+        || (!configured && !active && state != "disabled" && state != "unavailable")
+    {
+        return Err("desktop handoff health is inconsistent".into());
+    }
+    Ok(())
+}
+
 fn validate_routing_preview(value: &serde_json::Value) -> Result<(), String> {
     if !object_has_only(
         value,
@@ -1613,7 +1750,10 @@ fn validate_desktop_view(view: &serde_json::Value) -> Result<(), String> {
     {
         return Err("bundled desktop engine returned an invalid snapshot".into());
     }
-    Ok(())
+    validate_handoff_health(
+        view.get("handoff")
+            .ok_or_else(|| "bundled desktop engine omitted handoff health".to_string())?,
+    )
 }
 
 fn configured_theme(view: &serde_json::Value) -> &'static str {
@@ -1652,6 +1792,7 @@ fn validate_desktop_bootstrap(
                 "resilient_collection",
                 "validated_settings",
                 "routing_launch",
+                "handoff_health",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -1716,6 +1857,15 @@ fn desktop_startup_view() -> serde_json::Value {
                 "global_threshold_percent": 20,
                 "provider_threshold_percent": {},
             },
+        },
+        "handoff": {
+            "schema": HANDOFF_HEALTH_SCHEMA,
+            "configured": true, "supported": false,
+            "state": "unavailable", "code": "engine_starting",
+            "explanation": "The bundled engine is starting.",
+            "action": "none", "active_session": false,
+            "account": null, "model": null, "observed_at": null,
+            "preference_effect": "next_launch_only",
         },
     })
 }
@@ -3753,10 +3903,7 @@ mod tests {
 
     #[test]
     fn desktop_bootstrap_requires_onboarding_and_lifecycle_capabilities() {
-        let view = serde_json::json!({
-            "schema": DESKTOP_VIEW_SCHEMA,
-            "accounts": [],
-        });
+        let view = desktop_startup_view();
         let capabilities = [
             "discover",
             "adopt",
@@ -3769,6 +3916,7 @@ mod tests {
             "resilient_collection",
             "validated_settings",
             "routing_launch",
+            "handoff_health",
         ];
         let compatible = serde_json::json!({
             "product": "headroom",
@@ -3809,11 +3957,14 @@ mod tests {
     fn desktop_store_revisions_one_ordered_snapshot_for_both_surfaces() {
         let store = DesktopStore::default();
         let first = store
-            .replace_view(serde_json::json!({
-                "schema": DESKTOP_VIEW_SCHEMA,
-                "settings": {"theme": "midnight"},
-                "accounts": [{"name": "codex"}, {"name": "claude"}],
-            }))
+            .replace_view({
+                let mut view = desktop_startup_view();
+                view["settings"]["theme"] = serde_json::json!("midnight");
+                view["accounts"] = serde_json::json!([
+                    {"name": "codex"}, {"name": "claude"}
+                ]);
+                view
+            })
             .unwrap();
         assert_eq!(first.revision, 1);
         assert_eq!(first.theme, "midnight");
@@ -3823,11 +3974,11 @@ mod tests {
         assert_eq!(themed.theme, "terminal");
         assert_eq!(themed.view, first.view);
         let persisted = store
-            .replace_view(serde_json::json!({
-                "schema": DESKTOP_VIEW_SCHEMA,
-                "settings": {"theme": "paper"},
-                "accounts": [],
-            }))
+            .replace_view({
+                let mut view = desktop_startup_view();
+                view["settings"]["theme"] = serde_json::json!("paper");
+                view
+            })
             .unwrap();
         assert_eq!(persisted.revision, 3);
         assert_eq!(persisted.theme, "paper");
@@ -3941,6 +4092,26 @@ mod tests {
         assert_eq!(view["recovery_code"], "engine_starting");
         assert!(view["accounts"].as_array().unwrap().is_empty());
         assert_eq!(desktop_startup_handshake()["runtime"], "unavailable");
+    }
+
+    #[test]
+    fn handoff_health_requires_the_exact_bounded_engine_contract() {
+        let valid = desktop_startup_view()["handoff"].clone();
+        assert!(validate_handoff_health(&valid).is_ok());
+        let mut unknown = valid.clone();
+        unknown["pid"] = serde_json::json!(1234);
+        assert!(validate_handoff_health(&unknown).is_err());
+        let mut raw_reason = valid.clone();
+        raw_reason["reason"] = serde_json::json!("provider internals");
+        assert!(validate_handoff_health(&raw_reason).is_err());
+        let mut inconsistent = valid.clone();
+        inconsistent["active_session"] = serde_json::json!(true);
+        inconsistent["state"] = serde_json::json!("configured");
+        assert!(validate_handoff_health(&inconsistent).is_err());
+        inconsistent["code"] = serde_json::json!("awaiting_session_start");
+        inconsistent["action"] = serde_json::json!("wait_for_session");
+        inconsistent["supported"] = serde_json::json!(true);
+        assert!(validate_handoff_health(&inconsistent).is_ok());
     }
 
     #[test]

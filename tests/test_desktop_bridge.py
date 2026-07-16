@@ -43,6 +43,149 @@ class DesktopBridgeUnit(unittest.TestCase):
         for secret_field in ("email", "token", "credential", "home"):
             self.assertNotIn(secret_field, encoded.lower())
 
+    def test_handoff_health_projects_engine_contract_without_process_material(self):
+        config = {"routing": {"auto_handoff": True}}
+        events = [{
+            "schema": "headroom_supervision_event@1", "state": "armed",
+            "code": "supervision_armed", "explanation": "Bound safely.",
+            "action": "none", "account": "claude-a", "model": "sonnet",
+            "supervisor_id": "11111111-1111-4111-8111-111111111111",
+            "pid": os.getpid(), "observed_at": 1_800_000_000.0,
+        }]
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=events):
+            value = desktop_bridge.handoff_health_desktop(config)
+        self.assertEqual(value["state"], "armed")
+        self.assertTrue(value["active_session"])
+        self.assertEqual(value["preference_effect"], "next_launch_only")
+        encoded = json.dumps(value)
+        for private in ("pid", "supervisor_id", "reason"):
+            self.assertNotIn(private, encoded)
+
+    def test_handoff_health_distinguishes_all_operator_states(self):
+        config = {"routing": {"auto_handoff": True}}
+        cases = [
+            ([], "configured"),
+            ([{"state": "downgraded", "code": "incompatible_launch",
+               "explanation": "Downgraded safely.",
+               "action": "use_compatible_interactive_launch"}], "downgraded"),
+            ([{"state": "supervision_lost", "code": "spawn_ambiguous",
+               "explanation": "Supervision lost.",
+               "action": "inspect_handoff_health"}], "supervision_lost"),
+            ([{"state": "loop_guard", "code": "loop_guard",
+               "explanation": "Loop stopped.",
+               "action": "start_new_session"}], "loop_guard"),
+        ]
+        for rows, expected in cases:
+            events = [{
+                "schema": "headroom_supervision_event@1", "account": "a",
+                "model": "sonnet", "supervisor_id": None,
+                "pid": os.getpid(), "observed_at": 1.0, **row,
+            } for row in rows]
+            with self.subTest(state=expected), mock.patch.object(
+                    desktop_bridge.connect, "provider_binary",
+                    return_value="/usr/bin/claude"), mock.patch.object(
+                    desktop_bridge.notify, "read_health_events",
+                    return_value=events):
+                self.assertEqual(
+                    desktop_bridge.handoff_health_desktop(config)["state"],
+                    expected)
+        disabled = {"routing": {"auto_handoff": False}}
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[]):
+            self.assertEqual(desktop_bridge.handoff_health_desktop(
+                disabled)["state"], "disabled")
+        with mock.patch.object(desktop_bridge.capabilities, "contract",
+                               return_value={"auto_handoff": {}}):
+            self.assertEqual(desktop_bridge.handoff_health_desktop(
+                config)["state"], "unavailable")
+
+    def test_desktop_states_are_differential_with_notification_contracts(self):
+        config = {"routing": {"auto_handoff": True}}
+        fixtures = [
+            ({"event": "launch", "mode": "supervised"}, "configured"),
+            ({"event": "supervision_armed"}, "armed"),
+            ({"event": "downgrade", "reason": "user-supplied --settings"},
+             "downgraded"),
+            ({"event": "supervision_lost", "code": "spawn_ambiguous"},
+             "supervision_lost"),
+            ({"event": "supervision_lost", "code": "loop_guard"},
+             "loop_guard"),
+        ]
+        for event, expected in fixtures:
+            event.update({"account": "a", "model": "sonnet"})
+            projected = desktop_bridge.notify.health_projection(
+                event, now=1.0, pid=os.getpid())
+            with self.subTest(event=event["event"], state=expected), \
+                    mock.patch.object(
+                        desktop_bridge.connect, "provider_binary",
+                        return_value="/usr/bin/claude"), \
+                    mock.patch.object(
+                        desktop_bridge.notify, "read_health_events",
+                        return_value=[projected]):
+                observed = desktop_bridge.handoff_health_desktop(config)
+            self.assertEqual(observed["state"], expected)
+            self.assertEqual(observed["code"], projected["code"])
+
+    def test_disabling_handoff_does_not_reclassify_a_live_child(self):
+        event = {
+            "schema": "headroom_supervision_event@1", "state": "armed",
+            "code": "supervision_armed", "explanation": "Bound safely.",
+            "action": "none", "account": "a", "model": "sonnet",
+            "supervisor_id": None, "pid": os.getpid(), "observed_at": 1.0,
+        }
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[event]):
+            value = desktop_bridge.handoff_health_desktop(
+                {"routing": {"auto_handoff": False}})
+        self.assertEqual(value["state"], "armed")
+        self.assertTrue(value["active_session"])
+        self.assertIn("next launch", value["explanation"])
+
+    def test_starting_and_finished_downgrade_have_consistent_activity(self):
+        config = {"routing": {"auto_handoff": True}}
+        common = {
+            "schema": "headroom_supervision_event@1", "account": "a",
+            "model": "sonnet", "supervisor_id": None,
+            "observed_at": 1.0,
+        }
+        starting = {
+            **common, "state": "starting", "code": "awaiting_session_start",
+            "explanation": "Waiting for proof.", "action": "wait_for_session",
+            "pid": os.getpid(),
+        }
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[starting]):
+            value = desktop_bridge.handoff_health_desktop(config)
+        self.assertEqual(value["state"], "configured")
+        self.assertTrue(value["active_session"])
+        self.assertEqual(value["code"], "awaiting_session_start")
+
+        downgraded = {
+            **common, "state": "downgraded", "code": "incompatible_launch",
+            "explanation": "Downgraded safely.",
+            "action": "use_compatible_interactive_launch", "pid": 999_999_999,
+        }
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[downgraded]):
+            value = desktop_bridge.handoff_health_desktop(config)
+        self.assertEqual(value["state"], "configured")
+        self.assertFalse(value["active_session"])
+        self.assertEqual(value["code"], "no_active_supervisor")
+        self.assertIsNone(value["account"])
+        self.assertIsNone(value["model"])
+        self.assertIsNone(value["observed_at"])
+
     def test_invalid_request_returns_stable_error(self):
         source = io.StringIO('{"id":"bad"}\n')
         target = io.StringIO()
@@ -128,7 +271,9 @@ class DesktopBridgeUnit(unittest.TestCase):
     def test_demo_never_probes_or_creates_provider_or_registry_state(self):
         with mock.patch.object(desktop_bridge.connect, "detect_existing") as detect, \
                 mock.patch.object(desktop_bridge.connect,
-                                  "provider_binary") as binary:
+                                  "provider_binary") as binary, \
+                mock.patch.object(desktop_bridge.notify,
+                                  "read_health_events") as health:
             value = desktop_bridge.onboarding_desktop(
                 "demo", now=1_800_000_000)
         self.assertEqual(value["mode"], "demo")
@@ -139,6 +284,7 @@ class DesktopBridgeUnit(unittest.TestCase):
                          {"claude", "codex"})
         detect.assert_not_called()
         binary.assert_not_called()
+        health.assert_not_called()
         self.assertFalse(os.path.exists(paths.config_path()))
         self.assertNotIn("claude-demo@example.invalid", json.dumps(value))
 
@@ -431,8 +577,18 @@ class DesktopBridgeUnit(unittest.TestCase):
                           "home": "/main"}],
         })
 
+        armed_event = {
+            "schema": "headroom_supervision_event@1", "state": "armed",
+            "code": "supervision_armed", "explanation": "Bound safely.",
+            "action": "none", "account": "main", "model": "sonnet",
+            "supervisor_id": None, "pid": os.getpid(), "observed_at": 1.0,
+        }
         with mock.patch.object(desktop_bridge.connect, "detect_existing",
-                               return_value=[]):
+                               return_value=[]), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[armed_event]), \
+                mock.patch.object(desktop_bridge.os, "kill",
+                                  wraps=os.kill) as process_probe:
             value = desktop_bridge.update_settings_desktop({
                 "theme": "terminal",
                 "title": "Headroom // Operator",
@@ -466,6 +622,11 @@ class DesktopBridgeUnit(unittest.TestCase):
             "claude": os.path.realpath(binary),
         })
         self.assertFalse(saved["desktop"]["notifications"]["enabled"])
+        self.assertEqual(value["handoff"]["state"], "armed")
+        self.assertTrue(value["handoff"]["active_session"])
+        self.assertFalse(value["handoff"]["configured"])
+        self.assertIn("next launch", value["handoff"]["explanation"])
+        self.assertEqual(process_probe.call_args_list, [mock.call(os.getpid(), 0)])
         self.assertEqual(value["settings"]["notifications"]
                          ["provider_threshold_percent"], {"claude": 10})
         self.assertEqual(desktop_bridge.connect.provider_binary("claude"),

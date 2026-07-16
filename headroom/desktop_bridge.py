@@ -19,8 +19,8 @@ import threading
 import time
 
 from . import (
-    __version__, account_lifecycle, collect as collector, connect, paths,
-    registry, route, widget,
+    __version__, account_lifecycle, capabilities, collect as collector, connect,
+    notify, paths, registry, route, widget,
 )
 
 
@@ -31,6 +31,7 @@ ONBOARDING_SCHEMA = "headroom_desktop_onboarding@1"
 ONBOARDING_STEPS = {"welcome", "providers", "accounts", "demo", "complete"}
 ROUTING_SCHEMA = "headroom_desktop_routing@1"
 LAUNCH_INTENT_SCHEMA = "headroom_provider_launch_intent@1"
+HANDOFF_HEALTH_SCHEMA = "headroom_handoff_health@1"
 DESKTOP_FAMILIES = ("claude", "opus", "sonnet", "haiku", "fable", "codex")
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_REQUEST_ID = 128
@@ -55,6 +56,112 @@ def _settings(config=None):
                          if config is not None else True),
         **desktop,
     }
+
+
+def _pid_alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def handoff_health_desktop(
+        config=None, now=None, *, probe_provider=True, observe_events=True):
+    """Sanitized projection of CLI capabilities and supervisor notifications."""
+    configured = registry.auto_handoff(config) if config is not None else True
+    try:
+        capability_map = capabilities.contract()
+        auto = capability_map.get("auto_handoff")
+        supported = isinstance(auto, dict) \
+            and auto.get("claude") is True and auto.get("health") is True
+    except Exception:  # noqa: BLE001 - an unreadable probe is unavailable
+        supported = False
+    base = {
+        "schema": HANDOFF_HEALTH_SCHEMA,
+        "configured": configured,
+        "supported": supported,
+        "state": "configured",
+        "code": "handoff_configured",
+        "explanation": (
+            "Automatic handoff is enabled for the next compatible Claude launch."),
+        "action": "none",
+        "active_session": False,
+        "account": None,
+        "model": None,
+        "observed_at": None,
+        "preference_effect": "next_launch_only",
+    }
+    if not supported:
+        base.update({
+            "state": "unavailable", "code": "handoff_unsupported",
+            "explanation": "This engine cannot prove automatic-handoff support.",
+            "action": "upgrade_engine",
+        })
+        return base
+    if probe_provider and config is not None \
+            and connect.provider_binary("claude") is None:
+        base.update({
+            "state": "unavailable", "code": "claude_cli_missing",
+            "explanation": "Automatic handoff requires a verified Claude CLI.",
+            "action": "install_claude_cli",
+        })
+        return base
+    if not observe_events:
+        if not configured:
+            base.update({
+                "state": "disabled", "code": "handoff_disabled",
+                "explanation": "Automatic handoff is disabled for future launches.",
+                "action": "enable_handoff",
+            })
+        return base
+    try:
+        events = notify.read_health_events()
+    except (OSError, RuntimeError, ValueError):
+        base.update({
+            "state": "unavailable", "code": "handoff_health_unreadable",
+            "explanation": "Supervisor health history cannot be verified safely.",
+            "action": "inspect_diagnostics",
+        })
+        return base
+    latest = events[-1] if events else None
+    if latest is not None:
+        event_state = latest["state"]
+        active = _pid_alive(latest["pid"])
+        if event_state in {
+                "starting", "downgraded", "armed",
+                "supervision_lost", "loop_guard"} \
+                and not active:
+            event_state = "ended"
+        state = "configured" if event_state in {"starting", "ended"} \
+            else event_state
+        base.update({
+            "state": state,
+            "code": latest["code"] if event_state != "ended"
+            else "no_active_supervisor",
+            "explanation": latest["explanation"] if event_state != "ended"
+            else "No supervised Claude process is currently active.",
+            "action": latest["action"] if event_state != "ended" else "none",
+            "active_session": active and event_state != "ended",
+            "account": latest["account"] if event_state != "ended" else None,
+            "model": latest["model"] if event_state != "ended" else None,
+            "observed_at": (
+                latest["observed_at"] if event_state != "ended" else None),
+        })
+    if not configured and not base["active_session"]:
+        base.update({
+            "state": "disabled", "code": "handoff_disabled",
+            "explanation": "Automatic handoff is disabled for future launches.",
+            "action": "enable_handoff",
+        })
+    elif not configured and base["active_session"]:
+        base["explanation"] += (
+            " The saved preference applies only to the next launch.")
+    return base
 
 
 def _registry_discovery():
@@ -271,6 +378,9 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
         "schema": VIEW_SCHEMA,
         "mode": mode,
         "settings": _settings(config),
+        "handoff": handoff_health_desktop(
+            config, now=now, probe_provider=mode == "ready",
+            observe_events=mode == "ready"),
         "candidates": list(candidates or []),
         "onboarding": onboarding,
         "recovery_code": recovery_code,
@@ -1057,7 +1167,7 @@ def _handle(command, args):
                 "claude_login", "codex_device_login", "onboarding",
                 "account_lifecycle", "reauthentication",
                 "resilient_collection", "validated_settings",
-                "routing_launch", "shutdown"],
+                "routing_launch", "handoff_health", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False

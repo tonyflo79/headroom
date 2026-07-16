@@ -11,6 +11,16 @@ const VALID_SURFACES = new Set(["main", "popover"]);
 const REFRESH_INTERVAL_MIN = 60;
 const REFRESH_INTERVAL_MAX = 3600;
 const ROUTING_SCHEMA = "headroom_desktop_routing@1";
+const HANDOFF_HEALTH_SCHEMA = "headroom_handoff_health@1";
+const HANDOFF_STATES = new Set([
+  "configured", "unavailable", "downgraded", "armed",
+  "supervision_lost", "loop_guard", "disabled",
+]);
+const HANDOFF_ACTIONS = new Set([
+  "none", "upgrade_engine", "install_claude_cli", "inspect_diagnostics",
+  "use_compatible_interactive_launch", "inspect_handoff_health",
+  "start_new_session", "enable_handoff", "wait_for_session",
+]);
 const ROUTING_FAMILIES = new Set(["claude", "opus", "sonnet", "haiku", "fable", "codex"]);
 const ROUTING_CODES = new Set([
   "selected", "available", "reserved", "routing_disabled", "leased",
@@ -209,6 +219,42 @@ export function normalizeRoutingPreview(raw) {
       explanation: launch.explanation, action: launch.action,
     },
   };
+}
+
+export function normalizeHandoffHealth(raw) {
+  const keys = new Set(Object.keys(raw || {}));
+  const expected = [
+    "schema", "configured", "supported", "state", "code", "explanation",
+    "action", "active_session", "account", "model", "observed_at",
+    "preference_effect",
+  ];
+  if (!raw || keys.size !== expected.length || expected.some((key) => !keys.has(key)) ||
+      raw.schema !== HANDOFF_HEALTH_SCHEMA || typeof raw.configured !== "boolean" ||
+      typeof raw.supported !== "boolean" || !HANDOFF_STATES.has(raw.state) ||
+      typeof raw.code !== "string" || !/^[a-z0-9_]{1,64}$/.test(raw.code) ||
+      typeof raw.explanation !== "string" || raw.explanation.length < 1 ||
+      raw.explanation.length > 256 || !HANDOFF_ACTIONS.has(raw.action) ||
+      typeof raw.active_session !== "boolean" ||
+      (raw.account !== null && (typeof raw.account !== "string" ||
+        !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(raw.account))) ||
+      (raw.model !== null && (typeof raw.model !== "string" ||
+        !/^[a-z0-9_-]{1,32}$/.test(raw.model))) ||
+      (raw.observed_at !== null &&
+        (!Number.isFinite(raw.observed_at) || raw.observed_at < 0)) ||
+      raw.preference_effect !== "next_launch_only" ||
+      (!raw.supported && raw.state !== "unavailable") ||
+      (raw.active_session && !["configured", "armed", "downgraded",
+        "supervision_lost", "loop_guard"].includes(raw.state)) ||
+      (raw.active_session && raw.state === "configured" &&
+        (raw.code !== "awaiting_session_start" || raw.action !== "wait_for_session")) ||
+      (["armed", "downgraded", "supervision_lost", "loop_guard"]
+        .includes(raw.state) && !raw.active_session) ||
+      (raw.state === "disabled" && raw.configured) ||
+      (!raw.configured && !raw.active_session && raw.state !== "disabled" &&
+        raw.state !== "unavailable")) {
+    throw new Error("invalid handoff health contract");
+  }
+  return Object.fromEntries(expected.map((key) => [key, raw[key]]));
 }
 
 export function accountStatePresentation(account) {
@@ -468,6 +514,7 @@ export function normalizeBootstrap(raw) {
   };
   const rawHeadline = view.headline && typeof view.headline === "object" ? view.headline : {};
   const numberOrNull = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
+  const handoff = normalizeHandoffHealth(view.handoff);
   return {
     bridge: {
       bridge_schema: raw.bridge.bridge_schema,
@@ -516,7 +563,7 @@ export function normalizeBootstrap(raw) {
         total_accounts: numberOrNull(rawHeadline.total_accounts),
       },
       recovery_code: typeof view.recovery_code === "string" ? view.recovery_code : null,
-      accounts, candidates, onboarding: {
+      handoff, accounts, candidates, onboarding: {
         schema: "headroom_desktop_onboarding@1", step,
         resumable: rawOnboarding.resumable === true,
         recovery_code: typeof rawOnboarding.recovery_code === "string"
@@ -524,6 +571,35 @@ export function normalizeBootstrap(raw) {
         providers,
       } },
   };
+}
+
+function renderHandoffHealth(handoff, mode) {
+  const panel = document.getElementById("handoff-health");
+  panel.hidden = mode !== "ready";
+  panel.dataset.state = handoff.state;
+  document.getElementById("handoff-state").textContent = handoff.state.replaceAll("_", " ");
+  document.getElementById("handoff-code").textContent = handoff.code.replaceAll("_", " ");
+  const actions = {
+    none: "No action required",
+    upgrade_engine: "Update the bundled Headroom engine",
+    install_claude_cli: "Install or configure the Claude CLI",
+    inspect_diagnostics: "Inspect Headroom diagnostics",
+    use_compatible_interactive_launch: "Start Claude from an interactive terminal",
+    inspect_handoff_health: "Inspect handoff diagnostics",
+    start_new_session: "Start a new Claude session",
+    enable_handoff: "Enable automatic handoff for the next launch",
+    wait_for_session: "Wait for Claude SessionStart proof",
+  };
+  document.getElementById("handoff-action").textContent = actions[handoff.action];
+  document.getElementById("handoff-explanation").textContent = handoff.explanation;
+  const context = [handoff.account, handoff.model].filter(Boolean).join(" · ");
+  document.getElementById("handoff-context").textContent = context ||
+    (handoff.configured ? "next compatible Claude launch" : "future launches disabled");
+  const levels = {
+    armed: 5, configured: 3, downgraded: 2, supervision_lost: 1,
+    loop_guard: 1, unavailable: 0, disabled: 0,
+  };
+  panel.dataset.level = String(levels[handoff.state] ?? 0);
 }
 
 function windowRow(label, value) {
@@ -1383,6 +1459,7 @@ export function renderBootstrap(raw, invoke = null) {
   document.getElementById("page-title").textContent = view.settings?.title || "Headroom";
   document.getElementById("summary").textContent =
     `Engine ${value.bridge.product_version} · ${value.bridge.architecture}`;
+  renderHandoffHealth(view.handoff, view.mode);
   const average = typeof view.headline?.avg_5h_left_percent === "number"
     ? view.headline.avg_5h_left_percent : Number.NaN;
   const presentation = onboardingPresentation(view.onboarding);

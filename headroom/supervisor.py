@@ -123,6 +123,8 @@ class Child:
     last_received_at: float = 0.0
     pending_cap: PendingCap = None
     supervision_loss_notified: bool = False
+    armed_notified: bool = False
+    model: str = "claude"
 
 
 @dataclass(frozen=True)
@@ -135,7 +137,14 @@ class Relaunch:
     plan: object = None
 
 
-def _lose_supervision(child, reason):
+def _child_supervisor_id(child):
+    if not isinstance(child.event_path, (str, bytes, os.PathLike)):
+        return None
+    value = os.path.splitext(os.path.basename(child.event_path))[0]
+    return value if handoff._valid_uuid(value) else None
+
+
+def _lose_supervision(child, reason, code="supervision_lost"):
     """Turn automation off for this child and (once per child) notify the
     loss. Post-spawn supervision loss is exactly what an external dispatcher
     cannot see on its own: the launch looked supervised, but auto-handoff
@@ -146,6 +155,9 @@ def _lose_supervision(child, reason):
         child.supervision_loss_notified = True
         notify.emit({"event": "supervision_lost",
                      "account": child.account.get("name", ""),
+                     "model": child.model,
+                     "supervisor_id": _child_supervisor_id(child),
+                     "code": code,
                      "reason": str(reason)})
 
 
@@ -896,10 +908,11 @@ class Supervisor:
         if self.generation == 1:
             notify.emit({"event": "launch", "mode": "supervised",
                          "account": account.get("name", ""),
-                         "model": self.family, "note": ""})
+                         "model": self.family,
+                         "supervisor_id": self.supervisor_id, "note": ""})
         return Child(process, account, self.generation,
                      event_path(self.supervisor_id), settings, launched_at,
-                     automatic)
+                     automatic, model=self.family)
 
     def _fresh_collect(self, event_time):
         # Provider snapshots use whole-second timestamps.  Crossing the next
@@ -1366,6 +1379,14 @@ class Supervisor:
                             transcript_path=child.binding.transcript_path,
                             child_generation=child.generation)
                         child.resume_bound = True
+                    if child.automation and not child.armed_notified:
+                        notify.emit({
+                            "event": "supervision_armed",
+                            "account": child.account.get("name", ""),
+                            "model": child.model,
+                            "supervisor_id": _child_supervisor_id(child),
+                        })
+                        child.armed_notified = True
                 except (SupervisorError, handoff.HandoffError, RuntimeError,
                         OSError) as error:
                     _lose_supervision(child, f"session binding failed: {error}")
@@ -1468,6 +1489,13 @@ class Supervisor:
                 if proof is not None and child.automation:
                     try:
                         plan = self._preflight(child, proof)
+                    except handoff.HandoffLoopGuardError as error:
+                        print(f"[headroom] automatic handoff held: {error}; "
+                              "child continues", file=sys.stderr)
+                        _lose_supervision(
+                            child, f"automatic handoff held: {error}",
+                            code="loop_guard")
+                        proof = None
                     except handoff.HandoffError as error:
                         # A recent mtime is expected just after StopFailure; keep
                         # polling until the required five quiet seconds pass.
@@ -1550,6 +1578,9 @@ class Supervisor:
                         notify.emit({
                             "event": "supervision_lost",
                             "account": account["name"],
+                            "model": self.family,
+                            "supervisor_id": self.supervisor_id,
+                            "code": "spawn_ambiguous",
                             "reason": f"spawn outcome ambiguous ({error}); a "
                             "child may be live but is unmonitored"})
                         return 127
@@ -1568,6 +1599,9 @@ class Supervisor:
                         notify.emit({
                             "event": "supervision_lost",
                             "account": failed_plan.source.account["name"],
+                            "model": self.family,
+                            "supervisor_id": self.supervisor_id,
+                            "code": "target_relaunch_failed",
                             "reason": f"target relaunch failed: {error}"})
                         # the target never started — release its unused lease
                         route.release_slot_lease(failed_plan.target["name"])
@@ -1650,6 +1684,13 @@ class Supervisor:
                 if name != self._ambiguous_account:
                     route.release_slot_lease(name)
             if clean_exit:
+                if self.spawned_any:
+                    notify.emit({
+                        "event": "supervision_ended",
+                        "account": account.get("name", ""),
+                        "model": self.family,
+                        "supervisor_id": self.supervisor_id,
+                    })
                 self._cleanup_files()
 
 

@@ -37,6 +37,10 @@ class HandoffError(RuntimeError):
     """A user-actionable refusal; handoff guards intentionally fail closed."""
 
 
+class HandoffLoopGuardError(HandoffError):
+    """The authoritative rolling automatic-handoff admission guard tripped."""
+
+
 @dataclass(frozen=True)
 class SourceSession:
     session_id: str
@@ -1119,7 +1123,7 @@ def reserve_automatic(plan, now=None, *, loop_window=600.0, loop_max=3):
                          and row.get("action") == "cap_confirmed"
                          and row["ts"] >= cutoff]
             if len(confirmed) >= loop_max:
-                raise HandoffError(
+                raise HandoffLoopGuardError(
                     "automatic handoff loop guard: 3 handoffs in 10 minutes")
             released = {row.get("handoff_id") for row in rows
                         if row.get("action") in ("failure", "resume_bound")}
