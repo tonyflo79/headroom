@@ -11,6 +11,7 @@ import json
 import math
 import os
 import platform
+import re
 import secrets
 import sys
 import threading
@@ -88,6 +89,11 @@ def _candidate_projection(rows, config=None):
 
 def _redacted_identity(value):
     return collector.redact_email(value) if isinstance(value, str) else None
+
+
+def _diagnostic_code(value):
+    return value if isinstance(value, str) \
+        and re.fullmatch(r"[a-z0-9_]{1,64}", value) else None
 
 
 def _onboarding_path():
@@ -182,6 +188,7 @@ def _held_account(row, policy=None):
         "identity": _redacted_identity(row.get("expected_email")),
         "plan": "Unknown",
         "note": "No collected reading yet",
+        "diagnostic_code": "no_collected_reading",
         "trust_state": None,
         "reserved": row.get("reserved") is True,
         "policy": policy,
@@ -220,6 +227,7 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
             "identity": _redacted_identity(details.get("email")),
             "plan": details.get("plan") or "Unknown",
             "note": details.get("note"),
+            "diagnostic_code": _diagnostic_code(details.get("error_code")),
             "trust_state": details.get("trust_state"),
             "reserved": configured.get(row["name"], {}).get("reserved") is True,
             "policy": policies.get(row["name"]),

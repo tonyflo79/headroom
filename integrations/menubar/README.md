@@ -32,7 +32,17 @@ handoffs refuse the mutation.
 
 The dashboard's deliberate visual language is a black terminal canvas with
 phosphor-green monospace text and glowing capacity bars. Limited and uncertain
-states retain distinct red and amber treatments for accessibility.
+states retain distinct red and amber treatments for accessibility. Appearance
+also offers Minimal, Chrome, Paper, and Terminal previews; all five themes use
+the same semantic state model and never rely on color alone.
+
+The resizable dashboard and the 420-by-680 menu-bar popover are projections of
+one revisioned snapshot owned by Rust. They keep account order, capacity,
+freshness, trust, routing, and theme changes synchronized without polling one
+another. The popover scrolls for large fleets and provides Refresh, Dashboard,
+Settings, and Quit actions. Closing the dashboard keeps the tray and bundled
+engine running; Quit ends both. A private, schema-validated window record
+restores the dashboard only when its size and position remain safely visible.
 
 This is still an implementation build, not a production release. Complete
 account management, signing, notarization, updates, and release
@@ -54,6 +64,9 @@ Headroom.app
   `headroom_desktop_bridge@1` schema, frozen runtime, and required capability.
 - Engine stdout is protocol-only. Imported or child-process output is diverted
   to stderr and Rust never logs its contents.
+- Rust owns the current sanitized view, a monotonic revision, and the live
+  theme. Both webviews receive the same immutable snapshot envelope; stale or
+  duplicate revisions and stale command responses are ignored.
 - The bridge exposes only narrow onboarding, account, refresh, and login-job
   commands. Calls are serialized, bounded, and a timed-out or malformed session
   is retired so a late frame cannot be mistaken for a later response.
@@ -133,6 +146,10 @@ No output is expected. The bundled engine appears beneath the app in the
 process tree as `Headroom.app/Contents/MacOS/headroom-engine`, never as a
 system `python` process. Quitting Headroom must remove both processes.
 
+For the dashboard/popover acceptance record, including synchronized refresh,
+large-fleet scrolling, close-to-tray, theme propagation, and window restore,
+see `docs/desktop/SURFACE-SYNC-VALIDATION.md`.
+
 ## Current limitations
 
 - The app is macOS-only and is built for the runner's native architecture.
@@ -142,5 +159,7 @@ system `python` process. Quitting Headroom must remove both processes.
 - Recovery is currently a safe read-only state, not a repair workflow.
 - There is no launch-at-login, updater, diagnostics export, signing, or
   notarization yet.
-- The old loopback popover helpers remain in Rust for their security tests but
-  are not called by the desktop tracer.
+- Theme choice is live for the current application session; durable desktop
+  preferences are owned by the follow-on settings slice.
+- The old loopback viewer helpers remain in Rust for their security tests but
+  are not called by the desktop application path.
