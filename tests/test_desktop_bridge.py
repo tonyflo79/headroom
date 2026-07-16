@@ -43,6 +43,149 @@ class DesktopBridgeUnit(unittest.TestCase):
         for secret_field in ("email", "token", "credential", "home"):
             self.assertNotIn(secret_field, encoded.lower())
 
+    def test_handoff_health_projects_engine_contract_without_process_material(self):
+        config = {"routing": {"auto_handoff": True}}
+        events = [{
+            "schema": "headroom_supervision_event@1", "state": "armed",
+            "code": "supervision_armed", "explanation": "Bound safely.",
+            "action": "none", "account": "claude-a", "model": "sonnet",
+            "supervisor_id": "11111111-1111-4111-8111-111111111111",
+            "pid": os.getpid(), "observed_at": 1_800_000_000.0,
+        }]
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=events):
+            value = desktop_bridge.handoff_health_desktop(config)
+        self.assertEqual(value["state"], "armed")
+        self.assertTrue(value["active_session"])
+        self.assertEqual(value["preference_effect"], "next_launch_only")
+        encoded = json.dumps(value)
+        for private in ("pid", "supervisor_id", "reason"):
+            self.assertNotIn(private, encoded)
+
+    def test_handoff_health_distinguishes_all_operator_states(self):
+        config = {"routing": {"auto_handoff": True}}
+        cases = [
+            ([], "configured"),
+            ([{"state": "downgraded", "code": "incompatible_launch",
+               "explanation": "Downgraded safely.",
+               "action": "use_compatible_interactive_launch"}], "downgraded"),
+            ([{"state": "supervision_lost", "code": "spawn_ambiguous",
+               "explanation": "Supervision lost.",
+               "action": "inspect_handoff_health"}], "supervision_lost"),
+            ([{"state": "loop_guard", "code": "loop_guard",
+               "explanation": "Loop stopped.",
+               "action": "start_new_session"}], "loop_guard"),
+        ]
+        for rows, expected in cases:
+            events = [{
+                "schema": "headroom_supervision_event@1", "account": "a",
+                "model": "sonnet", "supervisor_id": None,
+                "pid": os.getpid(), "observed_at": 1.0, **row,
+            } for row in rows]
+            with self.subTest(state=expected), mock.patch.object(
+                    desktop_bridge.connect, "provider_binary",
+                    return_value="/usr/bin/claude"), mock.patch.object(
+                    desktop_bridge.notify, "read_health_events",
+                    return_value=events):
+                self.assertEqual(
+                    desktop_bridge.handoff_health_desktop(config)["state"],
+                    expected)
+        disabled = {"routing": {"auto_handoff": False}}
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[]):
+            self.assertEqual(desktop_bridge.handoff_health_desktop(
+                disabled)["state"], "disabled")
+        with mock.patch.object(desktop_bridge.capabilities, "contract",
+                               return_value={"auto_handoff": {}}):
+            self.assertEqual(desktop_bridge.handoff_health_desktop(
+                config)["state"], "unavailable")
+
+    def test_desktop_states_are_differential_with_notification_contracts(self):
+        config = {"routing": {"auto_handoff": True}}
+        fixtures = [
+            ({"event": "launch", "mode": "supervised"}, "configured"),
+            ({"event": "supervision_armed"}, "armed"),
+            ({"event": "downgrade", "reason": "user-supplied --settings"},
+             "downgraded"),
+            ({"event": "supervision_lost", "code": "spawn_ambiguous"},
+             "supervision_lost"),
+            ({"event": "supervision_lost", "code": "loop_guard"},
+             "loop_guard"),
+        ]
+        for event, expected in fixtures:
+            event.update({"account": "a", "model": "sonnet"})
+            projected = desktop_bridge.notify.health_projection(
+                event, now=1.0, pid=os.getpid())
+            with self.subTest(event=event["event"], state=expected), \
+                    mock.patch.object(
+                        desktop_bridge.connect, "provider_binary",
+                        return_value="/usr/bin/claude"), \
+                    mock.patch.object(
+                        desktop_bridge.notify, "read_health_events",
+                        return_value=[projected]):
+                observed = desktop_bridge.handoff_health_desktop(config)
+            self.assertEqual(observed["state"], expected)
+            self.assertEqual(observed["code"], projected["code"])
+
+    def test_disabling_handoff_does_not_reclassify_a_live_child(self):
+        event = {
+            "schema": "headroom_supervision_event@1", "state": "armed",
+            "code": "supervision_armed", "explanation": "Bound safely.",
+            "action": "none", "account": "a", "model": "sonnet",
+            "supervisor_id": None, "pid": os.getpid(), "observed_at": 1.0,
+        }
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[event]):
+            value = desktop_bridge.handoff_health_desktop(
+                {"routing": {"auto_handoff": False}})
+        self.assertEqual(value["state"], "armed")
+        self.assertTrue(value["active_session"])
+        self.assertIn("next launch", value["explanation"])
+
+    def test_starting_and_finished_downgrade_have_consistent_activity(self):
+        config = {"routing": {"auto_handoff": True}}
+        common = {
+            "schema": "headroom_supervision_event@1", "account": "a",
+            "model": "sonnet", "supervisor_id": None,
+            "observed_at": 1.0,
+        }
+        starting = {
+            **common, "state": "starting", "code": "awaiting_session_start",
+            "explanation": "Waiting for proof.", "action": "wait_for_session",
+            "pid": os.getpid(),
+        }
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[starting]):
+            value = desktop_bridge.handoff_health_desktop(config)
+        self.assertEqual(value["state"], "configured")
+        self.assertTrue(value["active_session"])
+        self.assertEqual(value["code"], "awaiting_session_start")
+
+        downgraded = {
+            **common, "state": "downgraded", "code": "incompatible_launch",
+            "explanation": "Downgraded safely.",
+            "action": "use_compatible_interactive_launch", "pid": 999_999_999,
+        }
+        with mock.patch.object(desktop_bridge.connect, "provider_binary",
+                               return_value="/usr/bin/claude"), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[downgraded]):
+            value = desktop_bridge.handoff_health_desktop(config)
+        self.assertEqual(value["state"], "configured")
+        self.assertFalse(value["active_session"])
+        self.assertEqual(value["code"], "no_active_supervisor")
+        self.assertIsNone(value["account"])
+        self.assertIsNone(value["model"])
+        self.assertIsNone(value["observed_at"])
+
     def test_invalid_request_returns_stable_error(self):
         source = io.StringIO('{"id":"bad"}\n')
         target = io.StringIO()
@@ -128,7 +271,9 @@ class DesktopBridgeUnit(unittest.TestCase):
     def test_demo_never_probes_or_creates_provider_or_registry_state(self):
         with mock.patch.object(desktop_bridge.connect, "detect_existing") as detect, \
                 mock.patch.object(desktop_bridge.connect,
-                                  "provider_binary") as binary:
+                                  "provider_binary") as binary, \
+                mock.patch.object(desktop_bridge.notify,
+                                  "read_health_events") as health:
             value = desktop_bridge.onboarding_desktop(
                 "demo", now=1_800_000_000)
         self.assertEqual(value["mode"], "demo")
@@ -139,6 +284,7 @@ class DesktopBridgeUnit(unittest.TestCase):
                          {"claude", "codex"})
         detect.assert_not_called()
         binary.assert_not_called()
+        health.assert_not_called()
         self.assertFalse(os.path.exists(paths.config_path()))
         self.assertNotIn("claude-demo@example.invalid", json.dumps(value))
 
@@ -253,7 +399,8 @@ class DesktopBridgeUnit(unittest.TestCase):
             row("current"), row("limited", "codex", used=100),
             row("held", trust="unverified"),
             row("stale", captured=now - 2_000),
-            {**row("offline"), "ok": False, "note": "provider unavailable"},
+            {**row("offline"), "ok": False, "note": "provider unavailable",
+             "error_code": "provider_auth_rejected"},
         ]}
         value = desktop_bridge._view(config, snapshot, now=now)
         states = {account["name"]: account["state"]
@@ -267,6 +414,69 @@ class DesktopBridgeUnit(unittest.TestCase):
         offline = next(row for row in value["accounts"]
                        if row["name"] == "offline")
         self.assertEqual(offline["note"], "provider unavailable")
+        self.assertEqual(offline["diagnostic_code"],
+                         "provider_auth_rejected")
+        self.assertEqual(offline["observation_age_seconds"], 0)
+        self.assertIsNone(desktop_bridge._diagnostic_code("../../raw-output"))
+        self.assertEqual(limited["policy"]["position"], 1)
+        self.assertTrue(limited["policy"]["home_retained_on_remove"])
+
+    def test_account_actions_reserve_reorder_rename_and_confirm_remove(self):
+        home_a = os.path.join(paths.homes_dir(), "a")
+        home_b = os.path.join(paths.homes_dir(), "b")
+        os.makedirs(home_a)
+        os.makedirs(home_b)
+        registry.save({"schema_version": 1, "accounts": [
+            {"name": "a", "provider": "claude", "home": home_a},
+            {"name": "b", "provider": "codex", "home": home_b},
+        ]})
+        with mock.patch.object(desktop_bridge.connect, "detect_existing",
+                               return_value=[]):
+            reserved = desktop_bridge.account_action_desktop("reserve", "a")
+            moved = desktop_bridge.account_action_desktop("move_up", "b")
+            renamed = desktop_bridge.account_action_desktop(
+                "rename", "a", new_name="primary")
+            with self.assertRaises(desktop_bridge.BridgeError) as unconfirmed:
+                desktop_bridge.account_action_desktop(
+                    "remove", "primary", confirmation="wrong")
+            removed = desktop_bridge.account_action_desktop(
+                "remove", "primary", confirmation="primary")
+        self.assertTrue(next(row for row in reserved["accounts"]
+                             if row["name"] == "a")["reserved"])
+        self.assertEqual([row["name"] for row in moved["accounts"]], ["b", "a"])
+        primary = next(row for row in renamed["accounts"]
+                       if row["name"] == "primary")
+        self.assertEqual(primary["policy"]["home_kind"], "headroom")
+        self.assertTrue(primary["policy"]["rename_keeps_home"])
+        self.assertEqual(unconfirmed.exception.code,
+                         "removal_confirmation_required")
+        self.assertEqual([row["name"] for row in removed["accounts"]], ["b"])
+        self.assertTrue(os.path.isdir(home_a))
+
+    def test_reauthentication_job_is_available_only_for_safe_owned_home(self):
+        manager = desktop_bridge.DesktopLoginManager()
+        home = os.path.join(paths.homes_dir(), "codex-main")
+        os.makedirs(home)
+        config = {"schema_version": 1, "accounts": [{
+            "name": "codex-main", "provider": "codex", "home": home,
+            "expected_email": "private@example.test",
+        }]}
+        registry.save(config)
+        finished = {"ok": True, "code": "reauthenticated",
+                    "entry": config["accounts"][0], "observation": {
+                        "email": "private@example.test", "plan": "plus",
+                        "windows": {"7d": {"used_percent": 20}},
+                    }}
+        with mock.patch.object(
+                desktop_bridge.connect, "desktop_connect_codex_device",
+                return_value=finished):
+            started = manager.start_reauthentication("codex-main")
+            manager._job["thread"].join(timeout=2)
+            value = manager.status(started["job_id"])
+        self.assertEqual(value["mode"], "reauthenticate")
+        self.assertEqual(value["state"], "succeeded")
+        self.assertEqual(value["result_code"], "reauthenticated")
+        self.assertNotIn("private@example.test", json.dumps(value))
 
     def test_desktop_boundary_always_redacts_identity(self):
         config = {"schema_version": 1,
@@ -285,10 +495,29 @@ class DesktopBridgeUnit(unittest.TestCase):
                          "p***@example.com")
         self.assertNotIn("private@example.com", json.dumps(value))
 
+    def test_registry_order_overrides_stale_snapshot_order(self):
+        config = {"schema_version": 1, "accounts": [
+            {"name": "codex-first", "provider": "codex", "home": "/codex"},
+            {"name": "claude-second", "provider": "claude", "home": "/claude"},
+        ]}
+        snapshot = {"generated": 1_800_000_000, "accounts": [
+            {"name": "claude-second", "provider": "claude", "ok": True,
+             "captured_at": 1_800_000_000, "windows": {}},
+            {"name": "codex-first", "provider": "codex", "ok": True,
+             "captured_at": 1_800_000_000, "windows": {}},
+        ]}
+
+        value = desktop_bridge._view(config, snapshot, now=1_800_000_000)
+
+        self.assertEqual(
+            [row["name"] for row in value["accounts"]],
+            ["codex-first", "claude-second"],
+        )
+
     def test_adopt_preserves_settings_and_returns_redacted_live_view(self):
         existing = {
             "schema_version": 1,
-            "dashboard": {"title": "Keep Me", "theme": "light",
+            "dashboard": {"title": "Keep Me", "theme": "paper",
                           "redact_emails": True, "port": 9000},
             "routing": {"reserve_percent": 12, "auto_handoff": False},
             "accounts": [{"name": "old", "provider": "claude",
@@ -329,13 +558,254 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(saved["dashboard"], existing["dashboard"])
         self.assertEqual(saved["routing"], existing["routing"])
         self.assertEqual(value["settings"]["title"], "Keep Me")
-        self.assertEqual(value["settings"]["theme"], "light")
+        self.assertEqual(value["settings"]["theme"], "paper")
         self.assertEqual(value["settings"]["reserve_percent"], 12)
         self.assertFalse(value["settings"]["auto_handoff"])
         account = next(row for row in value["accounts"]
                        if row["name"] == "codex-main")
         self.assertEqual(account["identity"], "p***@example.com")
         self.assertEqual(account["plan"], "ChatGPT Plus")
+
+    def test_settings_commit_atomically_and_drive_provider_discovery(self):
+        binary = os.path.join(self.temp.name, "custom-claude")
+        with open(binary, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(binary, 0o700)
+        registry.save({
+            "schema_version": 1,
+            "accounts": [{"name": "main", "provider": "claude",
+                          "home": "/main"}],
+        })
+
+        armed_event = {
+            "schema": "headroom_supervision_event@1", "state": "armed",
+            "code": "supervision_armed", "explanation": "Bound safely.",
+            "action": "none", "account": "main", "model": "sonnet",
+            "supervisor_id": None, "pid": os.getpid(), "observed_at": 1.0,
+        }
+        with mock.patch.object(desktop_bridge.connect, "detect_existing",
+                               return_value=[]), \
+                mock.patch.object(desktop_bridge.notify, "read_health_events",
+                                  return_value=[armed_event]), \
+                mock.patch.object(desktop_bridge.os, "kill",
+                                  wraps=os.kill) as process_probe:
+            value = desktop_bridge.update_settings_desktop({
+                "theme": "terminal",
+                "title": "Headroom // Operator",
+                "redact_emails": False,
+                "reserve_percent": 17.5,
+                "auto_handoff": False,
+                "refresh_interval_seconds": 420,
+                "provider_paths": {"claude": binary, "codex": None},
+                "preferred_terminal": "iterm",
+                "remember_window": False,
+                "notifications": {
+                    "enabled": False,
+                    "reset_enabled": True,
+                    "global_threshold_percent": 15,
+                    "provider_threshold_percent": {"claude": 10},
+                },
+            }, now=1_800_000_000)
+
+        saved = registry.load()
+        self.assertEqual(saved["dashboard"], {
+            "theme": "terminal", "title": "Headroom // Operator",
+            "redact_emails": False,
+        })
+        self.assertEqual(saved["routing"], {
+            "reserve_percent": 17.5, "auto_handoff": False,
+        })
+        self.assertEqual(saved["desktop"]["refresh_interval_seconds"], 420)
+        self.assertEqual(saved["desktop"]["preferred_terminal"], "iterm")
+        self.assertFalse(saved["desktop"]["remember_window"])
+        self.assertEqual(saved["desktop"]["provider_paths"], {
+            "claude": os.path.realpath(binary),
+        })
+        self.assertFalse(saved["desktop"]["notifications"]["enabled"])
+        self.assertEqual(value["handoff"]["state"], "armed")
+        self.assertTrue(value["handoff"]["active_session"])
+        self.assertFalse(value["handoff"]["configured"])
+        self.assertIn("next launch", value["handoff"]["explanation"])
+        self.assertEqual(process_probe.call_args_list, [mock.call(os.getpid(), 0)])
+        self.assertEqual(value["settings"]["notifications"]
+                         ["provider_threshold_percent"], {"claude": 10})
+        self.assertEqual(desktop_bridge.connect.provider_binary("claude"),
+                         os.path.realpath(binary))
+        self.assertEqual(os.stat(paths.config_path()).st_mode & 0o777, 0o600)
+
+    def test_settings_reject_invalid_fields_without_mutating_config(self):
+        registry.save({
+            "schema_version": 1,
+            "dashboard": {"title": "Before"},
+            "accounts": [{"name": "main", "provider": "claude",
+                          "home": "/main"}],
+        })
+        before = paths.load_json(paths.config_path())
+        invalid = [
+            ({"theme": "unknown"}, "invalid_setting_theme"),
+            ({"title": "  "}, "invalid_setting_title"),
+            ({"refresh_interval_seconds": 5},
+             "invalid_setting_refresh_interval"),
+            ({"provider_paths": {"claude": "/missing/claude"}},
+             "invalid_setting_claude_path"),
+            ({"preferred_terminal": "arbitrary-app"},
+             "invalid_setting_preferred_terminal"),
+            ({"notifications": {"global_threshold_percent": 100}},
+             "invalid_setting_notification_threshold"),
+            ({"unknown": True}, "invalid_settings"),
+        ]
+        for patch, code in invalid:
+            with self.subTest(patch=patch), \
+                    self.assertRaises(desktop_bridge.BridgeError) as raised:
+                desktop_bridge.update_settings_desktop(patch)
+            self.assertEqual(raised.exception.code, code)
+            self.assertEqual(paths.load_json(paths.config_path()), before)
+
+    def test_desktop_setting_defaults_are_quiet_and_safe(self):
+        config = {
+            "schema_version": 1,
+            "accounts": [{"name": "main", "provider": "claude",
+                          "home": "/main"}],
+        }
+        settings = desktop_bridge._settings(config)
+        self.assertEqual(settings["refresh_interval_seconds"], 300)
+        self.assertTrue(settings["remember_window"])
+        self.assertEqual(settings["preferred_terminal"], "terminal")
+        self.assertEqual(settings["provider_paths"], {})
+        self.assertFalse(settings["notifications"]["enabled"])
+
+    def test_routing_preview_uses_engine_order_and_sanitizes_every_reason(self):
+        accounts = [
+            {"name": "selected", "provider": "claude", "home": "/selected"},
+            {"name": "reserved", "provider": "claude", "home": "/reserved"},
+            {"name": "stale", "provider": "claude", "home": "/stale"},
+            {"name": "unverified", "provider": "claude", "home": "/unverified"},
+            {"name": "cooled", "provider": "claude", "home": "/cooled"},
+            {"name": "quarantined", "provider": "claude", "home": "/quarantined"},
+            {"name": "leased", "provider": "claude", "home": "/leased"},
+            {"name": "infra", "provider": "claude", "home": "/infra"},
+        ]
+        registry.save({"schema_version": 1, "accounts": accounts})
+        ranked = [
+            (accounts[0], None),
+            (accounts[1], "reserved (config): private detail"),
+            (accounts[2], "reading stale: raw-provider-secret"),
+            (accounts[3], "slot identity changed since snapshot — recollect"),
+            (accounts[4], "cooldown until private timestamp"),
+            (accounts[5], "quarantined: raw auth response"),
+            (accounts[6], "slot leased by another live launch"),
+            (accounts[7], "cooldown ledger unreadable — /private/path"),
+        ]
+        with mock.patch.object(desktop_bridge.route, "ensure_fresh_snapshot",
+                               return_value={"generated": time.time()}), \
+                mock.patch.object(desktop_bridge.route, "candidates",
+                                  return_value=ranked) as candidates, \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value="/bin/echo"):
+            value = desktop_bridge.routing_preview_desktop("claude")
+        candidates.assert_called_once()
+        self.assertEqual(value["schema"], desktop_bridge.ROUTING_SCHEMA)
+        self.assertEqual(value["selected"], {
+            "name": "selected", "provider": "claude"})
+        self.assertEqual([row["code"] for row in value["candidates"]], [
+            "selected", "reserved", "stale_reading", "unverified_reading",
+            "cooled_down", "quarantined", "leased",
+            "infrastructure_unavailable",
+        ])
+        encoded = json.dumps(value)
+        for private in ("raw-provider-secret", "raw auth response", "/private/path"):
+            self.assertNotIn(private, encoded)
+        self.assertEqual(value["launch"]["code"], "launch_ready")
+
+    def test_launch_intent_is_engine_generated_quoted_and_allowlisted(self):
+        binary = os.path.join(self.temp.name, "provider cli")
+        with open(binary, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(binary, 0o700)
+        registry.save({
+            "schema_version": 1,
+            "desktop": {"preferred_terminal": "warp"},
+            "accounts": [{"name": "safe-slot", "provider": "claude",
+                          "home": "/safe home"}],
+        })
+        preview = {
+            "selected": {"name": "safe-slot", "provider": "claude"},
+            "launch": {"status": "ready", "code": "launch_ready"},
+        }
+        with mock.patch.object(desktop_bridge, "routing_preview_desktop",
+                               return_value=preview), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value=binary), \
+                mock.patch.object(desktop_bridge.sys, "frozen", True,
+                                  create=True), \
+                mock.patch.object(desktop_bridge.sys, "executable",
+                                  "/Applications/Headroom App/engine"):
+            intent = desktop_bridge.routing_launch_intent_desktop(
+                "claude", "safe-slot")
+        self.assertEqual(intent["schema"], desktop_bridge.LAUNCH_INTENT_SCHEMA)
+        self.assertEqual(intent["preferred_terminal"], "warp")
+        self.assertEqual(intent["launcher"], [
+            "/Applications/Headroom App/engine", "--launch-provider",
+            "claude", "safe-slot",
+        ])
+        self.assertEqual(set(intent["environment"]), {
+            "HEADROOM_DIR", "HEADROOM_SLOT_LEASE"})
+        self.assertIn("'/Applications/Headroom App/engine'", intent["copy_command"])
+        self.assertNotIn("/safe home", intent["copy_command"])
+
+    def test_launch_intent_reports_selection_cli_and_gate_failures_distinctly(self):
+        cases = [
+            ({"selected": None, "launch": {"status": "unavailable",
+              "code": "quarantined", "explanation": "auth"}},
+             "routing_authentication_required"),
+            ({"selected": None, "launch": {"status": "unavailable",
+              "code": "capacity_unavailable", "explanation": "capacity"}},
+             "routing_capacity_unavailable"),
+            ({"selected": None, "launch": {"status": "unavailable",
+              "code": "leased", "explanation": "lease"}},
+             "routing_slot_leased"),
+            ({"selected": None, "launch": {"status": "unavailable",
+              "code": "infrastructure_unavailable", "explanation": "infra"}},
+             "routing_infrastructure_unavailable"),
+            ({"selected": {"name": "other", "provider": "claude"},
+              "launch": {"status": "ready", "code": "launch_ready"}},
+             "routing_selection_changed"),
+        ]
+        for preview, expected in cases:
+            with self.subTest(expected=expected), mock.patch.object(
+                    desktop_bridge, "routing_preview_desktop",
+                    return_value=preview), self.assertRaises(
+                        desktop_bridge.BridgeError) as raised:
+                desktop_bridge.routing_launch_intent_desktop(
+                    "claude", "safe-slot")
+            self.assertEqual(raised.exception.code, expected)
+
+        ready = {"selected": {"name": "safe-slot", "provider": "claude"},
+                 "launch": {"status": "ready", "code": "launch_ready"}}
+        with mock.patch.object(desktop_bridge, "routing_preview_desktop",
+                               return_value=ready), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value=None), \
+                self.assertRaises(desktop_bridge.BridgeError) as raised:
+            desktop_bridge.routing_launch_intent_desktop("claude", "safe-slot")
+        self.assertEqual(raised.exception.code, "provider_cli_missing")
+
+    def test_frozen_launcher_reproves_and_never_accepts_command_text(self):
+        intent = {
+            "family": "claude", "account_name": "safe-slot",
+            "provider_executable": "/verified/claude",
+        }
+        with mock.patch.object(desktop_bridge, "routing_launch_intent_desktop",
+                               return_value=intent), \
+                mock.patch.object(desktop_bridge.route, "cmd_exec_selected",
+                                  return_value=0) as execute:
+            self.assertEqual(desktop_bridge.launch_selected_provider(
+                "claude", "safe-slot"), 0)
+        execute.assert_called_once_with(
+            "claude", "safe-slot", ["/verified/claude"],
+            launch_note="desktop launch intent")
+        self.assertEqual(desktop_bridge.cli_main([
+            "--launch-provider", "claude", "safe-slot", "rm -rf /" ]), 2)
 
     def test_adopt_refuses_a_duplicate_name_before_mutation(self):
         registry.save({
@@ -448,6 +918,12 @@ class DesktopBridgeSubprocess(unittest.TestCase):
         self.assertTrue(all(frame["ok"] for frame in frames))
         self.assertEqual(frames[0]["result"]["bridge_schema"],
                          desktop_bridge.SCHEMA)
+        self.assertIn("resilient_collection",
+                      frames[0]["result"]["capabilities"])
+        self.assertIn("validated_settings",
+                      frames[0]["result"]["capabilities"])
+        self.assertIn("routing_launch",
+                      frames[0]["result"]["capabilities"])
         self.assertEqual(frames[1]["result"]["schema"], "headroom_widget@1")
         self.assertIn("prepared sanitized fixture", process.stderr)
         self.assertNotIn("prepared sanitized fixture", process.stdout)

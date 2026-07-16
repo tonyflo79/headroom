@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
-  accountNameError, loginMessage, normalizeBootstrap, normalizeDeviceInstructions,
-  onboardingPresentation, percentLeft, refreshPresentation, suggestedAccountName,
+  accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset, loginMessage,
+  normalizeBootstrap, normalizeDeviceInstructions, normalizeHandoffHealth,
+  normalizeRoutingPreview,
+  onboardingPresentation, percentLeft,
+  refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
+  shouldApplySnapshot, settingsPatch, suggestedAccountName, validateSettingsDraft,
 } from "../dist/main.js";
 
 const bootstrap = {
@@ -17,6 +22,13 @@ const bootstrap = {
     schema: "headroom_desktop_view@1",
     mode: "ready",
     settings: { title: "AI Fleet" },
+    handoff: {
+      schema: "headroom_handoff_health@1", configured: true, supported: true,
+      state: "configured", code: "handoff_configured",
+      explanation: "Automatic handoff is ready for the next Claude launch.",
+      action: "none", active_session: false, account: null, model: null,
+      observed_at: null, preference_effect: "next_launch_only",
+    },
     candidates: [],
     accounts: [{
       name: "personal",
@@ -31,6 +43,39 @@ test("normalizes a compatible sanitized bootstrap", () => {
   const value = normalizeBootstrap(bootstrap);
   assert.equal(value.view.accounts[0].name, "personal");
   assert.equal(value.view.accounts[0].provider, "claude");
+});
+
+test("normalizes only the bounded engine handoff contract", () => {
+  const raw = structuredClone(bootstrap.view.handoff);
+  raw.state = "armed";
+  raw.code = "supervision_armed";
+  raw.active_session = true;
+  raw.account = "claude-a";
+  raw.model = "sonnet";
+  raw.observed_at = 1_800_000_000;
+  assert.deepEqual(normalizeHandoffHealth(raw), raw);
+  assert.throws(() => normalizeHandoffHealth({ ...raw, pid: 1234 }),
+    /handoff health/);
+  assert.throws(() => normalizeHandoffHealth({ ...raw, explanation: "x".repeat(257) }),
+    /handoff health/);
+  assert.throws(() => normalizeHandoffHealth({ ...raw, state: "pretend_healthy" }),
+    /handoff health/);
+  assert.doesNotThrow(() => normalizeHandoffHealth({
+    ...bootstrap.view.handoff, state: "configured", code: "awaiting_session_start",
+    action: "wait_for_session", active_session: true,
+  }));
+});
+
+test("renders the terminal handoff health console and next-launch disclosure", () => {
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
+  for (const id of ["handoff-health", "handoff-state", "handoff-code",
+    "handoff-action", "handoff-explanation", "handoff-context"]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(html, /next Claude launch/);
+  assert.match(css, /\.handoff-signal/);
+  assert.match(css, /box-shadow: var\(--glow\)/);
 });
 
 test("rejects an incompatible bridge", () => {
@@ -81,6 +126,41 @@ test("shared login diagnostics remain accurate for Codex", () => {
   assert.equal(loginMessage("connected"), "Account connected");
   assert.equal(loginMessage("duplicate_identity"),
     "That identity is already connected");
+  assert.equal(loginMessage("reauthenticated"),
+    "Account identity verified; prior protective hold cleared");
+});
+
+test("normalizes account lifecycle policy without accepting home details", () => {
+  const raw = structuredClone(bootstrap);
+  raw.view.accounts[0].policy = {
+    schema: "headroom_account_lifecycle@1",
+    home_kind: "headroom",
+    home_retained_on_remove: true,
+    rename_keeps_home: true,
+    reauthentication: "available",
+    position: 0,
+    count: 2,
+    can_move_up: false,
+    can_move_down: true,
+    can_remove: true,
+    home: "/private/provider/home",
+  };
+  const policy = normalizeBootstrap(raw).view.accounts[0].policy;
+  assert.deepEqual(policy, {
+    schema: "headroom_account_lifecycle@1",
+    home_kind: "headroom",
+    home_retained_on_remove: true,
+    rename_keeps_home: true,
+    reauthentication: "available",
+    position: 0,
+    count: 2,
+    can_move_up: false,
+    can_move_down: true,
+    can_remove: true,
+  });
+  assert.equal(JSON.stringify(policy).includes("/private"), false);
+  raw.view.accounts[0].policy.reauthentication = "invented";
+  assert.equal(normalizeBootstrap(raw).view.accounts[0].policy, null);
 });
 
 test("device instructions accept only the exact OpenAI HTTPS origin", () => {
@@ -139,4 +219,193 @@ test("demo presentation is explicit and provider-free", () => {
     title: "> demo mode",
     headline: "Bundled sample data · no provider access",
   });
+});
+
+test("revisioned snapshots preserve account order and sanitize surface metadata", () => {
+  const raw = structuredClone(bootstrap);
+  raw.revision = 9;
+  raw.surface = "popover";
+  raw.theme = "terminal";
+  raw.view.accounts = [
+    { name: "codex-first", provider: "codex", state: "held", windows: {} },
+    { name: "claude-second", provider: "claude", state: "current", windows: {} },
+  ];
+  const value = normalizeBootstrap(raw);
+  assert.equal(value.revision, 9);
+  assert.equal(value.surface, "popover");
+  assert.equal(value.theme, "terminal");
+  assert.deepEqual(value.view.accounts.map((row) => row.name),
+    ["codex-first", "claude-second"]);
+  raw.surface = "remote";
+  raw.theme = "https://evil.test/theme.css";
+  assert.equal(normalizeBootstrap(raw).surface, "main");
+  assert.equal(normalizeBootstrap(raw).theme, "terminal");
+  assert.equal(shouldApplySnapshot(9, 10), true);
+  assert.equal(shouldApplySnapshot(9, 9), false);
+  assert.equal(shouldApplySnapshot(9, 8), false);
+  assert.equal(shouldApplyCommandResult(9, 9), true);
+  assert.equal(shouldApplyCommandResult(9, 10), false);
+});
+
+test("reset and account state copy remain actionable without color", () => {
+  assert.equal(formatReset(1_800_003_600, 1_800_000_000_000).label,
+    "resets in 1 hour");
+  assert.equal(formatReset(1_799_999_999, 1_800_000_000_000).label, "reset due");
+  assert.match(accountStatePresentation({ state: "stale" }).action, /refresh/);
+  assert.match(accountStatePresentation({
+    state: "stale", diagnostic_code: "provider_offline",
+    observation_age_seconds: 3720,
+  }).action, /1h 2m old.*automatic retry/);
+  assert.equal(formatAge(3720), "1h 2m");
+  assert.match(accountStatePresentation({ state: "limited" }).action, /wait/);
+  assert.match(accountStatePresentation({ state: "held", note: "Reconnect account" }).action,
+    /Reconnect/);
+  assert.match(accountStatePresentation({ state: "current", reserved: true }).action,
+    /excluded/);
+  assert.match(refreshStatePresentation("offline").label, /OFFLINE/);
+  assert.equal(refreshStatePresentation("refreshing").busy, true);
+  assert.match(refreshStatePresentation("backoff").label, /jittered/);
+  assert.equal(refreshStatePresentation("recovering").busy, true);
+  assert.match(refreshStatePresentation("degraded", "engine_unexpected_exit").label,
+    /restart loop.*engine_unexpected_exit/);
+  assert.doesNotMatch(refreshStatePresentation("degraded", "raw private detail").label,
+    /private/);
+});
+
+test("normalizes desktop settings with safe local defaults", () => {
+  const raw = structuredClone(bootstrap);
+  raw.view.settings = {
+    title: "Terminal Fleet", theme: "midnight", redact_emails: false,
+    reserve_percent: 12.5, auto_handoff: false, refresh_interval_seconds: 600,
+    provider_paths: { claude: "/opt/homebrew/bin/claude", codex: "relative/codex" },
+    preferred_terminal: "warp", remember_window: false,
+    notifications: {
+      enabled: true, reset_enabled: true, global_threshold_percent: 15,
+      provider_threshold_percent: { claude: 12, codex: 100 },
+    },
+  };
+  const settings = normalizeBootstrap(raw).view.settings;
+  assert.equal(settings.theme, "midnight");
+  assert.equal(settings.refresh_interval_seconds, 600);
+  assert.deepEqual(settings.provider_paths, { claude: "/opt/homebrew/bin/claude" });
+  assert.equal(settings.preferred_terminal, "warp");
+  assert.equal(settings.remember_window, false);
+  assert.deepEqual(settings.notifications.provider_threshold_percent, { claude: 12 });
+
+  raw.view.settings = { title: "Headroom" };
+  const defaults = normalizeBootstrap(raw).view.settings;
+  assert.equal(defaults.refresh_interval_seconds, 300);
+  assert.equal(defaults.notifications.enabled, false);
+  assert.equal(defaults.notifications.reset_enabled, false);
+});
+
+test("validates and projects the complete settings contract", () => {
+  const draft = {
+    theme: "terminal", title: "Headroom", redact_emails: true,
+    reserve_percent: "10.5", auto_handoff: true,
+    refresh_interval_seconds: "300", claude_path: "", codex_path: "/usr/bin/true",
+    preferred_terminal: "terminal", remember_window: true,
+    notifications_enabled: false, reset_notifications: false,
+    notification_threshold: "20", claude_notification_threshold: "",
+    codex_notification_threshold: "15",
+  };
+  assert.deepEqual(validateSettingsDraft(draft), {});
+  assert.deepEqual(settingsPatch(draft), {
+    theme: "terminal", title: "Headroom", redact_emails: true,
+    reserve_percent: 10.5, auto_handoff: true, refresh_interval_seconds: 300,
+    provider_paths: { claude: null, codex: "/usr/bin/true" },
+    preferred_terminal: "terminal", remember_window: true,
+    notifications: {
+      enabled: false, reset_enabled: false, global_threshold_percent: 20,
+      provider_threshold_percent: { claude: null, codex: 15 },
+    },
+  });
+  assert.equal(validateSettingsDraft({ ...draft, title: " Headroom" }).title !== undefined,
+    true);
+  assert.equal(validateSettingsDraft({ ...draft, refresh_interval_seconds: "30" })
+    .refresh_interval_seconds !== undefined, true);
+  assert.equal(validateSettingsDraft({ ...draft, codex_path: "relative/codex" })
+    .codex_path !== undefined, true);
+  assert.equal(validateSettingsDraft({ ...draft, notification_threshold: "100" })
+    .notification_threshold !== undefined, true);
+});
+
+test("uses locale formatters for percentages and exposes the settings console", () => {
+  assert.match(formatPercent(72), /72/);
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  for (const id of ["settings-theme", "settings-refresh", "settings-terminal",
+    "settings-launch-at-login", "settings-notifications", "settings-save"]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(html, /⌘, settings · ⌘R refresh · ⌘W close · ⌘Q quit/);
+});
+
+test("normalizes one bounded engine routing decision without command material", () => {
+  const preview = normalizeRoutingPreview({
+    schema: "headroom_desktop_routing@1", family: "sonnet", provider: "claude",
+    selected: { name: "claude-one", provider: "claude" },
+    candidates: [
+      { name: "claude-one", provider: "claude", selected: true, eligible: true,
+        code: "selected", explanation: "This is the engine-selected account.",
+        action: "copy_or_open" },
+      { name: "claude-two", provider: "claude", selected: false, eligible: false,
+        code: "leased", explanation: "Another live launch currently owns this slot.",
+        action: "close_other_session" },
+      { name: "claude-three", provider: "claude", selected: false, eligible: false,
+        code: "quarantined", explanation: "Authentication was rejected for this slot.",
+        action: "reauthenticate_account" },
+    ],
+    launch: { status: "ready", code: "launch_ready",
+      explanation: "The selected account can be launched safely.",
+      action: "copy_or_open" },
+    command: "rm -rf /",
+    environment: { DANGEROUS: "ignored" },
+  });
+  assert.equal(preview.selected.name, "claude-one");
+  assert.deepEqual(preview.candidates.map((row) => row.code),
+    ["selected", "leased", "quarantined"]);
+  assert.equal("command" in preview, false);
+  assert.equal("environment" in preview, false);
+});
+
+test("routing preview refuses malformed selection and unbounded explanations", () => {
+  const base = {
+    schema: "headroom_desktop_routing@1", family: "codex", provider: "codex",
+    selected: { name: "codex-one", provider: "codex" },
+    candidates: [{ name: "codex-one", provider: "codex", selected: true,
+      eligible: true, code: "selected", explanation: "Selected.",
+      action: "copy_or_open" }],
+    launch: { status: "ready", code: "launch_ready", explanation: "Ready.",
+      action: "copy_or_open" },
+  };
+  assert.throws(() => normalizeRoutingPreview({ ...base,
+    selected: { name: "other", provider: "codex" } }), /selection summary/);
+  const oversized = structuredClone(base);
+  oversized.candidates[0].explanation = "x".repeat(257);
+  assert.throws(() => normalizeRoutingPreview(oversized), /candidate/);
+  assert.throws(() => normalizeRoutingPreview({ ...base, family: "arbitrary" }),
+    /routing preview/);
+});
+
+test("routing UI exposes only family and account based native actions", () => {
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../dist/main.js", import.meta.url), "utf8");
+  for (const id of ["routing-family", "routing-preview", "routing-copy",
+    "routing-open", "routing-candidates"]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(source, /desktop_copy_routing_command/);
+  assert.match(source, /desktop_open_routing_launch/);
+  assert.doesNotMatch(source, /desktop_(copy|open)_routing_(command|launch)[\s\S]{0,180}(command|environment):/);
+});
+
+test("all five themes define the same semantic token contract", () => {
+  const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
+  const tokens = ["--canvas:", "--panel:", "--panel-strong:", "--control:",
+    "--phosphor:", "--phosphor-bright:", "--phosphor-dim:", "--line:",
+    "--warning:", "--danger:", "--scanline:", "--ambient:", "--glow-color:"];
+  for (const theme of ["midnight", "minimal", "chrome", "paper", "terminal"]) {
+    const block = css.split(`body[data-theme="${theme}"] {`, 2)[1].split("}", 1)[0];
+    for (const token of tokens) assert.match(block, new RegExp(token));
+  }
 });

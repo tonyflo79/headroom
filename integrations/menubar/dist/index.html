@@ -17,9 +17,179 @@
         </div>
         <div class="toolbar">
           <button id="refresh" type="button" disabled>Refresh</button>
+          <div id="surface-actions" class="surface-actions"></div>
           <span id="engine-badge" class="badge">connecting</span>
         </div>
       </header>
+
+      <p id="surface-status" class="surface-status" role="status" aria-live="polite"></p>
+
+      <section id="handoff-health" class="handoff-health" aria-labelledby="handoff-title" hidden>
+        <div class="handoff-copy">
+          <p class="eyebrow">HEADROOM // AUTO-HANDOFF</p>
+          <h2 id="handoff-title">$ headroom handoff --health</h2>
+          <p id="handoff-explanation">Waiting for the bundled engine.</p>
+          <p id="handoff-context" class="handoff-context">next compatible Claude launch</p>
+        </div>
+        <div class="handoff-signal" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i>
+        </div>
+        <div class="handoff-status" role="status" aria-live="polite">
+          <span id="handoff-state">unavailable</span>
+          <small id="handoff-code">engine starting</small>
+          <small id="handoff-action">No action required</small>
+        </div>
+      </section>
+
+      <section id="settings" class="settings-panel" aria-labelledby="settings-title" hidden>
+        <div class="settings-heading">
+          <div>
+            <p class="eyebrow">HEADROOM // SETTINGS</p>
+            <h2 id="settings-title">$ headroom configure</h2>
+            <p>Validated locally, committed atomically, and applied to both desktop surfaces.</p>
+          </div>
+          <button id="close-settings" type="button" aria-label="Close Settings">Close</button>
+        </div>
+
+        <form id="settings-form" novalidate>
+          <fieldset>
+            <legend>[APPEARANCE]</legend>
+            <div class="settings-grid">
+              <label class="settings-field" for="settings-theme">
+                <span>Theme</span>
+                <select id="settings-theme" name="theme">
+                  <option value="midnight">Midnight // phosphor green</option>
+                  <option value="terminal">Terminal // high glow</option>
+                  <option value="minimal">Minimal</option>
+                  <option value="chrome">Chrome</option>
+                  <option value="paper">Paper</option>
+                </select>
+                <small>Previewed immediately across dashboard and popover.</small>
+              </label>
+              <label class="settings-field" for="settings-title-input">
+                <span>Dashboard title</span>
+                <input id="settings-title-input" name="title" type="text" maxlength="80" autocomplete="off" />
+                <small>1–80 printable characters.</small>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>[ROUTING + COLLECTION]</legend>
+            <div class="settings-grid">
+              <label class="settings-field" for="settings-reserve">
+                <span>Reserve threshold (%)</span>
+                <input id="settings-reserve" name="reserve_percent" type="number" min="0" max="99" step="0.5" inputmode="decimal" />
+                <small>Capacity protected from automatic handoff.</small>
+              </label>
+              <label class="settings-field" for="settings-refresh">
+                <span>Refresh interval (seconds)</span>
+                <input id="settings-refresh" name="refresh_interval_seconds" type="number" min="60" max="3600" step="60" inputmode="numeric" />
+                <small>60–3600 seconds; applies to the native scheduler.</small>
+              </label>
+              <label class="settings-check"><input id="settings-redact" name="redact_emails" type="checkbox" /> <span>Redact account emails</span></label>
+              <label class="settings-check"><input id="settings-auto-handoff" name="auto_handoff" type="checkbox" /> <span>Allow automatic account handoff on the next Claude launch</span></label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>[PROVIDER TOOLS]</legend>
+            <div class="settings-grid">
+              <label class="settings-field" for="settings-claude-path">
+                <span>Claude executable</span>
+                <input id="settings-claude-path" name="claude_path" type="text" spellcheck="false" autocomplete="off" placeholder="automatic discovery" />
+                <small>Blank for automatic discovery; custom paths must be executable.</small>
+              </label>
+              <label class="settings-field" for="settings-codex-path">
+                <span>Codex executable</span>
+                <input id="settings-codex-path" name="codex_path" type="text" spellcheck="false" autocomplete="off" placeholder="automatic discovery" />
+                <small>Absolute local path only.</small>
+              </label>
+              <label class="settings-field" for="settings-terminal">
+                <span>Preferred terminal</span>
+                <select id="settings-terminal" name="preferred_terminal">
+                  <option value="terminal">Terminal</option>
+                  <option value="iterm">iTerm</option>
+                  <option value="warp">Warp</option>
+                </select>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>[DESKTOP]</legend>
+            <div class="settings-grid">
+              <label class="settings-check"><input id="settings-remember-window" name="remember_window" type="checkbox" /> <span>Remember window position and size</span></label>
+              <label class="settings-check"><input id="settings-launch-at-login" name="launch_at_login" type="checkbox" /> <span>Launch Headroom at login</span></label>
+              <p id="settings-login-status" class="settings-status">Login launch is off until explicitly enabled.</p>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>[NOTIFICATIONS // PREPARED]</legend>
+            <p class="settings-disclosure">Preferences are stored now. Native alerts and macOS permission requests arrive in the notification milestone; both remain off by default.</p>
+            <div class="settings-grid">
+              <label class="settings-check"><input id="settings-notifications" name="notifications_enabled" type="checkbox" /> <span>Enable capacity notifications</span></label>
+              <label class="settings-check"><input id="settings-reset-notifications" name="reset_notifications" type="checkbox" /> <span>Notify when capacity resets</span></label>
+              <label class="settings-field" for="settings-threshold">
+                <span>Global low-capacity threshold (%)</span>
+                <input id="settings-threshold" name="notification_threshold" type="number" min="1" max="99" step="1" inputmode="numeric" />
+              </label>
+              <label class="settings-field" for="settings-claude-threshold">
+                <span>Claude override (%)</span>
+                <input id="settings-claude-threshold" name="claude_notification_threshold" type="number" min="1" max="99" step="1" inputmode="numeric" placeholder="global" />
+              </label>
+              <label class="settings-field" for="settings-codex-threshold">
+                <span>Codex override (%)</span>
+                <input id="settings-codex-threshold" name="codex_notification_threshold" type="number" min="1" max="99" step="1" inputmode="numeric" placeholder="global" />
+              </label>
+            </div>
+          </fieldset>
+
+          <p id="settings-errors" class="settings-errors" role="status" aria-live="polite"></p>
+          <div class="settings-actions">
+            <span>⌘, settings · ⌘R refresh · ⌘W close · ⌘Q quit</span>
+            <button id="settings-save" class="primary" type="submit">Save settings</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="routing" class="routing-panel" aria-labelledby="routing-title">
+        <div class="routing-heading">
+          <div>
+            <p class="eyebrow">HEADROOM // ROUTING</p>
+            <h2 id="routing-title">$ headroom route --explain</h2>
+            <p>The bundled engine selects the account and explains every skip using the CLI’s final safety gates.</p>
+          </div>
+          <div class="routing-controls">
+            <label for="routing-family">Model family</label>
+            <select id="routing-family">
+              <option value="claude">Claude // generic</option>
+              <option value="opus">Claude Opus</option>
+              <option value="sonnet">Claude Sonnet</option>
+              <option value="haiku">Claude Haiku</option>
+              <option value="fable">Claude Fable</option>
+              <option value="codex">Codex</option>
+            </select>
+            <button id="routing-preview" type="button">Preview route</button>
+          </div>
+        </div>
+        <p id="routing-diagnostic" class="routing-diagnostic" role="status" aria-live="polite">Choose a model family to prove its current route.</p>
+        <div id="routing-result" hidden>
+          <div class="routing-selection">
+            <div>
+              <span class="routing-label">[ENGINE SELECTION]</span>
+              <strong id="routing-selected">No eligible account</strong>
+              <p id="routing-launch-explanation"></p>
+            </div>
+            <div class="routing-launch-actions">
+              <button id="routing-copy" type="button">Copy safe command</button>
+              <button id="routing-open" class="primary" type="button">Open in terminal</button>
+            </div>
+          </div>
+          <div id="routing-candidates" class="routing-candidates" aria-live="polite"></div>
+        </div>
+      </section>
 
       <section class="fleet" aria-labelledby="fleet-title">
         <div class="section-heading">
@@ -30,7 +200,7 @@
         <div id="accounts" class="accounts" aria-live="polite"></div>
       </section>
 
-      <footer>[bundled engine] [private bridge] [no localhost server]</footer>
+      <footer><span id="revision">revision 0</span> · [bundled engine] [private bridge] [no localhost server]</footer>
     </main>
     <script type="module" src="main.js"></script>
   </body>

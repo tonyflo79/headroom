@@ -9,13 +9,17 @@
 #![allow(dead_code)] // Removed when the legacy popover helpers move onto the bridge.
 
 use std::{
+    collections::VecDeque,
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::TcpStream,
+    path::PathBuf,
+    process::{Command as StdCommand, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tauri::{
@@ -24,12 +28,26 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
-    AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Manager, PhysicalPosition, PhysicalSize, Url, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tauri_plugin_positioner::{Position, WindowExt};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
+};
+
+#[cfg(unix)]
+use std::{
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::{UnixListener, UnixStream},
+        },
+    },
+    thread,
 };
 
 mod icon;
@@ -68,26 +86,433 @@ const FEED_MAX_BYTES: usize = 256 * 1024;
 const FEED_DEADLINE: Duration = Duration::from_secs(6);
 
 const DESKTOP_WINDOW_LABEL: &str = "main";
+const DESKTOP_POPOVER_LABEL: &str = "desktop-popover";
 const DESKTOP_BRIDGE_SCHEMA: &str = "headroom_desktop_bridge@1";
 const DESKTOP_VIEW_SCHEMA: &str = "headroom_desktop_view@1";
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_BRIDGE_FRAME_BYTES: usize = 1024 * 1024;
+const DESKTOP_POPOVER_WIDTH: f64 = 420.0;
+const DESKTOP_POPOVER_HEIGHT: f64 = 680.0;
+const WINDOW_STATE_SCHEMA: &str = "headroom_desktop_window@1";
+const DESKTOP_THEMES: [&str; 5] = ["midnight", "minimal", "chrome", "paper", "terminal"];
+const COLLECTION_IDLE_INTERVAL: Duration = Duration::from_secs(300);
+const COLLECTION_INTERVAL_MIN_SECONDS: u64 = 60;
+const COLLECTION_INTERVAL_MAX_SECONDS: u64 = 3600;
+const ROUTING_SCHEMA: &str = "headroom_desktop_routing@1";
+const LAUNCH_INTENT_SCHEMA: &str = "headroom_provider_launch_intent@1";
+const HANDOFF_HEALTH_SCHEMA: &str = "headroom_handoff_health@1";
+const ROUTING_FAMILIES: &[&str] = &["claude", "opus", "sonnet", "haiku", "fable", "codex"];
+const ROUTING_CODES: &[&str] = &[
+    "selected",
+    "available",
+    "reserved",
+    "routing_disabled",
+    "leased",
+    "quarantined",
+    "infrastructure_unavailable",
+    "cooled_down",
+    "capacity_unavailable",
+    "stale_reading",
+    "authentication_required",
+    "unverified_reading",
+    "provider_cli_missing",
+];
+const ROUTING_ACTIONS: &[&str] = &[
+    "copy_or_open",
+    "none",
+    "unreserve_account",
+    "enable_routing",
+    "close_other_session",
+    "reauthenticate_account",
+    "inspect_diagnostics",
+    "wait_for_reset",
+    "refresh_capacity",
+    "refresh_or_reauthenticate",
+    "install_provider_cli",
+    "connect_account",
+];
+const COLLECTION_RETRY_BASE: Duration = Duration::from_secs(5);
+const COLLECTION_RETRY_CAP: Duration = Duration::from_secs(300);
+const COLLECTION_TICK: Duration = Duration::from_secs(15);
+const ENGINE_RESTART_BASE: Duration = Duration::from_secs(2);
+const ENGINE_RESTART_CAP: Duration = Duration::from_secs(60);
+const ENGINE_DEGRADED_COOLDOWN: Duration = Duration::from_secs(300);
+const ENGINE_RESTART_LIMIT: u32 = 3;
+const ENGINE_CRASH_WINDOW: Duration = Duration::from_secs(300);
+const ENGINE_STABLE_RESET: Duration = Duration::from_secs(300);
+const ENGINE_WATCHDOG_TICK: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const SINGLETON_LOCK_PATH: &str = "/tmp/dev_headroom_menubar.lock";
+#[cfg(unix)]
+const SINGLETON_SOCKET_PATH: &str = "/tmp/dev_headroom_menubar.sock";
 
 struct BridgeSession {
     child: CommandChild,
     events: Receiver<CommandEvent>,
 }
 
+#[cfg(unix)]
+struct SingletonPrimary {
+    lock: File,
+    listener: UnixListener,
+    socket_path: PathBuf,
+}
+
+#[cfg(unix)]
+struct SingletonState {
+    _lock: File,
+    socket_path: PathBuf,
+    listener: Mutex<Option<UnixListener>>,
+}
+
+#[cfg(unix)]
+impl Drop for SingletonState {
+    fn drop(&mut self) {
+        self.cleanup_endpoint();
+    }
+}
+
+#[cfg(unix)]
+impl SingletonState {
+    fn cleanup_endpoint(&self) {
+        let _ = remove_owned_stale_socket(&self.socket_path);
+    }
+}
+
+#[cfg(unix)]
+enum SingletonClaim {
+    Primary(SingletonPrimary),
+    Secondary,
+}
+
+#[cfg(unix)]
+fn notify_primary(socket_path: &PathBuf) -> bool {
+    UnixStream::connect(socket_path).is_ok()
+}
+
+#[cfg(unix)]
+fn remove_owned_stale_socket(socket_path: &PathBuf) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("singleton activation endpoint is unavailable".into()),
+    };
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+    {
+        return Err("singleton activation endpoint is not safely owned".into());
+    }
+    fs::remove_file(socket_path)
+        .map_err(|_| "stale singleton activation endpoint could not be removed".to_string())
+}
+
+#[cfg(unix)]
+fn claim_singleton() -> Result<SingletonClaim, String> {
+    let lock_path = PathBuf::from(SINGLETON_LOCK_PATH);
+    let socket_path = PathBuf::from(SINGLETON_SOCKET_PATH);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|_| "singleton lock could not be opened safely".to_string())?;
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| "singleton lock could not be made private".to_string())?;
+    let metadata = lock
+        .metadata()
+        .map_err(|_| "singleton lock metadata is unavailable".to_string())?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err("singleton lock is not safely owned".into());
+    }
+    let claimed = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !claimed {
+        for _ in 0..40 {
+            if notify_primary(&socket_path) {
+                return Ok(SingletonClaim::Secondary);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        return Err("existing Headroom instance did not accept activation".into());
+    }
+    remove_owned_stale_socket(&socket_path)?;
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|_| "singleton activation endpoint could not be created".to_string())?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|_| "singleton activation endpoint could not be made private".to_string())?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| "singleton activation endpoint could not become non-blocking".to_string())?;
+    Ok(SingletonClaim::Primary(SingletonPrimary {
+        lock,
+        listener,
+        socket_path,
+    }))
+}
+
+#[cfg(unix)]
+fn start_singleton_listener(app: &AppHandle, listener: UnixListener) -> Result<(), String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(listener) = tokio::net::UnixListener::from_std(listener) else {
+            eprintln!("headroom-desktop: singleton activation listener could not start");
+            return;
+        };
+        while listener.accept().await.is_ok() {
+            let _ = show_desktop_window(&app, None);
+            request_scheduled_collection(&app, "activation");
+        }
+    });
+    Ok(())
+}
+
 #[derive(Clone)]
 struct DesktopEngine {
     session: Arc<Mutex<Option<BridgeSession>>>,
+    recovery: Arc<Mutex<EngineRecoveryPolicy>>,
+    starting: Arc<AtomicBool>,
 }
 
 impl Default for DesktopEngine {
     fn default() -> Self {
         Self {
             session: Arc::new(Mutex::new(None)),
+            recovery: Arc::new(Mutex::new(EngineRecoveryPolicy::default())),
+            starting: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct EngineRecoveryPolicy {
+    crash_times: VecDeque<Instant>,
+    retry_at: Option<Instant>,
+    degraded: bool,
+    running_since: Option<Instant>,
+    last_failure_code: Option<&'static str>,
+}
+
+impl EngineRecoveryPolicy {
+    fn prune_crashes(&mut self, now: Instant) {
+        while self
+            .crash_times
+            .front()
+            .is_some_and(|seen| now.duration_since(*seen) > ENGINE_CRASH_WINDOW)
+        {
+            self.crash_times.pop_front();
+        }
+    }
+
+    fn record_failure(&mut self, now: Instant, entropy: u64, code: &'static str) -> Duration {
+        self.prune_crashes(now);
+        self.crash_times.push_back(now);
+        self.running_since = None;
+        self.last_failure_code = Some(code);
+        if self.crash_times.len() as u32 >= ENGINE_RESTART_LIMIT {
+            self.degraded = true;
+            self.retry_at = Some(now + ENGINE_DEGRADED_COOLDOWN);
+            return ENGINE_DEGRADED_COOLDOWN;
+        }
+        let exponent = (self.crash_times.len() as u32).saturating_sub(1).min(5);
+        let raw = (ENGINE_RESTART_BASE * (1u32 << exponent)).min(ENGINE_RESTART_CAP);
+        let spread = raw.as_millis() as u64 / 5;
+        let offset = if spread == 0 {
+            0
+        } else {
+            (entropy % (spread * 2 + 1)) as i64 - spread as i64
+        };
+        let millis = (raw.as_millis() as i64 + offset)
+            .clamp(1, ENGINE_RESTART_CAP.as_millis() as i64) as u64;
+        let delay = Duration::from_millis(millis);
+        self.retry_at = Some(now + delay);
+        delay
+    }
+
+    fn admits_restart(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|retry_at| now >= retry_at)
+    }
+
+    fn record_started(&mut self, now: Instant) {
+        self.running_since = Some(now);
+        self.retry_at = None;
+        self.degraded = false;
+    }
+
+    fn record_success(&mut self, now: Instant) {
+        self.retry_at = None;
+        if self
+            .running_since
+            .is_some_and(|started| now.duration_since(started) >= ENGINE_STABLE_RESET)
+        {
+            self.crash_times.clear();
+            self.last_failure_code = None;
+        }
+    }
+
+    fn allow_manual_retry(&mut self) -> bool {
+        if !self.degraded {
+            return false;
+        }
+        self.degraded = false;
+        self.retry_at = None;
+        true
+    }
+}
+
+#[derive(Default)]
+struct CollectionPolicy {
+    failure_count: u32,
+    retry_at: Option<Instant>,
+    last_success_at: Option<Instant>,
+}
+
+impl CollectionPolicy {
+    fn record_success(&mut self, now: Instant) {
+        self.failure_count = 0;
+        self.retry_at = None;
+        self.last_success_at = Some(now);
+    }
+
+    fn record_failure(&mut self, now: Instant, entropy: u64) -> Duration {
+        self.failure_count = self.failure_count.saturating_add(1);
+        let multiplier = 1u32 << self.failure_count.saturating_sub(1).min(6);
+        let raw = (COLLECTION_RETRY_BASE * multiplier).min(COLLECTION_RETRY_CAP);
+        let spread = raw.as_secs() / 5;
+        let offset = if spread == 0 {
+            0
+        } else {
+            (entropy % (spread * 2 + 1)) as i64 - spread as i64
+        };
+        let seconds =
+            (raw.as_secs() as i64 + offset).clamp(1, COLLECTION_RETRY_CAP.as_secs() as i64) as u64;
+        let delay = Duration::from_secs(seconds);
+        self.retry_at = Some(now + delay);
+        delay
+    }
+
+    fn due(&self, now: Instant, interval: Duration) -> bool {
+        match self.retry_at {
+            Some(retry_at) => now >= retry_at,
+            None => self
+                .last_success_at
+                .is_none_or(|last| now.duration_since(last) >= interval),
+        }
+    }
+}
+
+struct CollectionScheduler {
+    enabled: AtomicBool,
+    running: AtomicBool,
+    interval_seconds: AtomicU64,
+    policy: Mutex<CollectionPolicy>,
+}
+
+impl Default for CollectionScheduler {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            interval_seconds: AtomicU64::new(COLLECTION_IDLE_INTERVAL.as_secs()),
+            policy: Mutex::new(CollectionPolicy::default()),
+        }
+    }
+}
+
+struct StartupRouting {
+    login_launch: bool,
+    decision_complete: AtomicBool,
+}
+
+#[derive(Clone)]
+struct DesktopSnapshot {
+    revision: u64,
+    theme: String,
+    view: serde_json::Value,
+}
+
+#[derive(Default)]
+struct DesktopStore {
+    current: Mutex<Option<DesktopSnapshot>>,
+}
+
+impl DesktopStore {
+    fn replace_view(&self, view: serde_json::Value) -> Result<DesktopSnapshot, String> {
+        validate_desktop_view(&view)?;
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| "desktop snapshot store is unavailable".to_string())?;
+        let revision = current.as_ref().map_or(1, |snapshot| snapshot.revision + 1);
+        // The engine owns the authoritative, validated preference. Every
+        // settings mutation returns a fresh view, so theme propagation must
+        // follow that view instead of retaining the previous in-memory value.
+        let theme = configured_theme(&view).to_string();
+        let snapshot = DesktopSnapshot {
+            revision,
+            theme,
+            view,
+        };
+        *current = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn set_theme(&self, theme: &str) -> Result<DesktopSnapshot, String> {
+        if !DESKTOP_THEMES.contains(&theme) {
+            return Err("desktop theme is invalid".into());
+        }
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| "desktop snapshot store is unavailable".to_string())?;
+        let previous = current
+            .as_ref()
+            .ok_or_else(|| "desktop snapshot is unavailable".to_string())?;
+        let snapshot = DesktopSnapshot {
+            revision: previous.revision + 1,
+            theme: theme.to_string(),
+            view: previous.view.clone(),
+        };
+        *current = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn snapshot(&self) -> Result<DesktopSnapshot, String> {
+        self.current
+            .lock()
+            .map_err(|_| "desktop snapshot store is unavailable".to_string())?
+            .clone()
+            .ok_or_else(|| "desktop snapshot is unavailable".to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WindowPlacement {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+struct DesktopUiState {
+    placement: Mutex<Option<WindowPlacement>>,
+    last_tray_rect: Mutex<Option<tauri::Rect>>,
+    popover_opened_at: Mutex<Option<Instant>>,
+    remember_window: AtomicBool,
+    window_preference_seen: AtomicBool,
+}
+
+impl Default for DesktopUiState {
+    fn default() -> Self {
+        Self {
+            placement: Mutex::new(None),
+            last_tray_rect: Mutex::new(None),
+            popover_opened_at: Mutex::new(None),
+            remember_window: AtomicBool::new(true),
+            window_preference_seen: AtomicBool::new(false),
         }
     }
 }
@@ -831,6 +1256,513 @@ fn parse_bridge_response(frame: &[u8], expected_id: &str) -> Result<serde_json::
         .ok_or_else(|| "desktop engine response is missing its result".to_string())
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ValidatedLaunchIntent {
+    family: String,
+    provider: String,
+    account_name: String,
+    preferred_terminal: String,
+    launcher: Vec<String>,
+    headroom_dir: String,
+    provider_executable: String,
+    copy_command: String,
+}
+
+fn valid_account_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
+        })
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn launch_command(environment_dir: &str, launcher: &[String]) -> String {
+    let mut parts = vec![
+        format!("HEADROOM_DIR={}", shell_quote(environment_dir)),
+        "HEADROOM_SLOT_LEASE=1".to_string(),
+    ];
+    parts.extend(launcher.iter().map(|value| shell_quote(value)));
+    parts.join(" ")
+}
+
+fn executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return false;
+    }
+    true
+}
+
+fn object_has_only(value: &serde_json::Value, allowed: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+}
+
+fn stable_handoff_token(value: &str, maximum: usize) -> bool {
+    (1..=maximum).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_handoff_health(value: &serde_json::Value) -> Result<(), String> {
+    let fields = [
+        "schema",
+        "configured",
+        "supported",
+        "state",
+        "code",
+        "explanation",
+        "action",
+        "active_session",
+        "account",
+        "model",
+        "observed_at",
+        "preference_effect",
+    ];
+    if !object_has_only(value, &fields)
+        || value
+            .as_object()
+            .map_or(true, |object| object.len() != fields.len())
+        || value.get("schema").and_then(serde_json::Value::as_str) != Some(HANDOFF_HEALTH_SCHEMA)
+    {
+        return Err("desktop handoff health contains unknown or missing fields".into());
+    }
+    let configured = value
+        .get("configured")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "desktop handoff preference is invalid".to_string())?;
+    let supported = value
+        .get("supported")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "desktop handoff capability is invalid".to_string())?;
+    let state = value
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .filter(|state| {
+            [
+                "configured",
+                "unavailable",
+                "downgraded",
+                "armed",
+                "supervision_lost",
+                "loop_guard",
+                "disabled",
+            ]
+            .contains(state)
+        })
+        .ok_or_else(|| "desktop handoff state is invalid".to_string())?;
+    let _code = value
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| stable_handoff_token(code, 64))
+        .ok_or_else(|| "desktop handoff code is invalid".to_string())?;
+    let _explanation = value
+        .get("explanation")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| (1..=256).contains(&text.len()))
+        .ok_or_else(|| "desktop handoff explanation is invalid".to_string())?;
+    let _action = value
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .filter(|action| {
+            [
+                "none",
+                "upgrade_engine",
+                "install_claude_cli",
+                "inspect_diagnostics",
+                "use_compatible_interactive_launch",
+                "inspect_handoff_health",
+                "start_new_session",
+                "enable_handoff",
+                "wait_for_session",
+            ]
+            .contains(action)
+        })
+        .ok_or_else(|| "desktop handoff action is invalid".to_string())?;
+    let active = value
+        .get("active_session")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "desktop handoff activity is invalid".to_string())?;
+    let account_valid = value.get("account").is_some_and(|account| {
+        account.is_null() || account.as_str().is_some_and(valid_account_name)
+    });
+    let model_valid = value.get("model").is_some_and(|model| {
+        model.is_null()
+            || model.as_str().is_some_and(|model| {
+                (1..=32).contains(&model.len())
+                    && model.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'_'
+                            || byte == b'-'
+                    })
+            })
+    });
+    let observed_valid = value.get("observed_at").is_some_and(|observed| {
+        observed.is_null()
+            || observed
+                .as_f64()
+                .is_some_and(|observed| observed.is_finite() && observed >= 0.0)
+    });
+    if !account_valid
+        || !model_valid
+        || !observed_valid
+        || value
+            .get("preference_effect")
+            .and_then(serde_json::Value::as_str)
+            != Some("next_launch_only")
+        || (!supported && state != "unavailable")
+        || (active
+            && ![
+                "configured",
+                "armed",
+                "downgraded",
+                "supervision_lost",
+                "loop_guard",
+            ]
+            .contains(&state))
+        || (active
+            && state == "configured"
+            && (_code != "awaiting_session_start" || _action != "wait_for_session"))
+        || (["armed", "downgraded", "supervision_lost", "loop_guard"].contains(&state) && !active)
+        || (state == "disabled" && configured)
+        || (!configured && !active && state != "disabled" && state != "unavailable")
+    {
+        return Err("desktop handoff health is inconsistent".into());
+    }
+    Ok(())
+}
+
+fn validate_routing_preview(value: &serde_json::Value) -> Result<(), String> {
+    if !object_has_only(
+        value,
+        &[
+            "schema",
+            "family",
+            "provider",
+            "selected",
+            "candidates",
+            "launch",
+        ],
+    ) {
+        return Err("desktop routing preview contains unknown fields".into());
+    }
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(ROUTING_SCHEMA) {
+        return Err("desktop engine returned an invalid routing preview".into());
+    }
+    let family = value
+        .get("family")
+        .and_then(serde_json::Value::as_str)
+        .filter(|family| ROUTING_FAMILIES.contains(family))
+        .ok_or_else(|| "desktop routing family is invalid".to_string())?;
+    let provider = value
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .filter(|provider| matches!(*provider, "claude" | "codex"))
+        .ok_or_else(|| "desktop routing provider is invalid".to_string())?;
+    if (family == "codex") != (provider == "codex") {
+        return Err("desktop routing family and provider disagree".into());
+    }
+    let candidates = value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .filter(|rows| rows.len() <= 256)
+        .ok_or_else(|| "desktop routing candidates are invalid".to_string())?;
+    let mut selected_count = 0;
+    let mut candidate_names = std::collections::HashSet::new();
+    for row in candidates {
+        if !object_has_only(
+            row,
+            &[
+                "name",
+                "provider",
+                "selected",
+                "eligible",
+                "code",
+                "explanation",
+                "action",
+            ],
+        ) {
+            return Err("desktop routing candidate contains unknown fields".into());
+        }
+        let name = row
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| valid_account_name(name))
+            .ok_or_else(|| "desktop routing account is invalid".to_string())?;
+        let row_provider = row.get("provider").and_then(serde_json::Value::as_str);
+        if row_provider != Some(provider) {
+            return Err("desktop routing candidate provider is invalid".into());
+        }
+        let selected = row
+            .get("selected")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "desktop routing selection is invalid".to_string())?;
+        let eligible = row
+            .get("eligible")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "desktop routing eligibility is invalid".to_string())?;
+        let code = row
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| ROUTING_CODES.contains(code))
+            .ok_or_else(|| "desktop routing code is invalid".to_string())?;
+        let action = row
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .filter(|action| ROUTING_ACTIONS.contains(action))
+            .ok_or_else(|| "desktop routing action is invalid".to_string())?;
+        let explanation = row
+            .get("explanation")
+            .and_then(serde_json::Value::as_str)
+            .filter(|copy| !copy.is_empty() && copy.len() <= 256)
+            .ok_or_else(|| "desktop routing explanation is invalid".to_string())?;
+        let _ = (name, code, action, explanation);
+        if !candidate_names.insert(name) {
+            return Err("desktop routing account appears more than once".into());
+        }
+        if selected {
+            selected_count += 1;
+            if !eligible || code != "selected" {
+                return Err("desktop routing selected account is not eligible".into());
+            }
+        } else if eligible && code != "available" {
+            return Err("desktop routing eligible account has an invalid code".into());
+        }
+    }
+    if selected_count > 1 {
+        return Err("desktop routing selected multiple accounts".into());
+    }
+    let selected = value.get("selected");
+    if selected_count == 0 {
+        if !selected.is_none_or(serde_json::Value::is_null) {
+            return Err("desktop routing selected summary is invalid".into());
+        }
+    } else {
+        if !selected.is_some_and(|row| object_has_only(row, &["name", "provider"])) {
+            return Err("desktop routing selected summary contains unknown fields".into());
+        }
+        let name = selected
+            .and_then(|row| row.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "desktop routing selected summary is missing".to_string())?;
+        let selected_provider = selected
+            .and_then(|row| row.get("provider"))
+            .and_then(serde_json::Value::as_str);
+        if !valid_account_name(name) || selected_provider != Some(provider) {
+            return Err("desktop routing selected summary is invalid".into());
+        }
+        if !candidates.iter().any(|row| {
+            row.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+                && row.get("name").and_then(serde_json::Value::as_str) == Some(name)
+        }) {
+            return Err("desktop routing selected summary disagrees".into());
+        }
+    }
+    let launch = value
+        .get("launch")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "desktop routing launch state is invalid".to_string())?;
+    if launch
+        .keys()
+        .any(|key| !["status", "code", "explanation", "action"].contains(&key.as_str()))
+    {
+        return Err("desktop routing launch state contains unknown fields".into());
+    }
+    let status = launch
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .filter(|status| matches!(*status, "ready" | "unavailable"))
+        .ok_or_else(|| "desktop routing launch status is invalid".to_string())?;
+    let code = launch
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| {
+            *code == "launch_ready"
+                || *code == "no_provider_accounts"
+                || ROUTING_CODES.contains(code)
+        })
+        .ok_or_else(|| "desktop routing launch code is invalid".to_string())?;
+    let action = launch
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .filter(|action| ROUTING_ACTIONS.contains(action))
+        .ok_or_else(|| "desktop routing launch action is invalid".to_string())?;
+    let explanation = launch
+        .get("explanation")
+        .and_then(serde_json::Value::as_str)
+        .filter(|copy| !copy.is_empty() && copy.len() <= 256)
+        .ok_or_else(|| "desktop routing launch explanation is invalid".to_string())?;
+    let _ = (status, code, action, explanation);
+    if status == "ready"
+        && (selected_count != 1 || code != "launch_ready" || action != "copy_or_open")
+    {
+        return Err("desktop routing ready state is inconsistent".into());
+    }
+    if status == "unavailable" && code == "launch_ready" {
+        return Err("desktop routing unavailable state is inconsistent".into());
+    }
+    Ok(())
+}
+
+fn validate_launch_intent(value: &serde_json::Value) -> Result<ValidatedLaunchIntent, String> {
+    if !object_has_only(
+        value,
+        &[
+            "schema",
+            "family",
+            "provider",
+            "account_name",
+            "preferred_terminal",
+            "launcher",
+            "environment",
+            "provider_executable",
+            "copy_command",
+        ],
+    ) {
+        return Err("provider launch intent contains unknown fields".into());
+    }
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(LAUNCH_INTENT_SCHEMA) {
+        return Err("desktop engine returned an invalid launch intent".into());
+    }
+    let family = value
+        .get("family")
+        .and_then(serde_json::Value::as_str)
+        .filter(|family| ROUTING_FAMILIES.contains(family))
+        .ok_or_else(|| "provider launch family is invalid".to_string())?;
+    let provider = value
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .filter(|provider| matches!(*provider, "claude" | "codex"))
+        .ok_or_else(|| "provider launch target is invalid".to_string())?;
+    if (family == "codex") != (provider == "codex") {
+        return Err("provider launch family and target disagree".into());
+    }
+    let account_name = value
+        .get("account_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| valid_account_name(name))
+        .ok_or_else(|| "provider launch account is invalid".to_string())?;
+    let preferred_terminal = value
+        .get("preferred_terminal")
+        .and_then(serde_json::Value::as_str)
+        .filter(|terminal| matches!(*terminal, "terminal" | "iterm" | "warp"))
+        .ok_or_else(|| "preferred terminal is invalid".to_string())?;
+    let launcher = value
+        .get("launcher")
+        .and_then(serde_json::Value::as_array)
+        .filter(|argv| argv.len() == 4)
+        .ok_or_else(|| "provider launcher is invalid".to_string())?
+        .iter()
+        .map(|part| {
+            part.as_str()
+                .filter(|part| !part.is_empty() && part.len() <= 4096 && !part.contains('\0'))
+                .map(str::to_string)
+                .ok_or_else(|| "provider launcher argument is invalid".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let launcher_path = std::path::Path::new(&launcher[0]);
+    let launcher_name = launcher_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !launcher_path.is_absolute()
+        || !launcher_name.starts_with("headroom-engine")
+        || !executable_file(launcher_path)
+        || launcher[1] != "--launch-provider"
+        || launcher[2] != family
+        || launcher[3] != account_name
+    {
+        return Err("provider launcher is not the bundled engine".into());
+    }
+    let environment = value
+        .get("environment")
+        .and_then(serde_json::Value::as_object)
+        .filter(|environment| environment.len() == 2)
+        .ok_or_else(|| "provider launch environment is invalid".to_string())?;
+    if environment
+        .get("HEADROOM_SLOT_LEASE")
+        .and_then(serde_json::Value::as_str)
+        != Some("1")
+    {
+        return Err("provider launch lease policy is invalid".into());
+    }
+    let headroom_dir = environment
+        .get("HEADROOM_DIR")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| {
+            std::path::Path::new(path).is_absolute() && path.len() <= 4096 && !path.contains('\0')
+        })
+        .ok_or_else(|| "provider launch state root is invalid".to_string())?;
+    let provider_executable = value
+        .get("provider_executable")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| {
+            let path = std::path::Path::new(path);
+            path.is_absolute() && executable_file(path)
+        })
+        .ok_or_else(|| "provider executable is invalid".to_string())?;
+    let copy_command = value
+        .get("copy_command")
+        .and_then(serde_json::Value::as_str)
+        .filter(|copy| copy.len() <= 16_384 && !copy.contains('\0'))
+        .ok_or_else(|| "provider copy command is invalid".to_string())?;
+    if copy_command != launch_command(headroom_dir, &launcher) {
+        return Err("provider copy command does not match its launch intent".into());
+    }
+    Ok(ValidatedLaunchIntent {
+        family: family.to_string(),
+        provider: provider.to_string(),
+        account_name: account_name.to_string(),
+        preferred_terminal: preferred_terminal.to_string(),
+        launcher,
+        headroom_dir: headroom_dir.to_string(),
+        provider_executable: provider_executable.to_string(),
+        copy_command: copy_command.to_string(),
+    })
+}
+
+fn validate_desktop_view(view: &serde_json::Value) -> Result<(), String> {
+    if view.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_VIEW_SCHEMA)
+        || !view
+            .get("accounts")
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return Err("bundled desktop engine returned an invalid snapshot".into());
+    }
+    validate_handoff_health(
+        view.get("handoff")
+            .ok_or_else(|| "bundled desktop engine omitted handoff health".to_string())?,
+    )
+}
+
+fn configured_theme(view: &serde_json::Value) -> &'static str {
+    view.pointer("/settings/theme")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|theme| DESKTOP_THEMES.iter().copied().find(|known| *known == theme))
+        .unwrap_or("terminal")
+}
+
 fn validate_desktop_bootstrap(
     handshake: &serde_json::Value,
     view: &serde_json::Value,
@@ -855,6 +1787,12 @@ fn validate_desktop_bootstrap(
                 "claude_login",
                 "codex_device_login",
                 "onboarding",
+                "account_lifecycle",
+                "reauthentication",
+                "resilient_collection",
+                "validated_settings",
+                "routing_launch",
+                "handoff_health",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -862,14 +1800,74 @@ fn validate_desktop_bootstrap(
     if !supports_desktop {
         return Err("bundled desktop engine lacks the required capability".into());
     }
-    if view.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_VIEW_SCHEMA)
-        || !view
-            .get("accounts")
-            .is_some_and(serde_json::Value::is_array)
-    {
-        return Err("bundled desktop engine returned an invalid snapshot".into());
+    validate_desktop_view(view)
+}
+
+fn engine_failure_code(error: &str) -> &'static str {
+    match error {
+        "bundled desktop engine startup timed out" => "engine_startup_timeout",
+        "bundled desktop engine stopped during startup" => "engine_startup_exited",
+        "bundled desktop engine did not accept the handshake"
+        | "bundled desktop engine did not accept the discovery request" => {
+            "engine_startup_pipe_failed"
+        }
+        "desktop engine request timed out" => "engine_request_timeout",
+        "desktop engine stopped unexpectedly" => "engine_exited_mid_request",
+        "desktop engine communication failed" => "engine_communication_failed",
+        _ if error.contains("incompatible") || error.contains("required capability") => {
+            "engine_incompatible"
+        }
+        _ => "engine_start_failed",
     }
-    Ok(())
+}
+
+fn desktop_startup_handshake() -> serde_json::Value {
+    serde_json::json!({
+        "product": "headroom",
+        "product_version": "starting",
+        "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
+        "architecture": std::env::consts::ARCH,
+        "runtime": "unavailable",
+    })
+}
+
+fn desktop_startup_view() -> serde_json::Value {
+    serde_json::json!({
+        "schema": DESKTOP_VIEW_SCHEMA,
+        "mode": "recovery",
+        "recovery_code": "engine_starting",
+        "accounts": [],
+        "candidates": [],
+        "freshness": {
+            "state": "held", "age_seconds": null,
+            "reason": "engine_starting",
+        },
+        "headline": {
+            "avg_5h_left_percent": null, "avg_7d_left_percent": null,
+            "current_accounts": 0, "total_accounts": 0,
+        },
+        "settings": {
+            "title": "Headroom", "theme": "terminal",
+            "redact_emails": true, "reserve_percent": 0,
+            "auto_handoff": true, "refresh_interval_seconds": 300,
+            "provider_paths": {}, "preferred_terminal": "terminal",
+            "remember_window": true,
+            "notifications": {
+                "enabled": false, "reset_enabled": false,
+                "global_threshold_percent": 20,
+                "provider_threshold_percent": {},
+            },
+        },
+        "handoff": {
+            "schema": HANDOFF_HEALTH_SCHEMA,
+            "configured": true, "supported": false,
+            "state": "unavailable", "code": "engine_starting",
+            "explanation": "The bundled engine is starting.",
+            "action": "none", "active_session": false,
+            "account": null, "model": null, "observed_at": null,
+            "preference_effect": "next_launch_only",
+        },
+    })
 }
 
 fn bootstrap_sidecar(
@@ -878,7 +1876,8 @@ fn bootstrap_sidecar(
     let command = app
         .shell()
         .sidecar("headroom-engine")
-        .map_err(|_| "bundled desktop engine could not be resolved".to_string())?;
+        .map_err(|_| "bundled desktop engine could not be resolved".to_string())?
+        .env("HEADROOM_SLOT_LEASE", "1");
     let (mut events, mut child) = command
         .spawn()
         .map_err(|_| "bundled desktop engine could not be started".to_string())?;
@@ -966,9 +1965,16 @@ fn bootstrap_sidecar(
 
 fn desktop_initialization_script(
     handshake: &serde_json::Value,
-    view: &serde_json::Value,
+    snapshot: &DesktopSnapshot,
+    surface: &str,
 ) -> String {
-    let payload = serde_json::json!({"bridge": handshake, "view": view});
+    let payload = serde_json::json!({
+        "bridge": handshake,
+        "view": snapshot.view,
+        "revision": snapshot.revision,
+        "theme": snapshot.theme,
+        "surface": surface,
+    });
     let payload_json = serde_json::to_string(&payload).expect("desktop bootstrap serializes");
     let payload_literal = serde_json::to_string(&payload_json).expect("JSON string serializes");
     format!(
@@ -979,9 +1985,10 @@ fn desktop_initialization_script(
 fn build_desktop_window(
     app: &AppHandle,
     handshake: &serde_json::Value,
-    view: &serde_json::Value,
+    snapshot: &DesktopSnapshot,
+    visible: bool,
 ) -> tauri::Result<WebviewWindow> {
-    let script = desktop_initialization_script(handshake, view);
+    let script = desktop_initialization_script(handshake, snapshot, "main");
     WebviewWindowBuilder::new(
         app,
         DESKTOP_WINDOW_LABEL,
@@ -991,10 +1998,257 @@ fn build_desktop_window(
     .inner_size(900.0, 650.0)
     .min_inner_size(680.0, 480.0)
     .resizable(true)
-    .visible(true)
+    .visible(visible)
     .initialization_script(&script)
     .on_navigation(|url| url.as_str() == "about:blank" || is_bundled_page(url))
     .build()
+}
+
+fn build_desktop_popover(
+    app: &AppHandle,
+    handshake: &serde_json::Value,
+    snapshot: &DesktopSnapshot,
+) -> tauri::Result<WebviewWindow> {
+    let script = desktop_initialization_script(handshake, snapshot, "popover");
+    let builder = WebviewWindowBuilder::new(
+        app,
+        DESKTOP_POPOVER_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("Headroom")
+    .inner_size(DESKTOP_POPOVER_WIDTH, DESKTOP_POPOVER_HEIGHT)
+    .visible(false)
+    .decorations(false)
+    .resizable(false)
+    .maximizable(false)
+    .minimizable(false)
+    .closable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
+    .transparent(true);
+    #[cfg(target_os = "macos")]
+    let builder = builder.theme(Some(tauri::Theme::Dark)).effects(
+        tauri::utils::config::WindowEffectsConfig {
+            effects: vec![tauri::utils::WindowEffect::Popover],
+            state: Some(tauri::utils::WindowEffectState::Active),
+            radius: Some(PANEL_RADIUS),
+            color: None,
+        },
+    );
+    builder
+        .initialization_script(&script)
+        .on_navigation(|url| url.as_str() == "about:blank" || is_bundled_page(url))
+        .build()
+}
+
+fn snapshot_envelope(snapshot: &DesktopSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "revision": snapshot.revision,
+        "theme": snapshot.theme,
+        "view": snapshot.view,
+    })
+}
+
+fn collection_enabled(view: &serde_json::Value) -> bool {
+    view.get("mode").and_then(serde_json::Value::as_str) == Some("ready")
+        && view
+            .get("accounts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|accounts| !accounts.is_empty())
+}
+
+fn configured_refresh_interval(view: &serde_json::Value) -> Duration {
+    let seconds = view
+        .pointer("/settings/refresh_interval_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(COLLECTION_IDLE_INTERVAL.as_secs())
+        .clamp(
+            COLLECTION_INTERVAL_MIN_SECONDS,
+            COLLECTION_INTERVAL_MAX_SECONDS,
+        );
+    Duration::from_secs(seconds)
+}
+
+fn login_launch_requires_window(view: &serde_json::Value) -> bool {
+    matches!(
+        view.get("mode").and_then(serde_json::Value::as_str),
+        Some("onboarding" | "recovery")
+    )
+}
+
+fn finish_login_launch_routing(app: &AppHandle, view: &serde_json::Value) {
+    let Some(startup) = app.try_state::<StartupRouting>() else {
+        return;
+    };
+    if !startup.login_launch || startup.decision_complete.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if login_launch_requires_window(view) {
+        let _ = show_desktop_window(app, Some("settings"));
+    }
+}
+
+fn apply_window_preference(app: &AppHandle, view: &serde_json::Value) {
+    let remember = view
+        .pointer("/settings/remember_window")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let ui = app.state::<DesktopUiState>();
+    let previous = ui.remember_window.swap(remember, Ordering::SeqCst);
+    let seen = ui.window_preference_seen.swap(true, Ordering::SeqCst);
+    if remember || (seen && !previous) {
+        return;
+    }
+    if let Ok(path) = window_state_path(app) {
+        let _ = fs::remove_file(path);
+    }
+    if let Some(window) = app.get_webview_window(DESKTOP_WINDOW_LABEL) {
+        let _ = window.center();
+        if let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) {
+            if let Ok(mut placement) = ui.placement.lock() {
+                *placement = Some(WindowPlacement {
+                    x: position.x,
+                    y: position.y,
+                    width: size.width,
+                    height: size.height,
+                });
+            }
+        }
+    }
+}
+
+fn show_login_launch_recovery(app: &AppHandle) {
+    let Some(startup) = app.try_state::<StartupRouting>() else {
+        return;
+    };
+    if startup.login_launch && !startup.decision_complete.swap(true, Ordering::SeqCst) {
+        let _ = show_desktop_window(app, None);
+    }
+}
+
+fn push_snapshot_to_windows(app: &AppHandle, snapshot: &DesktopSnapshot) {
+    let payload = serde_json::to_string(&snapshot_envelope(snapshot))
+        .expect("sanitized desktop snapshot serializes");
+    let payload_literal = serde_json::to_string(&payload).expect("snapshot string serializes");
+    let script = format!(
+        "window.__headroomApplySnapshot&&window.__headroomApplySnapshot(JSON.parse({payload_literal}));"
+    );
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+    update_desktop_tray_icon(app, &snapshot.view);
+}
+
+fn push_bridge_to_windows(app: &AppHandle, handshake: &serde_json::Value) {
+    let payload = serde_json::to_string(handshake).expect("sanitized bridge handshake serializes");
+    let payload_literal = serde_json::to_string(&payload).expect("bridge string serializes");
+    let script = format!(
+        "window.__headroomApplyBridge&&window.__headroomApplyBridge(JSON.parse({payload_literal}));"
+    );
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+}
+
+fn publish_desktop_view(
+    app: &AppHandle,
+    view: serde_json::Value,
+) -> Result<DesktopSnapshot, String> {
+    let snapshot = app.state::<DesktopStore>().replace_view(view)?;
+    if let Some(scheduler) = app.try_state::<CollectionScheduler>() {
+        scheduler
+            .enabled
+            .store(collection_enabled(&snapshot.view), Ordering::SeqCst);
+        scheduler.interval_seconds.store(
+            configured_refresh_interval(&snapshot.view).as_secs(),
+            Ordering::SeqCst,
+        );
+    }
+    apply_window_preference(app, &snapshot.view);
+    push_snapshot_to_windows(app, &snapshot);
+    finish_login_launch_routing(app, &snapshot.view);
+    Ok(snapshot)
+}
+
+fn publish_result_view(app: &AppHandle, value: &serde_json::Value) -> Result<(), String> {
+    if value.get("schema").and_then(serde_json::Value::as_str) == Some(DESKTOP_VIEW_SCHEMA) {
+        publish_desktop_view(app, value.clone())?;
+    } else if value
+        .get("view")
+        .and_then(|view| view.get("schema"))
+        .and_then(serde_json::Value::as_str)
+        == Some(DESKTOP_VIEW_SCHEMA)
+    {
+        publish_desktop_view(app, value["view"].clone())?;
+    }
+    Ok(())
+}
+
+fn bootstrap_desktop_engine(app: &AppHandle, engine: &DesktopEngine) -> Result<(), String> {
+    let missing = engine
+        .session
+        .lock()
+        .map_err(|_| "desktop engine state is unavailable".to_string())?
+        .is_none();
+    if !missing {
+        return Ok(());
+    }
+    {
+        let recovery = engine
+            .recovery
+            .lock()
+            .map_err(|_| "desktop engine recovery is unavailable".to_string())?;
+        if !recovery.admits_restart(Instant::now()) {
+            return Err(if recovery.degraded {
+                "desktop engine is safely degraded".into()
+            } else {
+                "desktop engine restart is in backoff".into()
+            });
+        }
+    }
+    match bootstrap_sidecar(app) {
+        Ok((handshake, view, session)) => {
+            let mut guard = engine
+                .session
+                .lock()
+                .map_err(|_| "desktop engine state is unavailable".to_string())?;
+            if guard.is_none() {
+                *guard = Some(session);
+            } else {
+                let _ = session.child.kill();
+            }
+            drop(guard);
+            if let Ok(mut recovery) = engine.recovery.lock() {
+                recovery.record_started(Instant::now());
+            }
+            push_bridge_to_windows(app, &handshake);
+            publish_desktop_view(app, view).map(|_| ())
+        }
+        Err(error) => {
+            if let Ok(mut recovery) = engine.recovery.lock() {
+                recovery.record_failure(
+                    Instant::now(),
+                    collection_entropy(),
+                    engine_failure_code(&error),
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn ensure_desktop_engine(app: &AppHandle, engine: &DesktopEngine) -> Result<(), String> {
+    if engine.starting.swap(true, Ordering::SeqCst) {
+        return Err("desktop engine restart is already running".into());
+    }
+    let outcome = bootstrap_desktop_engine(app, engine);
+    engine.starting.store(false, Ordering::SeqCst);
+    outcome
 }
 
 fn request_desktop_engine(
@@ -1055,7 +2309,12 @@ fn request_desktop_engine(
         }
     })();
     match outcome {
-        Ok(value) => Ok(value),
+        Ok(value) => {
+            if let Ok(mut recovery) = engine.recovery.lock() {
+                recovery.record_success(Instant::now());
+            }
+            Ok(value)
+        }
         Err((error, fatal)) => {
             // A malformed, late, or missing response makes frame ordering
             // unknowable. Retire that session so a later request cannot
@@ -1065,6 +2324,13 @@ fn request_desktop_engine(
                 if let Some(session) = guard.take() {
                     let _ = session.child.kill();
                 }
+                if let Ok(mut recovery) = engine.recovery.lock() {
+                    recovery.record_failure(
+                        Instant::now(),
+                        collection_entropy(),
+                        engine_failure_code(&error),
+                    );
+                }
             }
             Err(error)
         }
@@ -1072,63 +2338,140 @@ fn request_desktop_engine(
 }
 
 async fn engine_command(
+    app: AppHandle,
     engine: DesktopEngine,
     command: &'static str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || request_desktop_engine(&engine, command, args))
-        .await
-        .map_err(|_| "desktop engine task failed".to_string())?
+    let worker = engine.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        request_desktop_engine(&worker, command, args)
+    })
+    .await
+    .map_err(|_| "desktop engine task failed".to_string())?;
+    let missing = engine
+        .session
+        .lock()
+        .map(|session| session.is_none())
+        .unwrap_or(true);
+    if result.is_err() && missing && !engine.starting.load(Ordering::SeqCst) {
+        let (state, code, retry) = engine.recovery.lock().map_or(
+            ("degraded", Some("engine_state_unavailable"), None),
+            |policy| {
+                (
+                    if policy.degraded {
+                        "degraded"
+                    } else {
+                        "recovering"
+                    },
+                    policy.last_failure_code,
+                    policy
+                        .retry_at
+                        .and_then(|at| at.checked_duration_since(Instant::now())),
+                )
+            },
+        );
+        set_engine_state_windows(&app, state, code);
+        if state != "degraded" {
+            schedule_engine_restart(app, retry.unwrap_or(Duration::from_millis(100)));
+        }
+    }
+    result
 }
 
 #[tauri::command]
 async fn desktop_discover(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
 ) -> Result<serde_json::Value, String> {
-    engine_command(state.inner().clone(), "discover", serde_json::json!({})).await
+    let value = engine_command(
+        app.clone(),
+        state.inner().clone(),
+        "discover",
+        serde_json::json!({}),
+    )
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
 async fn desktop_onboarding(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     action: String,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
+    let value = engine_command(
+        app.clone(),
         state.inner().clone(),
         "onboarding",
         serde_json::json!({"action": action}),
     )
-    .await
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
+}
+
+#[tauri::command]
+async fn desktop_account_action(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    action: String,
+    name: String,
+    new_name: Option<String>,
+    reserved: Option<bool>,
+    confirmation: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let value = engine_command(
+        app.clone(),
+        state.inner().clone(),
+        "account_action",
+        serde_json::json!({
+            "action": action,
+            "name": name,
+            "new_name": new_name,
+            "reserved": reserved,
+            "confirmation": confirmation,
+        }),
+    )
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
 async fn desktop_adopt(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     candidate_id: String,
     name: String,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
+    let value = engine_command(
+        app.clone(),
         state.inner().clone(),
         "adopt",
         serde_json::json!({"candidate_id": candidate_id, "name": name}),
     )
-    .await
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
-async fn desktop_refresh(
-    state: tauri::State<'_, DesktopEngine>,
-) -> Result<serde_json::Value, String> {
-    engine_command(state.inner().clone(), "refresh", serde_json::json!({})).await
+async fn desktop_refresh(app: AppHandle) -> Result<serde_json::Value, String> {
+    request_scheduled_collection(&app, "manual");
+    Ok(app.state::<DesktopStore>().snapshot()?.view)
 }
 
 #[tauri::command]
 async fn desktop_start_claude_login(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     name: String,
     expected_email: Option<String>,
 ) -> Result<serde_json::Value, String> {
     engine_command(
+        app,
         state.inner().clone(),
         "start_claude_login",
         serde_json::json!({"name": name, "expected_email": expected_email}),
@@ -1138,14 +2481,31 @@ async fn desktop_start_claude_login(
 
 #[tauri::command]
 async fn desktop_start_codex_login(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     name: String,
     expected_email: Option<String>,
 ) -> Result<serde_json::Value, String> {
     engine_command(
+        app,
         state.inner().clone(),
         "start_codex_login",
         serde_json::json!({"name": name, "expected_email": expected_email}),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn desktop_start_reauthentication(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        app,
+        state.inner().clone(),
+        "start_reauthentication",
+        serde_json::json!({"name": name}),
     )
     .await
 }
@@ -1177,28 +2537,329 @@ async fn desktop_open_device_url(url: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn desktop_login_status(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     job_id: String,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
+    let value = engine_command(
+        app.clone(),
         state.inner().clone(),
         "login_status",
         serde_json::json!({"job_id": job_id}),
+    )
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
+}
+
+#[tauri::command]
+async fn desktop_cancel_login(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    job_id: String,
+) -> Result<serde_json::Value, String> {
+    let value = engine_command(
+        app.clone(),
+        state.inner().clone(),
+        "cancel_login",
+        serde_json::json!({"job_id": job_id}),
+    )
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
+}
+
+async fn update_desktop_settings(
+    app: AppHandle,
+    engine: DesktopEngine,
+    patch: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if !patch.is_object() {
+        return Err("desktop settings patch is invalid".into());
+    }
+    let value = engine_command(
+        app.clone(),
+        engine,
+        "update_settings",
+        serde_json::json!({"patch": patch}),
+    )
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
+}
+
+#[tauri::command]
+async fn desktop_set_theme(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    theme: String,
+) -> Result<serde_json::Value, String> {
+    update_desktop_settings(
+        app,
+        state.inner().clone(),
+        serde_json::json!({"theme": theme}),
     )
     .await
 }
 
 #[tauri::command]
-async fn desktop_cancel_login(
+async fn desktop_update_settings(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
-    job_id: String,
+    patch: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
-        state.inner().clone(),
-        "cancel_login",
-        serde_json::json!({"job_id": job_id}),
+    update_desktop_settings(app, state.inner().clone(), patch).await
+}
+
+async fn routing_launch_intent(
+    app: AppHandle,
+    engine: DesktopEngine,
+    family: String,
+    account_name: String,
+) -> Result<ValidatedLaunchIntent, String> {
+    if !ROUTING_FAMILIES.contains(&family.as_str()) || !valid_account_name(&account_name) {
+        return Err("routing launch request is invalid".into());
+    }
+    let value = engine_command(
+        app,
+        engine,
+        "routing_launch_intent",
+        serde_json::json!({"family": family, "account_name": account_name}),
     )
-    .await
+    .await?;
+    validate_launch_intent(&value)
+}
+
+#[tauri::command]
+async fn desktop_routing_preview(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    family: String,
+) -> Result<serde_json::Value, String> {
+    if !ROUTING_FAMILIES.contains(&family.as_str()) {
+        return Err("routing family is invalid".into());
+    }
+    let value = engine_command(
+        app,
+        state.inner().clone(),
+        "routing_preview",
+        serde_json::json!({"family": family}),
+    )
+    .await?;
+    validate_routing_preview(&value)?;
+    Ok(value)
+}
+
+fn copy_to_clipboard(copy: &str) -> Result<(), String> {
+    let mut child = StdCommand::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "provider command clipboard is unavailable".to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "provider command clipboard is unavailable".to_string())?
+        .write_all(copy.as_bytes())
+        .map_err(|_| "provider command could not be copied".to_string())?;
+    let status = child
+        .wait()
+        .map_err(|_| "provider command clipboard is unavailable".to_string())?;
+    if !status.success() {
+        return Err("provider command could not be copied".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn desktop_copy_routing_command(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    family: String,
+    account_name: String,
+) -> Result<serde_json::Value, String> {
+    let intent = routing_launch_intent(app, state.inner().clone(), family, account_name).await?;
+    copy_to_clipboard(&intent.copy_command)?;
+    Ok(serde_json::json!({
+        "status": "copied",
+        "account_name": intent.account_name,
+        "provider": intent.provider,
+    }))
+}
+
+fn write_terminal_launch_script(
+    app: &AppHandle,
+    intent: &ValidatedLaunchIntent,
+) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|_| "provider launch cache is unavailable".to_string())?
+        .join("launch-intents");
+    fs::create_dir_all(&directory)
+        .map_err(|_| "provider launch cache could not be prepared".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "provider launch cache permissions could not be set".to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = directory.join(format!("launch-{}-{nonce}.command", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o700);
+    let mut file = options
+        .open(&path)
+        .map_err(|_| "provider launch script could not be created".to_string())?;
+    let command = launch_command(&intent.headroom_dir, &intent.launcher);
+    writeln!(file, "#!/bin/zsh\nrm -f -- \"$0\"\n{command}")
+        .map_err(|_| "provider launch script could not be written".to_string())?;
+    file.sync_all()
+        .map_err(|_| "provider launch script could not be committed".to_string())?;
+    Ok(path)
+}
+
+fn open_launch_script(path: &std::path::Path, terminal: &str) -> Result<(), String> {
+    let application = match terminal {
+        "terminal" => "Terminal",
+        "iterm" => "iTerm",
+        "warp" => "Warp",
+        _ => return Err("preferred terminal is invalid".into()),
+    };
+    let status = StdCommand::new("/usr/bin/open")
+        .arg("-a")
+        .arg(application)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "preferred terminal could not be opened".to_string())?;
+    if !status.success() {
+        return Err("preferred terminal is unavailable".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn desktop_open_routing_launch(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    family: String,
+    account_name: String,
+) -> Result<serde_json::Value, String> {
+    let intent =
+        routing_launch_intent(app.clone(), state.inner().clone(), family, account_name).await?;
+    let script = write_terminal_launch_script(&app, &intent)?;
+    if let Err(error) = open_launch_script(&script, &intent.preferred_terminal) {
+        let _ = fs::remove_file(script);
+        return Err(error);
+    }
+    Ok(serde_json::json!({
+        "status": "opened",
+        "account_name": intent.account_name,
+        "provider": intent.provider,
+        "terminal": intent.preferred_terminal,
+    }))
+}
+
+#[tauri::command]
+fn desktop_launch_at_login_status(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|_| "launch at login status is unavailable".to_string())
+}
+
+#[tauri::command]
+fn desktop_set_launch_at_login(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|_| "launch at login could not be updated".to_string())?;
+    let actual = manager
+        .is_enabled()
+        .map_err(|_| "launch at login status is unavailable".to_string())?;
+    if actual != enabled {
+        return Err("launch at login did not reach the requested state".into());
+    }
+    Ok(actual)
+}
+
+#[tauri::command]
+fn desktop_snapshot(state: tauri::State<'_, DesktopStore>) -> Result<serde_json::Value, String> {
+    Ok(snapshot_envelope(&state.snapshot()?))
+}
+
+#[tauri::command]
+fn desktop_retry_engine(app: AppHandle) -> Result<serde_json::Value, String> {
+    let engine = app.state::<DesktopEngine>().inner().clone();
+    let allowed = engine
+        .recovery
+        .lock()
+        .map_err(|_| "desktop engine recovery is unavailable".to_string())?
+        .allow_manual_retry();
+    if !allowed {
+        return Err("desktop engine manual retry is available only in degraded mode".into());
+    }
+    if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+        policy.retry_at = None;
+    }
+    set_engine_state_windows(&app, "recovering", Some("engine_manual_retry"));
+    start_desktop_engine_async(&app);
+    Ok(snapshot_envelope(&app.state::<DesktopStore>().snapshot()?))
+}
+
+fn show_desktop_window(app: &AppHandle, panel: Option<&str>) -> Result<(), String> {
+    let window = app
+        .get_webview_window(DESKTOP_WINDOW_LABEL)
+        .ok_or_else(|| "desktop window is unavailable".to_string())?;
+    window
+        .show()
+        .map_err(|_| "desktop window could not be shown".to_string())?;
+    let _ = window.unminimize();
+    window
+        .set_focus()
+        .map_err(|_| "desktop window could not be focused".to_string())?;
+    if let Some(panel) = panel {
+        let panel = js_string_literal(panel);
+        let _ = window.eval(&format!(
+            "window.__headroomOpenPanel&&window.__headroomOpenPanel({panel});"
+        ));
+    }
+    if let Some(popover) = app.get_webview_window(DESKTOP_POPOVER_LABEL) {
+        let _ = popover.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn desktop_show_dashboard(app: AppHandle) -> Result<(), String> {
+    show_desktop_window(&app, None)
+}
+
+#[tauri::command]
+fn desktop_show_settings(app: AppHandle) -> Result<(), String> {
+    show_desktop_window(&app, Some("settings"))
+}
+
+#[tauri::command]
+fn desktop_hide_dashboard(app: AppHandle) -> Result<(), String> {
+    save_window_placement(&app)?;
+    app.get_webview_window(DESKTOP_WINDOW_LABEL)
+        .ok_or_else(|| "desktop window is unavailable".to_string())?
+        .hide()
+        .map_err(|_| "desktop window could not be hidden".to_string())
+}
+
+#[tauri::command]
+fn desktop_quit(app: AppHandle) {
+    app.exit(0);
 }
 
 fn stop_desktop_engine(app: &AppHandle) {
@@ -1217,61 +2878,843 @@ fn stop_desktop_engine(app: &AppHandle) {
         serde_json::json!({}),
     ));
     let deadline = Instant::now() + Duration::from_secs(6);
+    let mut terminated = false;
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         let next = tauri::async_runtime::block_on(async {
             tokio::time::timeout(remaining, session.events.recv()).await
         });
         match next {
             Ok(Some(CommandEvent::Stdout(frame))) => {
-                if parse_bridge_response(&frame, "desktop-shutdown").is_ok() {
-                    break;
-                }
+                let _ = parse_bridge_response(&frame, "desktop-shutdown");
             }
-            Ok(Some(CommandEvent::Terminated(_))) | Ok(None) | Err(_) => break,
+            Ok(Some(CommandEvent::Terminated(_))) | Ok(None) => {
+                terminated = true;
+                break;
+            }
+            Err(_) => break,
             Ok(Some(_)) => {}
         }
     }
-    let _ = session.child.kill();
+    if !terminated {
+        let _ = session.child.kill();
+    }
+}
+
+fn desktop_average_level(view: &serde_json::Value) -> Option<f32> {
+    let value = view
+        .pointer("/headline/avg_5h_left_percent")
+        .and_then(serde_json::Value::as_f64)?;
+    (value.is_finite() && (0.0..=100.0).contains(&value)).then_some((value / 100.0) as f32)
+}
+
+fn update_desktop_tray_icon(app: &AppHandle, view: &serde_json::Value) {
+    let Some(tray) = app.tray_by_id("headroom-tray") else {
+        return;
+    };
+    let level = desktop_average_level(view);
+    let (rgba, width, height) = icon::tray_icon_rgba(level);
+    let _ = tray.set_icon(Some(Image::new_owned(rgba, width, height)));
+    let _ = tray.set_icon_as_template(true);
+    let tooltip = level.map_or_else(
+        || "Headroom — no current five-hour reading".to_string(),
+        |level| {
+            format!(
+                "Headroom — {}% average five-hour headroom",
+                (level * 100.0).round()
+            )
+        },
+    );
+    let _ = tray.set_tooltip(Some(tooltip));
+}
+
+fn set_refresh_state_windows(app: &AppHandle, state: &str) {
+    let state = js_string_literal(state);
+    let script =
+        format!("window.__headroomSetRefreshState&&window.__headroomSetRefreshState({state});");
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+}
+
+fn set_engine_state_windows(app: &AppHandle, state: &str, code: Option<&str>) {
+    let state = js_string_literal(state);
+    let code = code.map(js_string_literal).unwrap_or_else(|| "null".into());
+    let script = format!(
+        "window.__headroomSetRefreshState&&window.__headroomSetRefreshState({state},{code});"
+    );
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+}
+
+fn collection_view_outcome(view: &serde_json::Value) -> (bool, bool) {
+    let accounts = view
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if accounts.is_empty() {
+        return (true, false);
+    }
+    let codes: Vec<&str> = accounts
+        .iter()
+        .filter_map(|account| {
+            account
+                .get("diagnostic_code")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    let transient = codes.iter().any(|code| {
+        matches!(
+            *code,
+            "provider_rate_limited"
+                | "provider_server_error"
+                | "provider_timeout"
+                | "provider_offline"
+                | "provider_unavailable"
+                | "malformed_provider_response"
+                | "codex_provider_backoff"
+                | "codex_app_server_throttled"
+                | "usage_source_rate_limited"
+        )
+    });
+    let has_usable = accounts.iter().any(|account| {
+        matches!(
+            account.get("state").and_then(serde_json::Value::as_str),
+            Some("current" | "limited")
+        )
+    });
+    let offline = !has_usable
+        && codes
+            .iter()
+            .any(|code| matches!(*code, "provider_offline" | "provider_unavailable"));
+    (!transient, offline)
+}
+
+fn collection_entropy() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64)
+}
+
+fn engine_recovery_state(engine: &DesktopEngine) -> &'static str {
+    engine
+        .recovery
+        .lock()
+        .map(|policy| {
+            if policy.degraded {
+                "degraded"
+            } else {
+                "recovering"
+            }
+        })
+        .unwrap_or("degraded")
+}
+
+fn engine_recovery_status(engine: &DesktopEngine) -> (&'static str, Option<&'static str>) {
+    engine
+        .recovery
+        .lock()
+        .map(|policy| {
+            (
+                if policy.degraded {
+                    "degraded"
+                } else {
+                    "recovering"
+                },
+                policy.last_failure_code,
+            )
+        })
+        .unwrap_or(("degraded", Some("engine_state_unavailable")))
+}
+
+#[cfg(unix)]
+fn sidecar_process_alive(session: &BridgeSession) -> bool {
+    let result = unsafe { libc::kill(session.child.pid() as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn sidecar_process_alive(_session: &BridgeSession) -> bool {
+    true
+}
+
+fn schedule_engine_restart(app: AppHandle, delay: Duration) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(delay).await;
+        start_desktop_engine_async(&app);
+    });
+}
+
+fn start_desktop_engine_async(app: &AppHandle) {
+    let engine = app.state::<DesktopEngine>().inner().clone();
+    let has_session = engine
+        .session
+        .lock()
+        .map(|session| session.is_some())
+        .unwrap_or(false);
+    if has_session
+        || engine
+            .starting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return;
+    }
+    let (_, code) = engine_recovery_status(&engine);
+    set_engine_state_windows(app, "recovering", code);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let bootstrap_app = app.clone();
+        let bootstrap_engine = engine.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            bootstrap_desktop_engine(&bootstrap_app, &bootstrap_engine)
+        })
+        .await
+        .map_err(|_| "desktop engine restart task failed".to_string())
+        .and_then(|result| result);
+        engine.starting.store(false, Ordering::SeqCst);
+        match outcome {
+            Ok(()) => {
+                let enabled = app
+                    .state::<CollectionScheduler>()
+                    .enabled
+                    .load(Ordering::SeqCst);
+                if enabled {
+                    request_scheduled_collection(&app, "engine_restart");
+                } else {
+                    set_refresh_state_windows(&app, "current");
+                }
+            }
+            Err(_) => {
+                show_login_launch_recovery(&app);
+                let (state, code, retry) = engine.recovery.lock().map_or(
+                    ("degraded", Some("engine_state_unavailable"), None),
+                    |policy| {
+                        (
+                            if policy.degraded {
+                                "degraded"
+                            } else {
+                                "recovering"
+                            },
+                            policy.last_failure_code,
+                            policy.retry_at.and_then(|retry_at| {
+                                retry_at.checked_duration_since(Instant::now())
+                            }),
+                        )
+                    },
+                );
+                set_engine_state_windows(&app, state, code);
+                if state != "degraded" {
+                    schedule_engine_restart(app, retry.unwrap_or(Duration::from_millis(100)));
+                }
+            }
+        }
+    });
+}
+
+fn start_engine_watchdog(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(ENGINE_WATCHDOG_TICK);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let engine = app.state::<DesktopEngine>().inner().clone();
+            let dead = engine
+                .session
+                .lock()
+                .map(|session| {
+                    session
+                        .as_ref()
+                        .is_some_and(|session| !sidecar_process_alive(session))
+                })
+                .unwrap_or(false);
+            if !dead {
+                if let Ok(mut recovery) = engine.recovery.lock() {
+                    recovery.record_success(Instant::now());
+                }
+                continue;
+            }
+            let removed = engine
+                .session
+                .lock()
+                .ok()
+                .and_then(|mut session| session.take())
+                .is_some();
+            if !removed {
+                continue;
+            }
+            let (delay, degraded, code) = engine.recovery.lock().map_or(
+                (
+                    ENGINE_DEGRADED_COOLDOWN,
+                    true,
+                    Some("engine_state_unavailable"),
+                ),
+                |mut policy| {
+                    let delay = policy.record_failure(
+                        Instant::now(),
+                        collection_entropy(),
+                        "engine_unexpected_exit",
+                    );
+                    (delay, policy.degraded, policy.last_failure_code)
+                },
+            );
+            set_engine_state_windows(&app, if degraded { "degraded" } else { "recovering" }, code);
+            if !degraded {
+                schedule_engine_restart(app.clone(), delay);
+            }
+        }
+    });
+}
+
+fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
+    let scheduler = app.state::<CollectionScheduler>();
+    if !scheduler.enabled.load(Ordering::SeqCst) {
+        return;
+    }
+    let now = Instant::now();
+    let (in_backoff, recently_current) = scheduler.policy.lock().map_or((false, false), |policy| {
+        (
+            policy.retry_at.is_some_and(|retry_at| now < retry_at),
+            policy.retry_at.is_none()
+                && policy
+                    .last_success_at
+                    .is_some_and(|last| now.duration_since(last) < Duration::from_secs(60)),
+        )
+    });
+    if trigger == "wake" && recently_current {
+        return;
+    }
+    if in_backoff
+        && !matches!(
+            trigger,
+            "wake" | "connectivity" | "engine_restart" | "engine_retry"
+        )
+    {
+        set_refresh_state_windows(app, "backoff");
+        return;
+    }
+    if scheduler.running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    set_refresh_state_windows(
+        app,
+        if matches!(trigger, "engine_restart" | "engine_retry") {
+            "recovering"
+        } else {
+            "refreshing"
+        },
+    );
+    let app = app.clone();
+    let engine = app.state::<DesktopEngine>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let bootstrap_app = app.clone();
+        let bootstrap_engine = engine.clone();
+        let ensured = tauri::async_runtime::spawn_blocking(move || {
+            ensure_desktop_engine(&bootstrap_app, &bootstrap_engine)
+        })
+        .await
+        .map_err(|_| "desktop engine restart task failed".to_string())
+        .and_then(|result| result);
+        let result = match ensured {
+            Ok(()) => {
+                engine_command(
+                    app.clone(),
+                    engine.clone(),
+                    "refresh",
+                    serde_json::json!({}),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let now = Instant::now();
+        let (settled, diagnostic) = match result {
+            Ok(view) => {
+                let published = publish_result_view(&app, &view).is_ok();
+                let current_view = view
+                    .get("view")
+                    .filter(|nested| nested.get("schema").is_some())
+                    .unwrap_or(&view);
+                let (success, offline) = collection_view_outcome(current_view);
+                if published && success {
+                    if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+                        policy.record_success(now);
+                    }
+                    ("current", None)
+                } else {
+                    if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+                        policy.record_failure(now, collection_entropy());
+                    }
+                    if offline {
+                        ("offline", None)
+                    } else {
+                        ("backoff", None)
+                    }
+                }
+            }
+            Err(_) => {
+                if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+                    policy.record_failure(now, collection_entropy());
+                }
+                let (state, code) = engine_recovery_status(&engine);
+                (state, code)
+            }
+        };
+        app.state::<CollectionScheduler>()
+            .running
+            .store(false, Ordering::SeqCst);
+        if diagnostic.is_some() {
+            set_engine_state_windows(&app, settled, diagnostic);
+        } else {
+            set_refresh_state_windows(&app, settled);
+        }
+    });
+}
+
+fn start_collection_scheduler(app: &AppHandle, snapshot: &DesktopSnapshot) {
+    let enabled = collection_enabled(&snapshot.view);
+    let scheduler = app.state::<CollectionScheduler>();
+    scheduler.enabled.store(enabled, Ordering::SeqCst);
+    scheduler.interval_seconds.store(
+        configured_refresh_interval(&snapshot.view).as_secs(),
+        Ordering::SeqCst,
+    );
+    if enabled {
+        let now = Instant::now();
+        let freshness_current = snapshot
+            .view
+            .pointer("/freshness/state")
+            .and_then(serde_json::Value::as_str)
+            == Some("current");
+        let age = snapshot
+            .view
+            .pointer("/freshness/age_seconds")
+            .and_then(serde_json::Value::as_u64);
+        if freshness_current {
+            if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+                policy.last_success_at = age
+                    .and_then(|seconds| now.checked_sub(Duration::from_secs(seconds)))
+                    .or(Some(now));
+            }
+        } else {
+            request_scheduled_collection(app, "activation");
+        }
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(COLLECTION_TICK);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let due = app
+                .state::<CollectionScheduler>()
+                .policy
+                .lock()
+                .map(|policy| {
+                    let seconds = app
+                        .state::<CollectionScheduler>()
+                        .interval_seconds
+                        .load(Ordering::SeqCst);
+                    policy.due(Instant::now(), Duration::from_secs(seconds))
+                })
+                .unwrap_or(false);
+            if due {
+                request_scheduled_collection(&app, "schedule");
+            }
+        }
+    });
+}
+
+fn toggle_desktop_popover(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(DESKTOP_POPOVER_LABEL) else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        return;
+    }
+    let max_height = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| {
+            monitor
+                .size()
+                .to_logical::<f64>(monitor.scale_factor())
+                .height
+                - 80.0
+        })
+        .unwrap_or(DESKTOP_POPOVER_HEIGHT);
+    let height = DESKTOP_POPOVER_HEIGHT.min(max_height).max(320.0);
+    let _ = window.set_size(tauri::LogicalSize::new(DESKTOP_POPOVER_WIDTH, height));
+    let _ = window.move_window_constrained(Position::TrayCenter);
+    *app.state::<DesktopUiState>()
+        .popover_opened_at
+        .lock()
+        .expect("desktop popover state poisoned") = Some(Instant::now());
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+fn build_desktop_tray(app: &AppHandle) -> tauri::Result<()> {
+    let dashboard = MenuItem::with_id(app, "dashboard", "Open Dashboard", true, None::<&str>)?;
+    let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&dashboard, &refresh, &settings, &quit])?;
+    let snapshot = app.state::<DesktopStore>().snapshot().ok();
+    let level = snapshot
+        .as_ref()
+        .and_then(|snapshot| desktop_average_level(&snapshot.view));
+    let (rgba, width, height) = icon::tray_icon_rgba(level);
+    TrayIconBuilder::with_id("headroom-tray")
+        .icon(Image::new_owned(rgba, width, height))
+        .icon_as_template(true)
+        .tooltip("Headroom")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "dashboard" => {
+                let _ = show_desktop_window(app, None);
+            }
+            "refresh" => request_scheduled_collection(app, "manual"),
+            "settings" => {
+                let _ = show_desktop_window(app, Some("settings"));
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
+            if let TrayIconEvent::Click { rect, .. }
+            | TrayIconEvent::Enter { rect, .. }
+            | TrayIconEvent::Move { rect, .. } = &event
+            {
+                *tray
+                    .app_handle()
+                    .state::<DesktopUiState>()
+                    .last_tray_rect
+                    .lock()
+                    .expect("desktop tray state poisoned") = Some(*rect);
+            }
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_desktop_popover(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+fn window_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("window-state.json"))
+        .map_err(|_| "desktop window state directory is unavailable".to_string())
+}
+
+fn valid_window_placement(value: &serde_json::Value) -> Option<WindowPlacement> {
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(WINDOW_STATE_SCHEMA) {
+        return None;
+    }
+    let number = |key: &str| value.get(key).and_then(serde_json::Value::as_i64);
+    let placement = WindowPlacement {
+        x: i32::try_from(number("x")?).ok()?,
+        y: i32::try_from(number("y")?).ok()?,
+        width: u32::try_from(number("width")?).ok()?,
+        height: u32::try_from(number("height")?).ok()?,
+    };
+    ((640..=6000).contains(&placement.width)
+        && (440..=4000).contains(&placement.height)
+        && (-50_000..=50_000).contains(&placement.x)
+        && (-50_000..=50_000).contains(&placement.y))
+    .then_some(placement)
+}
+
+fn placement_intersects_monitor(placement: WindowPlacement, monitor: &tauri::Monitor) -> bool {
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let left = placement.x.max(monitor_position.x);
+    let top = placement.y.max(monitor_position.y);
+    let right = (i64::from(placement.x) + i64::from(placement.width))
+        .min(i64::from(monitor_position.x) + i64::from(monitor_size.width));
+    let bottom = (i64::from(placement.y) + i64::from(placement.height))
+        .min(i64::from(monitor_position.y) + i64::from(monitor_size.height));
+    i64::from(left) + 120 <= right && i64::from(top) + 80 <= bottom
+}
+
+fn load_window_placement(app: &AppHandle) -> Option<WindowPlacement> {
+    let path = window_state_path(app).ok()?;
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 8192 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    valid_window_placement(&value)
+}
+
+fn save_window_placement(app: &AppHandle) -> Result<(), String> {
+    if !app
+        .state::<DesktopUiState>()
+        .remember_window
+        .load(Ordering::SeqCst)
+    {
+        if let Ok(path) = window_state_path(app) {
+            let _ = fs::remove_file(path);
+        }
+        return Ok(());
+    }
+    let Some(placement) = *app
+        .state::<DesktopUiState>()
+        .placement
+        .lock()
+        .map_err(|_| "desktop window state is unavailable".to_string())?
+    else {
+        return Ok(());
+    };
+    let path = window_state_path(app)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "desktop window state path is invalid".to_string())?;
+    fs::create_dir_all(directory)
+        .map_err(|_| "desktop window state directory could not be created".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "desktop window state permissions could not be set".to_string())?;
+    let temporary = directory.join(format!(".window-state-{}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| "desktop window state could not be prepared".to_string())?;
+    let value = serde_json::json!({
+        "schema": WINDOW_STATE_SCHEMA,
+        "x": placement.x,
+        "y": placement.y,
+        "width": placement.width,
+        "height": placement.height,
+    });
+    serde_json::to_writer(&mut file, &value)
+        .map_err(|_| "desktop window state could not be encoded".to_string())?;
+    file.write_all(b"\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "desktop window state could not be committed".to_string())?;
+    fs::rename(&temporary, &path)
+        .map_err(|_| "desktop window state could not be published".to_string())?;
+    Ok(())
+}
+
+fn restore_window_placement(window: &WebviewWindow) {
+    let app = window.app_handle();
+    let restored = load_window_placement(app).filter(|placement| {
+        window
+            .available_monitors()
+            .map(|monitors| {
+                monitors
+                    .iter()
+                    .any(|monitor| placement_intersects_monitor(*placement, monitor))
+            })
+            .unwrap_or(false)
+    });
+    if let Some(placement) = restored {
+        let _ = window.set_size(PhysicalSize::new(placement.width, placement.height));
+        let _ = window.set_position(PhysicalPosition::new(placement.x, placement.y));
+    }
+    let placement = (|| {
+        let position = window.outer_position().ok()?;
+        let size = window.inner_size().ok()?;
+        Some(WindowPlacement {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        })
+    })();
+    *app.state::<DesktopUiState>()
+        .placement
+        .lock()
+        .expect("desktop window state poisoned") = placement;
 }
 
 pub fn run() {
-    let app = tauri::Builder::default()
+    let login_launch = std::env::args_os()
+        .any(|argument| argument == std::ffi::OsStr::new("--headroom-login-launch"));
+    #[cfg(unix)]
+    let SingletonPrimary {
+        lock,
+        listener,
+        socket_path,
+    } = match claim_singleton() {
+        Ok(SingletonClaim::Primary(primary)) => primary,
+        Ok(SingletonClaim::Secondary) => return,
+        Err(error) => {
+            eprintln!("headroom-desktop: {error}");
+            return;
+        }
+    };
+    let builder = tauri::Builder::default();
+    #[cfg(unix)]
+    let builder = builder.manage(SingletonState {
+        _lock: lock,
+        socket_path,
+        listener: Mutex::new(Some(listener)),
+    });
+    let app = builder
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg("--headroom-login-launch")
+                .app_name("Headroom")
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_positioner::init())
         .manage(DesktopEngine::default())
+        .manage(DesktopStore::default())
+        .manage(DesktopUiState::default())
+        .manage(CollectionScheduler::default())
+        .manage(StartupRouting {
+            login_launch,
+            decision_complete: AtomicBool::new(false),
+        })
         .invoke_handler(tauri::generate_handler![
             desktop_discover,
             desktop_onboarding,
+            desktop_account_action,
             desktop_adopt,
             desktop_refresh,
             desktop_start_claude_login,
             desktop_start_codex_login,
+            desktop_start_reauthentication,
             desktop_login_status,
             desktop_cancel_login,
-            desktop_open_device_url
+            desktop_open_device_url,
+            desktop_snapshot,
+            desktop_retry_engine,
+            desktop_set_theme,
+            desktop_update_settings,
+            desktop_routing_preview,
+            desktop_copy_routing_command,
+            desktop_open_routing_launch,
+            desktop_launch_at_login_status,
+            desktop_set_launch_at_login,
+            desktop_show_dashboard,
+            desktop_show_settings,
+            desktop_hide_dashboard,
+            desktop_quit
         ])
         .setup(|app| {
-            let (handshake, view, session) =
-                bootstrap_sidecar(app.handle()).map_err(std::io::Error::other)?;
-            *app.state::<DesktopEngine>()
-                .session
-                .lock()
-                .expect("desktop engine mutex poisoned") = Some(session);
-            build_desktop_window(app.handle(), &handshake, &view)?;
+            #[cfg(unix)]
+            {
+                let listener = app
+                    .state::<SingletonState>()
+                    .listener
+                    .lock()
+                    .map_err(|_| std::io::Error::other("singleton listener is unavailable"))?
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("singleton listener already started"))?;
+                start_singleton_listener(app.handle(), listener).map_err(std::io::Error::other)?;
+            }
+            // Build a safe recovery shell immediately. The frozen handshake
+            // runs on the blocking pool and later replaces this projection;
+            // startup lifecycle work never stalls the main UI thread.
+            let handshake = desktop_startup_handshake();
+            let snapshot = app
+                .state::<DesktopStore>()
+                .replace_view(desktop_startup_view())
+                .map_err(std::io::Error::other)?;
+            let login_launch = app.state::<StartupRouting>().login_launch;
+            let main = build_desktop_window(app.handle(), &handshake, &snapshot, !login_launch)?;
+            restore_window_placement(&main);
+            let popover = build_desktop_popover(app.handle(), &handshake, &snapshot)?;
+            #[cfg(target_os = "macos")]
+            round_window_corners(&popover, PANEL_RADIUS);
+            build_desktop_tray(app.handle())?;
+            update_desktop_tray_icon(app.handle(), &snapshot.view);
+            start_collection_scheduler(app.handle(), &snapshot);
+            start_engine_watchdog(app.handle());
+            start_desktop_engine_async(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == DESKTOP_WINDOW_LABEL
-                && matches!(event, WindowEvent::CloseRequested { .. })
+            if window.label() == DESKTOP_WINDOW_LABEL {
+                let ui = window.app_handle().state::<DesktopUiState>();
+                match event {
+                    WindowEvent::Moved(position) => {
+                        if let Ok(mut placement) = ui.placement.lock() {
+                            let current = placement.get_or_insert(WindowPlacement {
+                                x: position.x,
+                                y: position.y,
+                                width: 900,
+                                height: 650,
+                            });
+                            current.x = position.x;
+                            current.y = position.y;
+                        }
+                    }
+                    WindowEvent::Resized(size) => {
+                        if let Ok(mut placement) = ui.placement.lock() {
+                            let current = placement.get_or_insert(WindowPlacement {
+                                x: 0,
+                                y: 0,
+                                width: size.width,
+                                height: size.height,
+                            });
+                            current.width = size.width;
+                            current.height = size.height;
+                        }
+                    }
+                    WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = save_window_placement(window.app_handle());
+                        let _ = window.hide();
+                    }
+                    _ => {}
+                }
+            } else if window.label() == DESKTOP_POPOVER_LABEL
+                && matches!(event, WindowEvent::Focused(false))
             {
-                window.app_handle().exit(0);
+                let just_opened = window
+                    .app_handle()
+                    .state::<DesktopUiState>()
+                    .popover_opened_at
+                    .lock()
+                    .ok()
+                    .and_then(|opened| *opened)
+                    .is_some_and(|opened| opened.elapsed() < REOPEN_SUPPRESS);
+                if !just_opened {
+                    let _ = window.hide();
+                }
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building Headroom desktop app");
 
     app.run(|handle, event| {
-        if matches!(event, tauri::RunEvent::Exit) {
+        if matches!(&event, tauri::RunEvent::Resumed) {
+            request_scheduled_collection(handle, "wake");
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(&event, tauri::RunEvent::Reopen { .. }) {
+            let _ = show_desktop_window(handle, None);
+            request_scheduled_collection(handle, "activation");
+        }
+        if matches!(&event, tauri::RunEvent::Exit) {
+            let _ = save_window_placement(handle);
             stop_desktop_engine(handle);
+            #[cfg(unix)]
+            handle.state::<SingletonState>().cleanup_endpoint();
         }
     });
 }
@@ -1282,6 +3725,26 @@ mod tests {
 
     fn url(raw: &str) -> Url {
         Url::parse(raw).expect("test URL parses")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_singleton_endpoint_cleanup_is_idempotent() {
+        let path = std::env::temp_dir().join(format!(
+            "headroom-singleton-test-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        let _listener = UnixListener::bind(&path).expect("test socket binds");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("test socket permissions update");
+
+        remove_owned_stale_socket(&path).expect("owned test socket is removed");
+        remove_owned_stale_socket(&path).expect("missing test socket is already clean");
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1439,11 +3902,8 @@ mod tests {
     }
 
     #[test]
-    fn desktop_bootstrap_requires_onboarding_capability() {
-        let view = serde_json::json!({
-            "schema": DESKTOP_VIEW_SCHEMA,
-            "accounts": [],
-        });
+    fn desktop_bootstrap_requires_onboarding_and_lifecycle_capabilities() {
+        let view = desktop_startup_view();
         let capabilities = [
             "discover",
             "adopt",
@@ -1451,6 +3911,12 @@ mod tests {
             "claude_login",
             "codex_device_login",
             "onboarding",
+            "account_lifecycle",
+            "reauthentication",
+            "resilient_collection",
+            "validated_settings",
+            "routing_launch",
+            "handoff_health",
         ];
         let compatible = serde_json::json!({
             "product": "headroom",
@@ -1463,7 +3929,7 @@ mod tests {
             "product": "headroom",
             "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
             "runtime": "frozen",
-            "capabilities": capabilities[..5],
+            "capabilities": capabilities[..9],
         });
         assert!(validate_desktop_bootstrap(&incompatible, &view).is_err());
     }
@@ -1476,10 +3942,347 @@ mod tests {
             "bridge_schema": DESKTOP_BRIDGE_SCHEMA
         });
         let view = serde_json::json!({"schema": DESKTOP_VIEW_SCHEMA, "accounts": []});
-        let script = desktop_initialization_script(&handshake, &view);
+        let snapshot = DesktopSnapshot {
+            revision: 7,
+            theme: "terminal".into(),
+            view,
+        };
+        let script = desktop_initialization_script(&handshake, &snapshot, "popover");
         assert!(script.contains("Object.defineProperty"));
         assert!(script.contains("writable:false"));
         assert!(!script.contains("JSON.parse({\"bridge\""));
+    }
+
+    #[test]
+    fn desktop_store_revisions_one_ordered_snapshot_for_both_surfaces() {
+        let store = DesktopStore::default();
+        let first = store
+            .replace_view({
+                let mut view = desktop_startup_view();
+                view["settings"]["theme"] = serde_json::json!("midnight");
+                view["accounts"] = serde_json::json!([
+                    {"name": "codex"}, {"name": "claude"}
+                ]);
+                view
+            })
+            .unwrap();
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.theme, "midnight");
+        assert_eq!(first.view["accounts"][0]["name"], "codex");
+        let themed = store.set_theme("terminal").unwrap();
+        assert_eq!(themed.revision, 2);
+        assert_eq!(themed.theme, "terminal");
+        assert_eq!(themed.view, first.view);
+        let persisted = store
+            .replace_view({
+                let mut view = desktop_startup_view();
+                view["settings"]["theme"] = serde_json::json!("paper");
+                view
+            })
+            .unwrap();
+        assert_eq!(persisted.revision, 3);
+        assert_eq!(persisted.theme, "paper");
+        assert!(store.set_theme("remote-css").is_err());
+    }
+
+    #[test]
+    fn collection_policy_is_bounded_jittered_and_single_schedule_aware() {
+        let started = Instant::now();
+        let mut policy = CollectionPolicy::default();
+        let interval = Duration::from_secs(120);
+        let first = policy.record_failure(started, 0);
+        assert!(first >= Duration::from_secs(4));
+        assert!(first <= Duration::from_secs(6));
+        assert!(!policy.due(started, interval));
+        assert!(policy.due(started + first, interval));
+        for entropy in 1..20 {
+            let delay = policy.record_failure(started, entropy);
+            assert!(delay <= COLLECTION_RETRY_CAP);
+        }
+        policy.record_success(started);
+        assert!(!policy.due(started + interval - Duration::from_secs(1), interval));
+        assert!(policy.due(started + interval, interval));
+    }
+
+    #[test]
+    fn configured_collection_interval_is_bounded() {
+        assert_eq!(
+            configured_refresh_interval(&serde_json::json!({
+                "settings": {"refresh_interval_seconds": 420}
+            })),
+            Duration::from_secs(420)
+        );
+        assert_eq!(
+            configured_refresh_interval(&serde_json::json!({
+                "settings": {"refresh_interval_seconds": 5}
+            })),
+            Duration::from_secs(COLLECTION_INTERVAL_MIN_SECONDS)
+        );
+        assert_eq!(
+            configured_refresh_interval(&serde_json::json!({
+                "settings": {"refresh_interval_seconds": 99_999}
+            })),
+            Duration::from_secs(COLLECTION_INTERVAL_MAX_SECONDS)
+        );
+    }
+
+    #[test]
+    fn login_launch_stays_hidden_except_for_required_operator_action() {
+        assert!(!login_launch_requires_window(
+            &serde_json::json!({"mode": "ready"})
+        ));
+        assert!(!login_launch_requires_window(
+            &serde_json::json!({"mode": "demo"})
+        ));
+        assert!(login_launch_requires_window(
+            &serde_json::json!({"mode": "onboarding"})
+        ));
+        assert!(login_launch_requires_window(
+            &serde_json::json!({"mode": "recovery"})
+        ));
+    }
+
+    #[test]
+    fn repeated_engine_failures_enter_and_leave_bounded_degraded_state() {
+        let started = Instant::now();
+        let mut policy = EngineRecoveryPolicy::default();
+        let first = policy.record_failure(started, 0, "engine_startup_exited");
+        assert!(first >= Duration::from_millis(1600));
+        assert!(first <= Duration::from_millis(2400));
+        assert!(!policy.degraded);
+        assert!(!policy.admits_restart(started));
+        policy.record_failure(started, 1, "engine_startup_timeout");
+        policy.record_failure(started, 2, "engine_unexpected_exit");
+        assert!(policy.degraded);
+        assert_eq!(policy.last_failure_code, Some("engine_unexpected_exit"));
+        assert!(!policy.admits_restart(started));
+        assert!(policy.admits_restart(started + ENGINE_DEGRADED_COOLDOWN));
+        assert!(policy.allow_manual_retry());
+        policy.record_started(started + ENGINE_DEGRADED_COOLDOWN);
+        policy.record_success(started + ENGINE_DEGRADED_COOLDOWN);
+        assert!(!policy.degraded);
+        assert!(policy.admits_restart(started));
+        assert_eq!(policy.crash_times.len(), 3);
+        policy.record_success(started + ENGINE_DEGRADED_COOLDOWN + ENGINE_STABLE_RESET);
+        assert!(policy.crash_times.is_empty());
+        assert!(policy.last_failure_code.is_none());
+    }
+
+    #[test]
+    fn engine_failures_and_startup_shell_use_stable_fail_closed_contracts() {
+        assert_eq!(
+            engine_failure_code("bundled desktop engine startup timed out"),
+            "engine_startup_timeout"
+        );
+        assert_eq!(
+            engine_failure_code("bundled desktop engine stopped during startup"),
+            "engine_startup_exited"
+        );
+        assert_eq!(
+            engine_failure_code("desktop engine stopped unexpectedly"),
+            "engine_exited_mid_request"
+        );
+        assert_eq!(
+            engine_failure_code("desktop engine request timed out"),
+            "engine_request_timeout"
+        );
+        let view = desktop_startup_view();
+        assert!(validate_desktop_view(&view).is_ok());
+        assert_eq!(view["mode"], "recovery");
+        assert_eq!(view["recovery_code"], "engine_starting");
+        assert!(view["accounts"].as_array().unwrap().is_empty());
+        assert_eq!(desktop_startup_handshake()["runtime"], "unavailable");
+    }
+
+    #[test]
+    fn handoff_health_requires_the_exact_bounded_engine_contract() {
+        let valid = desktop_startup_view()["handoff"].clone();
+        assert!(validate_handoff_health(&valid).is_ok());
+        let mut unknown = valid.clone();
+        unknown["pid"] = serde_json::json!(1234);
+        assert!(validate_handoff_health(&unknown).is_err());
+        let mut raw_reason = valid.clone();
+        raw_reason["reason"] = serde_json::json!("provider internals");
+        assert!(validate_handoff_health(&raw_reason).is_err());
+        let mut inconsistent = valid.clone();
+        inconsistent["active_session"] = serde_json::json!(true);
+        inconsistent["state"] = serde_json::json!("configured");
+        assert!(validate_handoff_health(&inconsistent).is_err());
+        inconsistent["code"] = serde_json::json!("awaiting_session_start");
+        inconsistent["action"] = serde_json::json!("wait_for_session");
+        inconsistent["supported"] = serde_json::json!(true);
+        assert!(validate_handoff_health(&inconsistent).is_ok());
+    }
+
+    #[test]
+    fn collection_outcome_distinguishes_capacity_offline_and_auth_holds() {
+        assert!(!collection_enabled(
+            &serde_json::json!({"mode": "onboarding", "accounts": []})
+        ));
+        assert!(collection_enabled(&serde_json::json!({
+            "mode": "ready", "accounts": [{"name": "a"}]
+        })));
+        let current = serde_json::json!({"accounts": [{"state": "current"}]});
+        assert_eq!(collection_view_outcome(&current), (true, false));
+        let offline = serde_json::json!({"accounts": [{
+            "state": "stale", "diagnostic_code": "provider_offline"
+        }]});
+        assert_eq!(collection_view_outcome(&offline), (false, true));
+        let partial = serde_json::json!({"accounts": [
+            {"state": "current"},
+            {"state": "stale", "diagnostic_code": "provider_timeout"}
+        ]});
+        assert_eq!(collection_view_outcome(&partial), (false, false));
+        let malformed = serde_json::json!({"accounts": [{
+            "state": "held", "diagnostic_code": "malformed_provider_response"
+        }]});
+        assert_eq!(collection_view_outcome(&malformed), (false, false));
+        let auth = serde_json::json!({"accounts": [{
+            "state": "held", "diagnostic_code": "provider_auth_rejected"
+        }]});
+        assert_eq!(collection_view_outcome(&auth), (true, false));
+    }
+
+    #[test]
+    fn window_placement_validation_refuses_unsafe_geometry() {
+        let valid = serde_json::json!({
+            "schema": WINDOW_STATE_SCHEMA,
+            "x": -1200,
+            "y": 40,
+            "width": 1800,
+            "height": 1300,
+        });
+        assert_eq!(
+            valid_window_placement(&valid),
+            Some(WindowPlacement {
+                x: -1200,
+                y: 40,
+                width: 1800,
+                height: 1300,
+            })
+        );
+        assert!(valid_window_placement(&serde_json::json!({
+            "schema": WINDOW_STATE_SCHEMA,
+            "x": 0,
+            "y": 0,
+            "width": 120,
+            "height": 80,
+        }))
+        .is_none());
+        assert!(valid_window_placement(&serde_json::json!({
+            "schema": "other",
+            "x": 0,
+            "y": 0,
+            "width": 900,
+            "height": 650,
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn routing_preview_requires_bounded_engine_semantics() {
+        let preview = serde_json::json!({
+            "schema": ROUTING_SCHEMA,
+            "family": "sonnet",
+            "provider": "claude",
+            "selected": {"name": "claude-one", "provider": "claude"},
+            "candidates": [
+                {"name": "claude-one", "provider": "claude", "selected": true,
+                 "eligible": true, "code": "selected",
+                 "explanation": "This is the engine-selected account.",
+                 "action": "copy_or_open"},
+                {"name": "claude-two", "provider": "claude", "selected": false,
+                 "eligible": false, "code": "leased",
+                 "explanation": "Another live launch currently owns this slot.",
+                 "action": "close_other_session"},
+            ],
+            "launch": {"status": "ready", "code": "launch_ready",
+                       "explanation": "The selected account can be launched safely.",
+                       "action": "copy_or_open"},
+        });
+        assert!(validate_routing_preview(&preview).is_ok());
+        let mut arbitrary = preview.clone();
+        arbitrary["command"] = serde_json::json!("rm -rf /");
+        assert!(validate_routing_preview(&arbitrary).is_err());
+        let mut mismatched = preview.clone();
+        mismatched["selected"]["name"] = serde_json::json!("claude-two");
+        assert!(validate_routing_preview(&mismatched).is_err());
+        let mut wrong_provider = preview.clone();
+        wrong_provider["selected"]["provider"] = serde_json::json!("codex");
+        assert!(validate_routing_preview(&wrong_provider).is_err());
+        let mut inconsistent = preview.clone();
+        inconsistent["launch"]["code"] = serde_json::json!("leased");
+        assert!(validate_routing_preview(&inconsistent).is_err());
+        let mut raw_reason = preview;
+        raw_reason["candidates"][1]["raw_reason"] = serde_json::json!("private provider text");
+        assert!(validate_routing_preview(&raw_reason).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_intent_accepts_only_the_bundled_launcher_contract() {
+        let directory = std::env::temp_dir().join(format!(
+            "headroom-launch-intent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("test directory exists");
+        let launcher_path = directory.join("headroom-engine-test");
+        let provider_path = directory.join("claude");
+        for path in [&launcher_path, &provider_path] {
+            fs::write(path, b"#!/bin/sh\nexit 0\n").expect("test executable writes");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("test executable permissions update");
+        }
+        let launcher = vec![
+            launcher_path.to_string_lossy().into_owned(),
+            "--launch-provider".into(),
+            "sonnet".into(),
+            "claude-one".into(),
+        ];
+        let command = launch_command(directory.to_str().unwrap(), &launcher);
+        let intent = serde_json::json!({
+            "schema": LAUNCH_INTENT_SCHEMA,
+            "family": "sonnet",
+            "provider": "claude",
+            "account_name": "claude-one",
+            "preferred_terminal": "terminal",
+            "launcher": launcher,
+            "environment": {
+                "HEADROOM_DIR": directory,
+                "HEADROOM_SLOT_LEASE": "1",
+            },
+            "provider_executable": provider_path,
+            "copy_command": command,
+        });
+        let validated = validate_launch_intent(&intent).expect("intent is valid");
+        assert_eq!(validated.account_name, "claude-one");
+        assert_eq!(validated.family, "sonnet");
+        assert_eq!(validated.provider, "claude");
+
+        let mut shell = intent.clone();
+        shell["launcher"][0] = serde_json::json!("/bin/sh");
+        assert!(validate_launch_intent(&shell).is_err());
+        let mut arbitrary = intent.clone();
+        arbitrary["command"] = serde_json::json!("touch /tmp/owned");
+        assert!(validate_launch_intent(&arbitrary).is_err());
+        let mut extra_environment = intent.clone();
+        extra_environment["environment"]["PATH"] = serde_json::json!("/tmp/evil");
+        assert!(validate_launch_intent(&extra_environment).is_err());
+        let mut wrong_copy = intent;
+        wrong_copy["copy_command"] = serde_json::json!("echo unsafe");
+        assert!(validate_launch_intent(&wrong_copy).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn shell_quote_never_reinterprets_launch_values() {
+        assert_eq!(shell_quote("/safe/path"), "/safe/path");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]

@@ -177,6 +177,20 @@ def quarantine_mark(name, reason):
     return ledger[name]
 
 
+def quarantine_clear(name):
+    """Clear one slot quarantine after a verified re-authentication."""
+    with _quarantine_lock():
+        ledger = _read_quarantine()
+        if ledger is None:
+            raise RuntimeError(
+                "quarantine ledger unreadable — inspect state/quarantine.json")
+        if name not in ledger:
+            return False
+        ledger.pop(name)
+        paths.write_json_atomic(paths.quarantine_path(), ledger)
+        return True
+
+
 def preflight_remove_slot_state():
     """Fail before a registry removal when protective state is unreadable."""
     with _cooldown_lock():
@@ -295,6 +309,39 @@ def _account_leased_by_other(name):
         except OSError as error:
             return error.errno in _LEASE_CONTENDED
         # nobody holds it — release the probe lock immediately
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def slot_lease_active(name):
+    """True when any live process currently holds this slot's lease.
+
+    Account lifecycle mutations use this independently of the caller's
+    ``HEADROOM_SLOT_LEASE`` setting: a compatible CLI may have leasing enabled
+    even when the desktop process does not. Probe errors fail closed so a
+    rename or removal can never strand a live launch behind a new slot name.
+    """
+    if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
+        raise LeaseError("account has no valid name to inspect")
+    if name in _HELD_LEASES:
+        return True
+    try:
+        fd = os.open(_lease_path(name), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise LeaseError(
+            f"cannot inspect slot lease for {name}: {error}") from error
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in _LEASE_CONTENDED:
+                return True
+            raise LeaseError(
+                f"cannot inspect slot lease for {name}: {error}") from error
         fcntl.flock(fd, fcntl.LOCK_UN)
         return False
     finally:
@@ -1103,7 +1150,24 @@ def cmd_exec(fam, command, launch_note="", fallback=False):
         env=original_env)
 
 
-def _exec_routed(fam, command, launch_note=""):
+def cmd_exec_selected(fam, account_name, command, launch_note="desktop"):
+    """Launch exactly the named, currently selected account or refuse.
+
+    Desktop launch intents use this narrow entry point after the user has seen
+    an engine preview. It deliberately cannot fall back or silently switch to
+    another slot: the account shown to the user is the only account that may
+    launch. The normal final binding, capacity, cooldown, quarantine, and lease
+    gates remain authoritative inside ``_exec_routed``.
+    """
+    if not isinstance(account_name, str) \
+            or not registry.NAME_RE.fullmatch(account_name):
+        print("[headroom] desktop launch account is invalid", file=sys.stderr)
+        return 2
+    return _exec_routed(
+        fam, command, launch_note, required_account=account_name)
+
+
+def _exec_routed(fam, command, launch_note="", required_account=None):
     if registry.family_provider(fam) == "codex" and not CODEX_ROUTING_ENABLED:
         # fail-closed: disabled routing means headroom REFUSES to launch a
         # Codex seat it cannot prove capacity for — never "just take the
@@ -1113,22 +1177,39 @@ def _exec_routed(fam, command, launch_note=""):
               "run codex directly with CODEX_HOME=<home> to bypass headroom",
               file=sys.stderr)
         return 2
-    # an explicitly exported config home that names a registered account is
-    # the caller's routing decision — consume it instead of re-routing, as
-    # long as it still has proven headroom
     account = None
-    pinned = env_pinned_account(fam)
-    if pinned is not None:
+    if required_account is not None:
         snapshot = ensure_fresh_snapshot()
-        reason = block_reason(pinned, fam,
-                              _snapshot_accounts(snapshot).get(pinned["name"]),
-                              cooldowns(), time.time())
-        if reason is None:
-            account = pinned
-        else:
-            print(f"[headroom] env-selected account {pinned['name']} is not "
-                  f"routable ({reason}) — picking another", file=sys.stderr)
-    if account is None:
+        account = next((candidate for candidate in registry.ordered_for(fam)
+                        if candidate["name"] == required_account), None)
+        reason = (
+            "account is no longer configured" if account is None else
+            block_reason(
+                account, fam,
+                _snapshot_accounts(snapshot).get(account["name"]),
+                cooldowns(), time.time())
+        )
+        if reason is not None:
+            print(f"[headroom] desktop-selected account {required_account} "
+                  f"is not routable ({reason}) — refusing to switch slots",
+                  file=sys.stderr)
+            return 2
+    else:
+        # an explicitly exported config home that names a registered account
+        # is the caller's routing decision — consume it instead of re-routing,
+        # as long as it still has proven headroom
+        pinned = env_pinned_account(fam)
+        if pinned is not None:
+            snapshot = ensure_fresh_snapshot()
+            reason = block_reason(
+                pinned, fam, _snapshot_accounts(snapshot).get(pinned["name"]),
+                cooldowns(), time.time())
+            if reason is None:
+                account = pinned
+            else:
+                print(f"[headroom] env-selected account {pinned['name']} is not "
+                      f"routable ({reason}) — picking another", file=sys.stderr)
+    if account is None and required_account is None:
         account = pick(fam)
         if account is None:
             print(f"[headroom] no account for '{fam}' has proven headroom; "
@@ -1158,6 +1239,11 @@ def _exec_routed(fam, command, launch_note=""):
     # explicit opt-in to "run something over nothing").
     try:
         if not acquire_slot_lease(account, fam):
+            if required_account is not None:
+                print(f"[headroom] desktop-selected account {account['name']} "
+                      "is leased by another live launch — refusing to switch "
+                      "slots", file=sys.stderr)
+                return 2
             print(f"[headroom] {account['name']} is leased by another live "
                   f"launch — picking another", file=sys.stderr)
             account = pick(fam)

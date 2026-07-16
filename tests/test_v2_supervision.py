@@ -30,7 +30,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
-    __main__, notify, paths, registry, route, supervisor,
+    __main__, handoff, notify, paths, registry, route, supervisor,
 )
 
 IDENTITY = {"account_fingerprint": "AAAA", "credential_digest": "BBBB"}
@@ -106,11 +106,19 @@ class CapsProbe(TempDirCase):
         self.assertEqual(payload["schema"], 2)
         self.assertEqual(payload["launch_marker"],
                          {"claude": True, "codex": True})
+        self.assertEqual(payload["auto_handoff"],
+                         {"claude": True, "codex": False, "health": True})
         self.assertEqual(payload["launch_fallback"],
                          {"claude": True, "codex": True, "run": False})
         self.assertIs(payload["notify_cmd"], True)
         self.assertEqual(payload["slot_lease"], {
             "claude": True, "codex": True, "run": False, "fail_closed": True})
+
+    def test_handoff_health_capability_fails_closed_when_projection_is_missing(self):
+        with mock.patch.object(notify, "read_health_events", None):
+            payload = __main__.capability_contract()
+        self.assertTrue(payload["auto_handoff"]["claude"])
+        self.assertFalse(payload["auto_handoff"]["health"])
 
 
 # --------------------------------------------------------------------------
@@ -129,6 +137,54 @@ class NotifyDelivery(TempDirCase):
 
     def test_unset_env_is_a_silent_no_op(self):
         self.assertFalse(notify.emit({"event": "launch"}))
+
+    def test_supervision_health_is_recorded_without_an_external_observer(self):
+        event = {
+            "event": "supervision_lost", "account": "acct-a",
+            "model": "sonnet",
+            "supervisor_id": "11111111-1111-4111-8111-111111111111",
+            "code": "loop_guard", "reason": "private implementation detail",
+        }
+        self.assertFalse(notify.emit(event))
+        history = notify.read_health_events()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["state"], "loop_guard")
+        self.assertEqual(history[0]["code"], "loop_guard")
+        self.assertNotIn("reason", history[0])
+        self.assertNotIn("private implementation detail", json.dumps(history))
+        for filename in ("supervision-events.json", "supervision-events.lock"):
+            path = os.path.join(paths.state_dir(), filename)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_supervision_health_is_bounded_and_strict(self):
+        for _ in range(notify.HEALTH_EVENT_LIMIT + 3):
+            notify.emit({"event": "supervision_ended", "account": "acct-a",
+                         "model": "sonnet"})
+        self.assertEqual(len(notify.read_health_events()),
+                         notify.HEALTH_EVENT_LIMIT)
+        paths.write_json_atomic(notify._health_path(), {
+            "schema": notify.HEALTH_SCHEMA,
+            "events": [{"schema": notify.HEALTH_EVENT_SCHEMA}],
+        })
+        with self.assertRaisesRegex(RuntimeError, "unreadable"):
+            notify.read_health_events()
+
+    def test_supervision_health_never_follows_a_symlink(self):
+        paths.ensure_private(paths.state_dir())
+        outside = os.path.join(self.temp.name, "outside.json")
+        with open(outside, "w", encoding="utf-8") as handle:
+            json.dump({"schema": notify.HEALTH_SCHEMA, "events": []}, handle)
+        os.symlink(outside, notify._health_path())
+        with self.assertRaisesRegex(RuntimeError, "unreadable"):
+            notify.read_health_events()
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(notify.emit({
+                "event": "supervision_ended", "account": "acct-a",
+                "model": "sonnet",
+            }))
+        with open(outside, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {
+                "schema": notify.HEALTH_SCHEMA, "events": []})
 
     def test_event_is_delivered_as_a_single_json_argument(self):
         script, out = self.notify_script()
@@ -688,6 +744,36 @@ class NotifyWiring(TempDirCase):
         self.assertIn("SessionStart hook never bound", events[1]["reason"])
         self.assertFalse(child.automation)
 
+    def test_authoritative_loop_guard_emits_a_stable_health_code(self):
+        account = self.account()
+        polls = iter([None, 0])
+        process = mock.Mock(pid=os.getpid())
+        process.poll.side_effect = lambda: next(polls)
+        event_path = os.path.join(
+            self.temp.name, "11111111-1111-4111-8111-111111111111.jsonl")
+        child = supervisor.Child(
+            process, account, 1, event_path, "", 1.0, True,
+            binding=supervisor.Binding(
+                "22222222-2222-4222-8222-222222222222", "/tmp/t.jsonl",
+                "/tmp", "Sonnet", "2", account["home"]),
+            model="sonnet")
+        runner = supervisor.Supervisor(
+            "sonnet", [], account, sleep=lambda _seconds: None)
+        proofs = iter([object(), None])
+        with mock.patch.object(runner, "_handle_events",
+                               side_effect=lambda *_args: next(proofs)), \
+                mock.patch.object(
+                    runner, "_preflight",
+                    side_effect=handoff.HandoffLoopGuardError("loop guard")), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(runner._monitor(child), 0)
+        events = [call.args[0] for call in emit.call_args_list]
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertEqual(events[0]["code"], "loop_guard")
+        self.assertFalse(child.automation)
+
 
 # --------------------------------------------------------------------------
 # P1-6: the session-end-without-replacement disarm routes through the helper
@@ -894,6 +980,75 @@ class SlotLease(TempDirCase):
         execute.assert_called_once()
         self.assertEqual(selected, account_b["home"])
         self.assertEqual(route.held_lease_names(), ["acct-b"])
+
+    def test_desktop_selected_exec_launches_only_the_named_account(self):
+        account_a, account_b = self.account("acct-a"), self.account("acct-b")
+        snapshot = {"generated": time.time(), "accounts": []}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=[account_a, account_b]), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "acquire_slot_lease",
+                                  return_value=True) as acquire, \
+                mock.patch.object(route, "pick") as pick, \
+                mock.patch.object(route, "write_launch_marker",
+                                  return_value=True), \
+                mock.patch.object(route.notify, "emit"), \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()):
+            code = route.cmd_exec_selected(
+                "sonnet", "acct-b", ["/fixture/claude"],
+                launch_note="desktop launch intent")
+        self.assertEqual(code, 0)
+        pick.assert_not_called()
+        acquire.assert_called_once_with(account_b, "sonnet")
+        execute.assert_called_once_with("/fixture/claude", ["/fixture/claude"])
+        self.assertEqual(os.environ.get("CLAUDE_CONFIG_DIR"), account_b["home"])
+
+    def test_desktop_selected_exec_refuses_if_account_becomes_blocked(self):
+        account_a, account_b = self.account("acct-a"), self.account("acct-b")
+        snapshot = {"generated": time.time(), "accounts": []}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=[account_a, account_b]), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason",
+                                  return_value="cooldown until later"), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "acquire_slot_lease") as acquire, \
+                mock.patch.object(route, "pick") as pick, \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = route.cmd_exec_selected(
+                "sonnet", "acct-a", ["/fixture/claude"])
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to switch slots", errors.getvalue())
+        pick.assert_not_called()
+        acquire.assert_not_called()
+        execute.assert_not_called()
+
+    def test_desktop_selected_exec_never_repicks_after_lost_lease_race(self):
+        account_a = self.account("acct-a")
+        snapshot = {"generated": time.time(), "accounts": []}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=[account_a]), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "acquire_slot_lease",
+                                  return_value=False), \
+                mock.patch.object(route, "pick") as pick, \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = route.cmd_exec_selected(
+                "sonnet", "acct-a", ["/fixture/claude"])
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to switch slots", errors.getvalue())
+        pick.assert_not_called()
+        execute.assert_not_called()
 
     def test_cmd_exec_fails_closed_on_lease_infrastructure_error(self):
         # P1-9: LeaseError -> refuse (exit 2), never launch unleased
