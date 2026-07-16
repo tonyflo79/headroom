@@ -3,28 +3,31 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>headroom</title>
+    <meta name="color-scheme" content="dark" />
+    <title>Headroom</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <main class="card" data-state="probing">
-      <div class="mark" aria-hidden="true">
-        <span class="battery"><span class="battery-fill"></span></span>
-      </div>
-      <h1>headroom</h1>
+    <main class="shell" aria-labelledby="page-title">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">Desktop tracer</p>
+          <h1 id="page-title">Headroom</h1>
+          <p id="summary" class="summary" aria-live="polite">Starting the bundled engine…</p>
+        </div>
+        <span id="engine-badge" class="badge">connecting</span>
+      </header>
 
-      <p class="status status-probing">connecting to the widget server&hellip;</p>
+      <section class="fleet" aria-labelledby="fleet-title">
+        <div class="section-heading">
+          <h2 id="fleet-title">AI fleet</h2>
+          <p id="headline">Waiting for a sanitized snapshot</p>
+        </div>
+        <div id="accounts" class="accounts" aria-live="polite"></div>
+      </section>
 
-      <div class="status status-down">
-        <p class="headline">server unreachable &mdash; is the tunnel up?</p>
-        <p class="detail">
-          couldn&rsquo;t reach <code id="widget-url">http://127.0.0.1:8377/widget</code>
-        </p>
-        <pre class="hint">ssh -N -L 8377:127.0.0.1:8377 &lt;headroom-host&gt;</pre>
-        <button id="retry" type="button">Retry</button>
-        <p class="auto">retrying automatically&hellip;</p>
-      </div>
+      <footer>Bundled engine · private bridge · no localhost server</footer>
     </main>
-    <script src="main.js"></script>
+    <script type="module" src="main.js"></script>
   </body>
 </html>

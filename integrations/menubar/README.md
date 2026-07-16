@@ -1,116 +1,107 @@
-# headroom menubar — native click-down popover
+# Headroom desktop application
 
-A tiny [Tauri v2](https://v2.tauri.app) menu-bar (macOS) / system-tray
-(Windows) app that shows headroom's liquid-glass `/widget` page as a real
-click-down panel — the thing a SwiftBar text menu can't do.
+This directory contains Headroom's self-contained Tauri desktop application.
+The first desktop tracer is intentionally narrow: an unsigned macOS app starts
+an architecture-specific bundled engine and renders a deterministic, sanitized
+two-account snapshot in a normal native window. It does not require
+`headroom serve`, a browser, a localhost URL, or a system Python installation.
 
-- **Left-click** the tray icon: toggle a frameless, always-on-top 360×640
-  panel anchored at the icon (below it on macOS, above the taskbar tray on
-  Windows). Clicking anywhere else hides it, like a native popover.
-- **Right-click**: menu with **Refresh**, **Open in Browser**, **Quit**.
-- The tray icon is a little head that fills like a battery: the level is the
-  fleet's average 5h battery (current windows contribute their level, limited
-  ones an honest 0), redrawn every minute from the server's `/widget.json`
-  (a dash means no live reading).
-- No Dock icon / app-switcher entry on macOS (accessory activation policy +
-  `LSUIElement`).
-- If the widget server can't be reached (tunnel down), the panel shows a
-  small glass fallback card — "server unreachable — is the tunnel up?" —
-  with a Retry button, and auto-recovers within ~3 s of the server coming
-  back.
+This is an implementation tracer, not a production release. Account setup,
+live collection, menu-bar behavior, signing, notarization, updates, and release
+distribution are delivered by the follow-on desktop issues linked from
+[the desktop PRD](https://github.com/tonyflo79/headroom/issues/1).
 
-## Security model
+## Runtime boundary
 
-This app is a **viewer, not a data path**:
+```text
+Headroom.app
+  Tauri/Rust process
+    stdin/stdout JSON-lines bridge
+      bundled headroom-engine (PyInstaller, Python 3.13)
+    embedded HTML/CSS/JavaScript dashboard
+```
 
-- The webview only ever loads **loopback** URLs. `HEADROOM_WIDGET_URL` is
-  validated at startup (must be `http://` + `127.0.0.0/8`, `::1`, or
-  `localhost`); anything else is rejected and the default is used.
-- A Rust-side `on_navigation` allowlist additionally blocks every navigation
-  that is not the bundled fallback page or a loopback `http://` URL — even a
-  link inside the page can't take the webview off-loopback.
-- The page gets **no Tauri IPC**: no capabilities are granted, `withGlobalTauri`
-  is off, and the app defines no commands.
-- The app never reads headroom auth, tokens, or account state. It renders a
-  page your local server already serves — nothing more.
-- No telemetry, no network calls other than the loopback reachability probe,
-  the webview page load itself, and a loopback read of the same server's
-  `/widget.json` to draw the tray icon's battery level (same numeric-loopback
-  socket discipline as the probe; the feed is already the public projection).
+- Rust starts `headroom-engine` as a Tauri sidecar and owns its lifecycle.
+- Startup has a 12-second bound and requires the exact
+  `headroom_desktop_bridge@1` schema, frozen runtime, and required capability.
+- Engine stdout is protocol-only. Imported or child-process output is diverted
+  to stderr and Rust never logs its contents.
+- Only the existing sanitized `headroom_widget@1` projection crosses the
+  bridge. Raw credentials and provider payloads do not.
+- The webview can navigate only to its embedded app document or `about:blank`.
+- The tracer opens no HTTP listener and grants the page no Tauri command API.
 
-## Prerequisites
+## Supported development target
 
-- [Rust](https://rustup.rs) (1.88+; stable toolchain — the pinned Cargo.lock needs 1.88)
-- Tauri CLI: `cargo install tauri-cli --version "^2" --locked`
-- **macOS**: Xcode Command Line Tools (`xcode-select --install`)
-- **Windows**: [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-  and the [WebView2 runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
-  (preinstalled on Windows 11)
-- **Linux** (untested, should work): `webkit2gtk-4.1`, `libayatana-appindicator3`
-  dev packages
+- macOS 13 or newer
+- Apple Silicon or Intel, built natively on each architecture
+- Rust 1.88
+- Python 3.13, provisioned by `uv` and frozen into the sidecar
+- PyInstaller 6.21.0
+- Tauri CLI 2.11.4
 
-## Build & run
+The bundled runtime pins are the supported engine matrix for this tracer. The
+repository's broader Python test suite also runs on Linux in CI. Some inherited
+macOS-only tests compare `/var` with its canonical `/private/var` path and are
+not used as the desktop runtime gate.
+
+## Build and run
+
+From the repository root:
+
+```sh
+# Build and smoke-test the architecture-specific frozen engine.
+scripts/build-desktop-sidecar.sh
+
+# Install the pinned packager once if needed.
+cargo install tauri-cli --version 2.11.4 --locked
+
+# Build an unsigned development app.
+cd integrations/menubar
+cargo tauri build --bundles app
+
+# Launch it.
+open src-tauri/target/release/bundle/macos/Headroom.app
+```
+
+The app is written to
+`src-tauri/target/release/bundle/macos/Headroom.app`. Because this tracer is
+unsigned and unnotarized, it is for local development only.
+
+For a faster edit-run loop, build the sidecar first and run:
 
 ```sh
 cd integrations/menubar
-
-# development (uses the bundled assets; no frontend dev server needed)
 cargo tauri dev
-
-# release bundle
-cargo tauri build
 ```
 
-Artifacts land under `src-tauri/target/release/bundle/`:
-`macos/Headroom.app` (+ `dmg/`) on macOS, `nsis/*-setup.exe` on Windows.
+## Verification
 
-Move `Headroom.app` to `/Applications` and launch it — the battery glyph
-appears in the menu bar.
-
-## Configuration
-
-| Env var              | Default                          | Meaning                                  |
-| -------------------- | -------------------------------- | ---------------------------------------- |
-| `HEADROOM_WIDGET_URL`| `http://127.0.0.1:8377/widget`   | Widget page URL (**loopback only**)      |
-
-If the fleet's dashboard runs on another machine, bring it to loopback with
-an SSH tunnel (this is the assumed setup):
+From the repository root:
 
 ```sh
-ssh -N -L 8377:127.0.0.1:8377 user@headroom-host
+uv run --python 3.13 python -m unittest tests.test_desktop_bridge
+npm --prefix integrations/menubar test
+cargo fmt --check --manifest-path integrations/menubar/src-tauri/Cargo.toml
+cargo test --locked --manifest-path integrations/menubar/src-tauri/Cargo.toml
 ```
 
-For a GUI app on macOS, per-shell exports don't apply; set the variable for
-launchd-spawned apps if you need a non-default URL:
+After launching the packaged app, verify it owns no listener:
 
 ```sh
-launchctl setenv HEADROOM_WIDGET_URL http://127.0.0.1:8377/widget
+APP_PID="$(pgrep -n -f 'Headroom.app/Contents/MacOS/headroom-menubar')"
+lsof -nP -a -p "$APP_PID" -iTCP -sTCP:LISTEN
 ```
 
-## Autostart at login
+No output is expected. The bundled engine appears beneath the app in the
+process tree as `Headroom.app/Contents/MacOS/headroom-engine`, never as a
+system `python` process. Quitting Headroom must remove both processes.
 
-- **macOS**: System Settings → General → Login Items → add `Headroom.app`.
-- **Windows**: press `Win+R`, run `shell:startup`, drop a shortcut to
-  `Headroom.exe` there.
+## Current limitations
 
-## Behavior details
-
-- The panel window is created hidden at startup and warmed with the widget
-  page, so the first click is instant.
-- Reachability is probed Rust-side (a real HTTP `HEAD`, not just a TCP
-  connect — an `ssh -L` listener accepts even when its remote side is dead).
-- While the fallback card is visible, a watcher re-probes every 3 s and swaps
-  the widget page back in as soon as the server responds.
-- Clicking the tray icon while the panel is open closes it (the focus-loss
-  hide and the click toggle are debounced so it doesn't instantly reopen).
-
-## Troubleshooting
-
-- **Blank/old panel after sleep or tunnel restart** — right-click → Refresh.
-- **Icon not visible on macOS** — the menu bar may be full (notch); menu-bar
-  managers like Bartender/Ice can hide new items.
-- **Panel opens on the wrong monitor edge (Windows)** — the panel anchors to
-  the tray icon's reported position; with auto-hidden taskbars, unhide the
-  taskbar once so the position updates.
-- **`cargo tauri dev` shows the fallback card** — the widget server isn't
-  reachable on the configured URL; start `headroom serve` or the SSH tunnel.
+- The dashboard uses deterministic fixture accounts, not installed accounts.
+- The app is macOS-only and is built for the runner's native architecture.
+- There is no menu-bar popover, account management, launch-at-login, updater,
+  recovery UI, diagnostics export, signing, or notarization yet.
+- The old loopback popover helpers remain in Rust for their security tests but
+  are not called by the desktop tracer.

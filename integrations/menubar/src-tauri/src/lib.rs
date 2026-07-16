@@ -1,21 +1,12 @@
-//! headroom menu-bar / system-tray popover.
+//! Headroom desktop shell.
 //!
-//! A tray icon that toggles a frameless, always-on-top panel anchored under
-//! (macOS) or above (Windows) the tray icon. The panel is a plain webview
-//! pointed at the locally served liquid-glass widget page
-//! (`http://127.0.0.1:8377/widget` by default, `HEADROOM_WIDGET_URL` to
-//! override — loopback only, enforced).
-//!
-//! Security model: this app is a *viewer*, not a data path. It never reads
-//! auth or credentials, exposes no IPC to the page (no capabilities), and the
-//! webview is only ever allowed to navigate to the bundled fallback page,
-//! `about:blank`, or the ONE configured widget document — everything else,
-//! other loopback origins and paths included, is blocked in `on_navigation`.
-//! A `localhost` override is pinned to `127.0.0.1` at startup, so neither the
-//! probe nor any navigation ever consults the OS resolver (a poisoned hosts
-//! file or DNS entry cannot redirect the panel to a public IP), and
-//! `window.open` is neutered with a non-configurable stub before any page
-//! runs.
+//! The default app is a self-contained native window. It starts the bundled
+//! Headroom engine as a sidecar, performs a versioned JSON-lines handshake,
+//! injects a sanitized fixture snapshot before page scripts run, and never
+//! opens an HTTP listener. The legacy loopback viewer helpers remain in this
+//! module while the later menu-bar slice is migrated onto the same bridge.
+
+#![allow(dead_code)] // Removed when the legacy popover helpers move onto the bridge.
 
 use std::{
     io::{Read, Write},
@@ -35,6 +26,10 @@ use tauri::{
     AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
+use tauri_plugin_shell::{
+    process::{CommandChild, CommandEvent},
+    ShellExt,
+};
 
 mod icon;
 
@@ -70,6 +65,17 @@ const FEED_MAX_BYTES: usize = 256 * 1024;
 /// Wall-clock bound for one whole feed exchange — a drip-feeding endpoint
 /// must not hold a worker thread open indefinitely.
 const FEED_DEADLINE: Duration = Duration::from_secs(6);
+
+const DESKTOP_WINDOW_LABEL: &str = "main";
+const DESKTOP_BRIDGE_SCHEMA: &str = "headroom_desktop_bridge@1";
+const DESKTOP_SNAPSHOT_SCHEMA: &str = "headroom_widget@1";
+const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
+const MAX_BRIDGE_FRAME_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct DesktopEngine {
+    child: Mutex<Option<CommandChild>>,
+}
 
 struct AppState {
     /// Validated loopback widget URL. Never changes after startup.
@@ -262,9 +268,8 @@ fn fetch_loopback(url: &Url, path: &str) -> Option<String> {
     } else {
         format!("{host}:{port}")
     };
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n"
-    );
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).ok()?;
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -281,8 +286,9 @@ fn fetch_loopback(url: &Url, path: &str) -> Option<String> {
                 }
             }
             // a 1s read timeout loops back to the deadline check above
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-                || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => return None,
         }
     }
@@ -542,8 +548,8 @@ fn anchor_below_tray(window: &WebviewWindow, app: &AppHandle) -> bool {
     let (tray_w, tray_h) = to_logical_size(rect.size);
     let mut x = tray_x + tray_w - WINDOW_WIDTH; // right edges aligned
     let y = tray_y + tray_h + 5.0; // just below the menu bar
-    // clamp against the monitor that CONTAINS the tray icon — the hidden
-    // window's current monitor may be a different display entirely
+                                   // clamp against the monitor that CONTAINS the tray icon — the hidden
+                                   // window's current monitor may be a different display entirely
     let monitor = monitor_containing(window, tray_x, tray_y)
         .or_else(|| window.current_monitor().ok().flatten());
     if let Some(monitor) = monitor {
@@ -561,11 +567,7 @@ fn anchor_below_tray(window: &WebviewWindow, app: &AppHandle) -> bool {
 
 /// The monitor whose logical bounds contain the given point, if any.
 #[cfg(target_os = "macos")]
-fn monitor_containing(
-    window: &WebviewWindow,
-    x: f64,
-    y: f64,
-) -> Option<tauri::Monitor> {
+fn monitor_containing(window: &WebviewWindow, x: f64, y: f64) -> Option<tauri::Monitor> {
     for monitor in window.available_monitors().ok()? {
         let scale = monitor.scale_factor();
         let position = monitor.position().to_logical::<f64>(scale);
@@ -630,31 +632,32 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
         css = js_string_literal(embed_css)
     );
     let navigation_widget = widget_url.clone();
-    let builder = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-        .title("headroom")
-        .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
-        .visible(false)
-        .decorations(false)
-        .resizable(false)
-        .maximizable(false)
-        .minimizable(false)
-        .closable(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .visible_on_all_workspaces(true)
-        .transparent(true);
+    let builder =
+        WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+            .title("headroom")
+            .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+            .visible(false)
+            .decorations(false)
+            .resizable(false)
+            .maximizable(false)
+            .minimizable(false)
+            .closable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .visible_on_all_workspaces(true)
+            .transparent(true);
     // The system's adaptive popover material provides the standard dropdown
     // background; the page paints nothing over it. Dark theme pinned so the
     // widget's ink colors always sit on the dark material.
     #[cfg(target_os = "macos")]
-    let builder = builder
-        .theme(Some(tauri::Theme::Dark))
-        .effects(tauri::utils::config::WindowEffectsConfig {
+    let builder = builder.theme(Some(tauri::Theme::Dark)).effects(
+        tauri::utils::config::WindowEffectsConfig {
             effects: vec![tauri::utils::WindowEffect::Popover],
             state: Some(tauri::utils::WindowEffectState::Active),
             radius: Some(PANEL_RADIUS),
             color: None,
-        });
+        },
+    );
     builder
         .initialization_script(&init_script)
         .on_navigation(move |url| {
@@ -777,80 +780,244 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-pub fn run() {
-    let widget_url = resolve_widget_url();
+fn bridge_request(id: &str, command: &str, args: serde_json::Value) -> Vec<u8> {
+    let request = serde_json::json!({
+        "schema": DESKTOP_BRIDGE_SCHEMA,
+        "id": id,
+        "command": command,
+        "args": args,
+    });
+    let mut frame = serde_json::to_vec(&request).expect("static bridge request serializes");
+    frame.push(b'\n');
+    frame
+}
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_positioner::init())
-        .manage(AppState {
-            widget_url: widget_url.clone(),
-            widget_loaded: AtomicBool::new(false),
-            last_probe_ok: AtomicBool::new(false),
-            last_auto_hide: Mutex::new(None),
-            last_tray_rect: Mutex::new(None),
-        })
-        .setup(move |app| {
-            // Menu-bar app: no Dock icon / app switcher entry on macOS.
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+fn parse_bridge_response(frame: &[u8], expected_id: &str) -> Result<serde_json::Value, String> {
+    if frame.len() > MAX_BRIDGE_FRAME_BYTES {
+        return Err("desktop engine returned an oversized response".into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(frame)
+        .map_err(|_| "desktop engine returned an invalid response".to_string())?;
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_BRIDGE_SCHEMA)
+        || value.get("id").and_then(serde_json::Value::as_str) != Some(expected_id)
+    {
+        return Err("desktop engine returned an incompatible response".into());
+    }
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        let code = value
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown_error");
+        return Err(format!("desktop engine rejected request ({code})"));
+    }
+    value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "desktop engine response is missing its result".to_string())
+}
 
-            let handle = app.handle();
-            build_popover(handle, &widget_url)?;
-            #[cfg(target_os = "macos")]
-            if let Some(window) = handle.get_webview_window(WINDOW_LABEL) {
-                round_window_corners(&window, PANEL_RADIUS);
-            }
-            build_tray(handle)?;
+fn validate_desktop_bootstrap(
+    handshake: &serde_json::Value,
+    snapshot: &serde_json::Value,
+) -> Result<(), String> {
+    if handshake.get("product").and_then(serde_json::Value::as_str) != Some("headroom")
+        || handshake
+            .get("bridge_schema")
+            .and_then(serde_json::Value::as_str)
+            != Some(DESKTOP_BRIDGE_SCHEMA)
+        || handshake.get("runtime").and_then(serde_json::Value::as_str) != Some("frozen")
+    {
+        return Err("bundled desktop engine is incompatible".into());
+    }
+    let supports_fixture = handshake
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value == "fixture_snapshot"));
+    if !supports_fixture {
+        return Err("bundled desktop engine lacks the required capability".into());
+    }
+    if snapshot.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_SNAPSHOT_SCHEMA)
+        || !snapshot
+            .get("accounts")
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return Err("bundled desktop engine returned an invalid snapshot".into());
+    }
+    Ok(())
+}
 
-            // Warm the view so the first click shows content instantly, then
-            // keep retrying in the background while the fallback is visible.
-            sync_view_async(handle, false);
-            let watcher = handle.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(RETRY_INTERVAL);
-                let Some(window) = watcher.get_webview_window(WINDOW_LABEL) else {
-                    continue;
+fn bootstrap_sidecar(
+    app: &AppHandle,
+) -> Result<(serde_json::Value, serde_json::Value, CommandChild), String> {
+    let command = app
+        .shell()
+        .sidecar("headroom-engine")
+        .map_err(|_| "bundled desktop engine could not be resolved".to_string())?;
+    let (mut events, mut child) = command
+        .spawn()
+        .map_err(|_| "bundled desktop engine could not be started".to_string())?;
+    if child
+        .write(&bridge_request(
+            "startup-handshake",
+            "handshake",
+            serde_json::json!({"accepted_schemas": [DESKTOP_BRIDGE_SCHEMA]}),
+        ))
+        .is_err()
+    {
+        let _ = child.kill();
+        return Err("bundled desktop engine did not accept the handshake".into());
+    }
+    if child
+        .write(&bridge_request(
+            "startup-snapshot",
+            "fixture_snapshot",
+            serde_json::json!({}),
+        ))
+        .is_err()
+    {
+        let _ = child.kill();
+        return Err("bundled desktop engine did not accept the snapshot request".into());
+    }
+
+    let deadline = Instant::now() + SIDECAR_STARTUP_TIMEOUT;
+    let mut handshake = None;
+    let mut snapshot = None;
+    while handshake.is_none() || snapshot.is_none() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            let _ = child.kill();
+            return Err("bundled desktop engine startup timed out".into());
+        };
+        let next = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(remaining, events.recv()).await
+        });
+        match next {
+            Ok(Some(CommandEvent::Stdout(frame))) => {
+                let parsed = if handshake.is_none() {
+                    parse_bridge_response(&frame, "startup-handshake")
+                } else {
+                    parse_bridge_response(&frame, "startup-snapshot")
                 };
-                let state = watcher.state::<AppState>();
-                let visible = window.is_visible().unwrap_or(false);
-                if visible && !state.widget_loaded.load(Ordering::SeqCst) {
-                    sync_view(&watcher, false);
+                match parsed {
+                    Ok(value) if handshake.is_none() => handshake = Some(value),
+                    Ok(value) => snapshot = Some(value),
+                    Err(error) => {
+                        let _ = child.kill();
+                        return Err(error);
+                    }
                 }
-            });
-            // Keep the tray icon's battery level current (worker thread —
-            // the feed read is a blocking loopback fetch).
-            let icon_watcher = handle.clone();
-            std::thread::spawn(move || loop {
-                update_tray_icon(&icon_watcher);
-                std::thread::sleep(ICON_INTERVAL);
-            });
+            }
+            Ok(Some(CommandEvent::Stderr(bytes))) => {
+                // stderr may eventually include provider output. Record only
+                // its size so credentials or account details cannot leak.
+                eprintln!(
+                    "headroom-desktop: engine diagnostic ({} bytes)",
+                    bytes.len()
+                );
+            }
+            Ok(Some(CommandEvent::Terminated(_))) | Ok(None) => {
+                return Err("bundled desktop engine stopped during startup".into());
+            }
+            Ok(Some(CommandEvent::Error(_))) => {
+                let _ = child.kill();
+                return Err("bundled desktop engine communication failed".into());
+            }
+            Ok(Some(_)) => {}
+            Err(_) => {
+                let _ = child.kill();
+                return Err("bundled desktop engine startup timed out".into());
+            }
+        }
+    }
+
+    let handshake = handshake.expect("startup loop collected handshake");
+    let snapshot = snapshot.expect("startup loop collected snapshot");
+    if let Err(error) = validate_desktop_bootstrap(&handshake, &snapshot) {
+        let _ = child.kill();
+        return Err(error);
+    }
+    Ok((handshake, snapshot, child))
+}
+
+fn desktop_initialization_script(
+    handshake: &serde_json::Value,
+    snapshot: &serde_json::Value,
+) -> String {
+    let payload = serde_json::json!({"bridge": handshake, "snapshot": snapshot});
+    let payload_json = serde_json::to_string(&payload).expect("desktop bootstrap serializes");
+    let payload_literal = serde_json::to_string(&payload_json).expect("JSON string serializes");
+    format!(
+        "Object.defineProperty(window,'__HEADROOM_BOOTSTRAP__',{{value:JSON.parse({payload_literal}),writable:false,configurable:false}});"
+    )
+}
+
+fn build_desktop_window(
+    app: &AppHandle,
+    handshake: &serde_json::Value,
+    snapshot: &serde_json::Value,
+) -> tauri::Result<WebviewWindow> {
+    let script = desktop_initialization_script(handshake, snapshot);
+    WebviewWindowBuilder::new(
+        app,
+        DESKTOP_WINDOW_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("Headroom")
+    .inner_size(900.0, 650.0)
+    .min_inner_size(680.0, 480.0)
+    .resizable(true)
+    .visible(true)
+    .initialization_script(&script)
+    .on_navigation(|url| url.as_str() == "about:blank" || is_bundled_page(url))
+    .build()
+}
+
+fn stop_desktop_engine(app: &AppHandle) {
+    let Some(mut child) = app
+        .state::<DesktopEngine>()
+        .child
+        .lock()
+        .expect("desktop engine mutex poisoned")
+        .take()
+    else {
+        return;
+    };
+    let _ = child.write(&bridge_request(
+        "desktop-shutdown",
+        "shutdown",
+        serde_json::json!({}),
+    ));
+    let _ = child.kill();
+}
+
+pub fn run() {
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .manage(DesktopEngine::default())
+        .setup(|app| {
+            let (handshake, snapshot, child) =
+                bootstrap_sidecar(app.handle()).map_err(std::io::Error::other)?;
+            *app.state::<DesktopEngine>()
+                .child
+                .lock()
+                .expect("desktop engine mutex poisoned") = Some(child);
+            build_desktop_window(app.handle(), &handshake, &snapshot)?;
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() != WINDOW_LABEL {
-                return;
-            }
-            match event {
-                // Native popover behaviour: clicking away hides the panel.
-                WindowEvent::Focused(false) => {
-                    let _ = window.hide();
-                    let state = window.app_handle().state::<AppState>();
-                    *state
-                        .last_auto_hide
-                        .lock()
-                        .expect("last_auto_hide poisoned") = Some(Instant::now());
-                }
-                // No visible close button, but if a close ever arrives
-                // (Cmd+W, taskbar), hide instead of destroying the window.
-                WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
-                _ => {}
+            if window.label() == DESKTOP_WINDOW_LABEL
+                && matches!(event, WindowEvent::CloseRequested { .. })
+            {
+                window.app_handle().exit(0);
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running headroom menubar app");
+        .build(tauri::generate_context!())
+        .expect("error while building Headroom desktop app");
+
+    app.run(|handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            stop_desktop_engine(handle);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -989,5 +1156,43 @@ mod tests {
             js_string_literal("a\"b\\c\n<script>"),
             "\"a\\\"b\\\\c\\n\\u003cscript>\""
         );
+    }
+
+    #[test]
+    fn desktop_bridge_response_requires_schema_id_and_success() {
+        let valid = serde_json::json!({
+            "schema": DESKTOP_BRIDGE_SCHEMA,
+            "id": "startup-handshake",
+            "ok": true,
+            "result": {"product": "headroom"}
+        });
+        assert_eq!(
+            parse_bridge_response(
+                serde_json::to_string(&valid).unwrap().as_bytes(),
+                "startup-handshake"
+            )
+            .unwrap()["product"],
+            "headroom"
+        );
+        assert!(parse_bridge_response(b"not json", "startup-handshake").is_err());
+        assert!(parse_bridge_response(
+            br#"{"schema":"headroom_desktop_bridge@1","id":"wrong","ok":true,"result":{}}"#,
+            "startup-handshake"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn desktop_bootstrap_script_uses_a_json_string_literal() {
+        let handshake = serde_json::json!({
+            "product": "headroom",
+            "product_version": "0.4.0</script><script>bad()</script>",
+            "bridge_schema": DESKTOP_BRIDGE_SCHEMA
+        });
+        let snapshot = serde_json::json!({"schema": DESKTOP_SNAPSHOT_SCHEMA, "accounts": []});
+        let script = desktop_initialization_script(&handshake, &snapshot);
+        assert!(script.contains("Object.defineProperty"));
+        assert!(script.contains("writable:false"));
+        assert!(!script.contains("JSON.parse({\"bridge\""));
     }
 }
