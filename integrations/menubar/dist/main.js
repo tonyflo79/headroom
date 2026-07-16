@@ -13,6 +13,33 @@ export function refreshPresentation(busy) {
   return { label: busy ? "Refreshing…" : "Refresh", busy: busy === true };
 }
 
+const LOGIN_MESSAGES = {
+  queued: "Queued",
+  preflight: "Checking Claude CLI prerequisite",
+  browser_login: "Waiting for Claude browser sign-in",
+  verifying_identity: "Verifying account identity",
+  publishing: "Publishing the verified account",
+  cancelling: "Cancelling and restoring prior credentials",
+  complete: "Complete",
+  connected: "Claude account connected",
+  cancelled: "Login cancelled; prior credentials restored",
+  login_timed_out: "Login timed out; prior credentials restored",
+  provider_login_failed: "Claude login failed; prior credentials restored",
+  identity_unreadable: "Claude completed but identity could not be verified",
+  wrong_identity: "Signed-in identity did not match; credentials restored",
+  duplicate_identity: "That Claude identity is already connected",
+  claude_cli_missing: "Install Claude Code before connecting",
+  claude_upgrade_required: "Update Claude Code to a version with auth login support",
+  claude_shared_keychain_conflict: "Login refused: an existing slot uses the legacy shared Keychain item",
+  claude_keychain_isolation_missing: "Claude did not create an isolated Keychain item; update Claude Code",
+  claude_slot_keychain_occupied: "Login refused: this unused slot name already has a Keychain item",
+  internal_error: "Login failed safely; prior credentials were restored",
+};
+
+export function loginMessage(code) {
+  return LOGIN_MESSAGES[code] || "Login could not be completed safely";
+}
+
 export function normalizeBootstrap(raw) {
   if (!raw || raw.bridge?.bridge_schema !== "headroom_desktop_bridge@1") {
     throw new Error("incompatible desktop engine");
@@ -132,6 +159,70 @@ function candidateCard(candidate, invoke, update) {
   return form;
 }
 
+function claudeLoginCard(invoke, update) {
+  const form = document.createElement("form");
+  form.className = "provider-login";
+  const title = document.createElement("strong");
+  title.textContent = "> connect new Claude login";
+  const fields = document.createElement("div");
+  fields.className = "login-fields";
+  const name = document.createElement("input");
+  name.required = true;
+  name.pattern = "[a-z0-9][a-z0-9_-]{0,31}";
+  name.value = "claude-new";
+  name.placeholder = "slot name";
+  name.setAttribute("aria-label", "Claude slot name");
+  const expected = document.createElement("input");
+  expected.type = "email";
+  expected.placeholder = "expected email (optional)";
+  expected.setAttribute("aria-label", "Expected Claude email, optional");
+  const start = document.createElement("button");
+  start.type = "submit";
+  start.textContent = "Connect";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.hidden = true;
+  const diagnostic = document.createElement("p");
+  diagnostic.className = "diagnostic";
+  diagnostic.setAttribute("aria-live", "polite");
+  fields.append(name, expected, start, cancel);
+  form.append(title, fields, diagnostic);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    start.disabled = true;
+    name.disabled = true;
+    expected.disabled = true;
+    try {
+      let job = await invoke("desktop_start_claude_login", {
+        name: name.value, expectedEmail: expected.value || null,
+      });
+      cancel.hidden = false;
+      cancel.onclick = async () => {
+        cancel.disabled = true;
+        job = await invoke("desktop_cancel_login", { jobId: job.job_id });
+        diagnostic.textContent = loginMessage(job.progress_code);
+      };
+      while (job.state === "running" || job.state === "cancelling") {
+        diagnostic.textContent = loginMessage(job.progress_code);
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        job = await invoke("desktop_login_status", { jobId: job.job_id });
+      }
+      diagnostic.textContent = loginMessage(job.result_code);
+      if (job.state === "succeeded" && job.view) update(job.view);
+    } catch (error) {
+      diagnostic.textContent = String(error);
+    } finally {
+      start.disabled = false;
+      name.disabled = false;
+      expected.disabled = false;
+      cancel.hidden = true;
+      cancel.disabled = false;
+    }
+  });
+  return form;
+}
+
 export function renderBootstrap(raw, invoke = null) {
   const value = normalizeBootstrap(raw);
   const { view } = value;
@@ -149,8 +240,11 @@ export function renderBootstrap(raw, invoke = null) {
   document.getElementById("accounts").replaceChildren(...view.accounts.map(accountCard));
   const actions = document.getElementById("actions");
   const update = (nextView) => renderBootstrap({ bridge: value.bridge, view: nextView }, invoke);
-  actions.replaceChildren(...(invoke ? view.candidates.map((row) =>
-    candidateCard(row, invoke, update)) : []));
+  const actionCards = invoke && view.mode !== "recovery" ? [
+    ...view.candidates.map((row) => candidateCard(row, invoke, update)),
+    claudeLoginCard(invoke, update),
+  ] : [];
+  actions.replaceChildren(...actionCards);
   const refresh = document.getElementById("refresh");
   refresh.disabled = !invoke || view.mode !== "ready";
   refresh.onclick = invoke ? async () => {

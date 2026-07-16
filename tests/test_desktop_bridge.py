@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -219,6 +221,52 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(raised.exception.code, "duplicate_account_name")
         detect.assert_not_called()
 
+    def test_claude_login_job_returns_only_stable_progress_and_sanitized_view(self):
+        manager = desktop_bridge.DesktopLoginManager()
+        finished = {"ok": True, "code": "connected", "entry": {
+            "name": "claude-new", "expected_email": "private@example.com"}}
+        safe_view = {"schema": desktop_bridge.VIEW_SCHEMA, "accounts": [{
+            "name": "claude-new", "identity": "p***@example.com"}]}
+        with mock.patch.object(desktop_bridge.connect, "desktop_connect_fresh",
+                               return_value=finished), \
+                mock.patch.object(desktop_bridge, "discover_desktop",
+                                  return_value=safe_view):
+            started = manager.start_claude("claude-new", "private@example.com")
+            manager._job["thread"].join(timeout=2)
+            value = manager.status(started["job_id"])
+        self.assertEqual(value["state"], "succeeded")
+        self.assertEqual(value["result_code"], "connected")
+        self.assertEqual(value["view"], safe_view)
+        self.assertNotIn("private@example.com", json.dumps(value))
+
+    def test_claude_login_job_can_be_cancelled(self):
+        manager = desktop_bridge.DesktopLoginManager()
+        entered = threading.Event()
+
+        def wait_for_cancel(config, name, provider, **options):
+            entered.set()
+            self.assertTrue(options["cancel_event"].wait(timeout=2))
+            return {"ok": False, "code": "cancelled"}
+
+        with mock.patch.object(desktop_bridge.connect, "desktop_connect_fresh",
+                               side_effect=wait_for_cancel):
+            started = manager.start_claude("claude-new")
+            self.assertTrue(entered.wait(timeout=2))
+            cancelling = manager.cancel(started["job_id"])
+            self.assertEqual(cancelling["state"], "cancelling")
+            manager._job["thread"].join(timeout=2)
+            value = manager.status(started["job_id"])
+        self.assertEqual(value["state"], "cancelled")
+        self.assertEqual(value["result_code"], "cancelled")
+
+    def test_claude_login_job_refuses_corrupt_registry(self):
+        with open(paths.config_path(), "w", encoding="utf-8") as handle:
+            handle.write("bad")
+        manager = desktop_bridge.DesktopLoginManager()
+        with self.assertRaises(desktop_bridge.BridgeError) as raised:
+            manager.start_claude("claude-new")
+        self.assertEqual(raised.exception.code, "recovery_required")
+
 
 class DesktopBridgeSubprocess(unittest.TestCase):
     def run_bridge(self, lines, env=None):
@@ -266,6 +314,46 @@ class DesktopBridgeSubprocess(unittest.TestCase):
                          desktop_bridge.VIEW_SCHEMA)
         self.assertEqual(frames[0]["result"]["mode"], "empty")
         self.assertEqual(frames[0]["result"]["candidates"], [])
+
+    def test_claude_login_crosses_protocol_without_terminal_or_raw_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ)
+            env.update({
+                "HEADROOM_DIR": os.path.join(directory, "headroom"),
+                "PATH": os.path.join(ROOT, "tests", "fixtures", "desktop-bin")
+                        + os.pathsep + env.get("PATH", ""),
+                "CLAUDE_CONFIG_DIR": os.path.join(directory, "no-claude"),
+                "CODEX_HOME": os.path.join(directory, "no-codex"),
+            })
+            process = subprocess.Popen(
+                [sys.executable, "-m", "headroom.desktop_bridge"], cwd=ROOT,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=env)
+            process.stdin.write(request("1", "start_claude_login", {
+                "name": "claude-fixture", "expected_email": "fixture@example.test"}) + "\n")
+            process.stdin.flush()
+            started = json.loads(process.stdout.readline())["result"]
+            value = started
+            for index in range(100):
+                if value["state"] not in {"running", "cancelling"}:
+                    break
+                process.stdin.write(request(str(index + 2), "login_status", {
+                    "job_id": started["job_id"]}) + "\n")
+                process.stdin.flush()
+                value = json.loads(process.stdout.readline())["result"]
+                time.sleep(0.02)
+            process.stdin.write(request("stop", "shutdown") + "\n")
+            process.stdin.flush()
+            json.loads(process.stdout.readline())
+            process.wait(timeout=10)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+        self.assertEqual(value["state"], "succeeded")
+        self.assertEqual(value["result_code"], "connected")
+        self.assertEqual(value["view"]["accounts"][0]["identity"],
+                         "f***@example.test")
+        self.assertNotIn("fixture-org", json.dumps(value))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,9 @@ import json
 import math
 import os
 import platform
+import secrets
 import sys
+import threading
 import time
 
 from . import __version__, collect as collector, connect, paths, registry, widget
@@ -19,6 +21,7 @@ from . import __version__, collect as collector, connect, paths, registry, widge
 
 SCHEMA = "headroom_desktop_bridge@1"
 VIEW_SCHEMA = "headroom_desktop_view@1"
+LOGIN_SCHEMA = "headroom_desktop_login@1"
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_REQUEST_ID = 128
 
@@ -195,6 +198,118 @@ def adopt_desktop(candidate_id, name, now=None):
     return refresh_desktop(now=now)
 
 
+class DesktopLoginManager:
+    """One cancellable provider-login job, projected without provider output."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._job = None
+
+    def _projection(self, job):
+        return {
+            "schema": LOGIN_SCHEMA,
+            "job_id": job["job_id"],
+            "provider": job["provider"],
+            "name": job["name"],
+            "state": job["state"],
+            "progress_code": job["progress_code"],
+            "result_code": job.get("result_code"),
+            "view": job.get("view"),
+        }
+
+    def start_claude(self, name, expected_email=None):
+        if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
+            raise BridgeError("invalid_account_name", "account name is invalid")
+        if expected_email is not None and (
+                not isinstance(expected_email, str)
+                or len(expected_email) > 254 or "@" not in expected_email):
+            raise BridgeError("invalid_expected_identity",
+                              "expected email is invalid")
+        state, config, recovery_code = _registry_discovery()
+        if state == "recovery":
+            raise BridgeError("recovery_required", recovery_code)
+        config = config or {
+            "schema_version": 1,
+            "dashboard": dict(registry.DEFAULT_DASHBOARD),
+            "accounts": [],
+        }
+        if any(row.get("name") == name for row in config["accounts"]):
+            raise BridgeError("duplicate_account_name", "account name is already in use")
+        with self._lock:
+            if self._job and self._job["state"] in {"running", "cancelling"}:
+                raise BridgeError("login_in_progress", "another login is in progress")
+            job = {
+                "job_id": secrets.token_hex(12), "provider": "claude",
+                "name": name, "state": "running", "progress_code": "queued",
+                "cancel": threading.Event(),
+            }
+            self._job = job
+            thread = threading.Thread(
+                target=self._run, args=(job, config, expected_email),
+                name="headroom-claude-login", daemon=False)
+            job["thread"] = thread
+            thread.start()
+            return self._projection(job)
+
+    def _run(self, job, config, expected_email):
+        def progress(code):
+            with self._lock:
+                if self._job is job and job["state"] == "running":
+                    job["progress_code"] = code
+        try:
+            outcome = connect.desktop_connect_fresh(
+                config, job["name"], "claude", expected_email=expected_email,
+                cancel_event=job["cancel"], progress=progress)
+            if outcome.get("ok"):
+                progress("publishing")
+                view = discover_desktop()
+                state = "succeeded"
+            else:
+                view = None
+                state = ("cancelled" if outcome.get("code") == "cancelled"
+                         else "failed")
+            with self._lock:
+                if self._job is job:
+                    job.update({
+                        "state": state, "progress_code": "complete",
+                        "result_code": outcome.get("code", "internal_error"),
+                        "view": view,
+                    })
+        except Exception:  # noqa: BLE001 - no detail crosses desktop boundary
+            with self._lock:
+                if self._job is job:
+                    job.update({"state": "failed", "progress_code": "complete",
+                                "result_code": "internal_error", "view": None})
+
+    def status(self, job_id):
+        with self._lock:
+            if not self._job or job_id != self._job["job_id"]:
+                raise BridgeError("login_job_missing", "login job is unavailable")
+            return self._projection(self._job)
+
+    def cancel(self, job_id):
+        with self._lock:
+            if not self._job or job_id != self._job["job_id"]:
+                raise BridgeError("login_job_missing", "login job is unavailable")
+            if self._job["state"] == "running":
+                self._job["state"] = "cancelling"
+                self._job["progress_code"] = "cancelling"
+                self._job["cancel"].set()
+            return self._projection(self._job)
+
+    def shutdown(self):
+        with self._lock:
+            job = self._job
+            if job and job["state"] in {"running", "cancelling"}:
+                job["cancel"].set()
+            thread = job.get("thread") if job else None
+        if thread and thread.is_alive():
+            thread.join(timeout=5)
+
+
+LOGIN_MANAGER = DesktopLoginManager()
+
+
 class BridgeError(ValueError):
     """A stable protocol error safe to return across the desktop boundary."""
 
@@ -279,7 +394,8 @@ def _handle(command, args):
             "state_schema_range": [1, 1], "platform": sys.platform,
             "architecture": platform.machine(),
             "capabilities": [
-                "fixture_snapshot", "discover", "adopt", "refresh", "shutdown"],
+                "fixture_snapshot", "discover", "adopt", "refresh",
+                "claude_login", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
@@ -300,9 +416,23 @@ def _handle(command, args):
         if set(args) - {"now"}:
             raise BridgeError("invalid_args", "refresh arguments are invalid")
         return refresh_desktop(args.get("now")), False
+    if command == "start_claude_login":
+        if set(args) - {"name", "expected_email"}:
+            raise BridgeError("invalid_args", "login arguments are invalid")
+        return LOGIN_MANAGER.start_claude(
+            args.get("name"), args.get("expected_email")), False
+    if command == "login_status":
+        if set(args) != {"job_id"}:
+            raise BridgeError("invalid_args", "login status arguments are invalid")
+        return LOGIN_MANAGER.status(args.get("job_id")), False
+    if command == "cancel_login":
+        if set(args) != {"job_id"}:
+            raise BridgeError("invalid_args", "cancel arguments are invalid")
+        return LOGIN_MANAGER.cancel(args.get("job_id")), False
     if command == "shutdown":
         if args:
             raise BridgeError("invalid_args", "shutdown accepts no arguments")
+        LOGIN_MANAGER.shutdown()
         return {"accepted": True}, True
     raise BridgeError("unknown_command", f"unsupported command: {command}")
 
