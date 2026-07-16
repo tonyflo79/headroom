@@ -96,6 +96,13 @@ def _diagnostic_code(value):
         and re.fullmatch(r"[a-z0-9_]{1,64}", value) else None
 
 
+def _observation_age(value, now):
+    if not isinstance(value, (int, float)) or isinstance(value, bool) \
+            or not math.isfinite(value) or value > now:
+        return None
+    return max(0, int(now - value))
+
+
 def _onboarding_path():
     return os.path.join(paths.state_dir(), "desktop-onboarding.json")
 
@@ -228,6 +235,8 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
             "plan": details.get("plan") or "Unknown",
             "note": details.get("note"),
             "diagnostic_code": _diagnostic_code(details.get("error_code")),
+            "observation_age_seconds": _observation_age(
+                details.get("captured_at"), now),
             "trust_state": details.get("trust_state"),
             "reserved": configured.get(row["name"], {}).get("reserved") is True,
             "policy": policies.get(row["name"]),
@@ -689,7 +698,8 @@ def _handle(command, args):
             "capabilities": [
                 "fixture_snapshot", "discover", "adopt", "refresh",
                 "claude_login", "codex_device_login", "onboarding",
-                "account_lifecycle", "reauthentication", "shutdown"],
+                "account_lifecycle", "reauthentication",
+                "resilient_collection", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False

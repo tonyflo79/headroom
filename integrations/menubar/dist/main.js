@@ -10,6 +10,11 @@ const VALID_SURFACES = new Set(["main", "popover"]);
 const TRUST_STATES = new Set([
   "verified", "verified_local", "verified_remote", "duplicate_identity", "held",
 ]);
+const TRANSIENT_CODES = new Set([
+  "provider_rate_limited", "provider_server_error", "provider_timeout",
+  "provider_offline", "provider_unavailable", "codex_provider_backoff",
+  "codex_app_server_throttled", "usage_source_rate_limited",
+]);
 
 let activeBootstrap = null;
 let activeInvoke = null;
@@ -52,12 +57,30 @@ export function accountStatePresentation(account) {
   if (account?.state === "limited") return {
     label: "limited", action: "Capacity is exhausted; wait for the displayed reset",
   };
-  if (account?.state === "stale") return {
-    label: "stale", action: "Last verified reading has aged out; refresh when online",
-  };
+  if (account?.state === "stale") {
+    const age = Number(account?.observation_age_seconds);
+    const ageCopy = Number.isFinite(age) ? ` (${formatAge(age)} old)` : "";
+    return TRANSIENT_CODES.has(account?.diagnostic_code) ? {
+      label: "stale",
+      action: `Provider unavailable; showing the last verified reading${ageCopy} until automatic retry`,
+    } : {
+      label: "stale", action: `Last verified reading has aged out${ageCopy}; refresh when online`,
+    };
+  }
   return {
     label: "held", action: account?.note || "Capacity is not proven; refresh or re-authenticate",
   };
+}
+
+export function formatAge(seconds) {
+  const value = Math.max(0, Math.floor(Number(seconds)));
+  if (!Number.isFinite(value)) return "age unknown";
+  if (value < 60) return `${value}s`;
+  const minutes = Math.floor(value / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
 }
 
 export function accountNameError(value, existingNames = []) {
@@ -225,6 +248,8 @@ export function normalizeBootstrap(raw) {
       diagnostic_code: typeof account?.diagnostic_code === "string" &&
         /^[a-z0-9_]{1,64}$/.test(account.diagnostic_code)
         ? account.diagnostic_code : null,
+      observation_age_seconds: Number.isFinite(Number(account?.observation_age_seconds))
+        ? Math.max(0, Math.floor(Number(account.observation_age_seconds))) : null,
       trust_state: TRUST_STATES.has(account?.trust_state) ? account.trust_state : null,
       reserved: account?.reserved === true,
       policy,
@@ -809,6 +834,18 @@ export function refreshStatePresentation(state) {
     label: "OFFLINE · refresh failed; retained readings keep their displayed age and trust state",
     busy: false,
   };
+  if (state === "backoff") return {
+    label: "BACKOFF · automatic retry is bounded, jittered, and energy-conscious",
+    busy: false,
+  };
+  if (state === "recovering") return {
+    label: "RECOVERING · restarting the bundled engine within the bounded policy",
+    busy: true,
+  };
+  if (state === "degraded") return {
+    label: "DEGRADED · repeated engine failures stopped the restart loop safely",
+    busy: false,
+  };
   return { label: "", busy: false };
 }
 
@@ -955,11 +992,8 @@ export function renderBootstrap(raw, invoke = null) {
   refresh.disabled = !invoke || view.mode !== "ready";
   refresh.onclick = invoke ? async () => {
     applyRefreshState("refreshing");
-    try { update(await invoke("desktop_refresh")); }
+    try { await invoke("desktop_refresh"); }
     catch { applyRefreshState("offline"); }
-    finally {
-      if (document.body.dataset.refreshState !== "offline") applyRefreshState("current");
-    }
   } : null;
   return value;
 }
@@ -980,7 +1014,16 @@ if (typeof document !== "undefined") {
     if (panel === "appearance") openAppearancePanel();
   };
   try {
-    renderBootstrap(window.__HEADROOM_BOOTSTRAP__, window.__TAURI__?.core?.invoke || null);
+    const invoke = window.__TAURI__?.core?.invoke || null;
+    renderBootstrap(window.__HEADROOM_BOOTSTRAP__, invoke);
+    // A stale-activation collection can finish before this module registers
+    // its native callback. Reconcile once from the Rust-owned store so that
+    // an early revision is never lost; duplicate revisions are ignored.
+    if (invoke) {
+      invoke("desktop_snapshot")
+        .then((snapshot) => window.__headroomApplySnapshot(snapshot))
+        .catch(() => {});
+    }
   } catch (error) {
     document.getElementById("engine-badge").textContent = "unavailable";
     document.getElementById("summary").textContent = error.message;

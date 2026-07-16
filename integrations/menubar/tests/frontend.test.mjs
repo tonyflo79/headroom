@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
-  accountNameError, accountStatePresentation, formatReset, loginMessage,
+  accountNameError, accountStatePresentation, formatAge, formatReset, loginMessage,
   normalizeBootstrap, normalizeDeviceInstructions, onboardingPresentation, percentLeft,
   refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
   shouldApplySnapshot, suggestedAccountName,
@@ -210,6 +210,11 @@ test("reset and account state copy remain actionable without color", () => {
     "resets in 1h");
   assert.equal(formatReset(1_799_999_999, 1_800_000_000_000).label, "reset due");
   assert.match(accountStatePresentation({ state: "stale" }).action, /refresh/);
+  assert.match(accountStatePresentation({
+    state: "stale", diagnostic_code: "provider_offline",
+    observation_age_seconds: 3720,
+  }).action, /1h 2m old.*automatic retry/);
+  assert.equal(formatAge(3720), "1h 2m");
   assert.match(accountStatePresentation({ state: "limited" }).action, /wait/);
   assert.match(accountStatePresentation({ state: "held", note: "Reconnect account" }).action,
     /Reconnect/);
@@ -217,6 +222,9 @@ test("reset and account state copy remain actionable without color", () => {
     /excluded/);
   assert.match(refreshStatePresentation("offline").label, /OFFLINE/);
   assert.equal(refreshStatePresentation("refreshing").busy, true);
+  assert.match(refreshStatePresentation("backoff").label, /jittered/);
+  assert.equal(refreshStatePresentation("recovering").busy, true);
+  assert.match(refreshStatePresentation("degraded").label, /restart loop/);
 });
 
 test("all five themes define the same semantic token contract", () => {

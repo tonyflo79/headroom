@@ -140,7 +140,10 @@ button.danger:hover:not(:disabled) { border-color: var(--danger); box-shadow: va
   text-transform: uppercase;
 }
 body[data-refresh-state="refreshing"] .surface-status { color: var(--phosphor-bright); text-shadow: var(--glow); }
-body[data-refresh-state="offline"] .surface-status { color: var(--warning); }
+body[data-refresh-state="recovering"] .surface-status { color: var(--phosphor-bright); text-shadow: var(--glow); }
+body[data-refresh-state="offline"] .surface-status,
+body[data-refresh-state="backoff"] .surface-status,
+body[data-refresh-state="degraded"] .surface-status { color: var(--warning); }
 
 .appearance-panel {
   display: grid;

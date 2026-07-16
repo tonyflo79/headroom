@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tauri::{
@@ -84,6 +84,14 @@ const DESKTOP_POPOVER_WIDTH: f64 = 420.0;
 const DESKTOP_POPOVER_HEIGHT: f64 = 680.0;
 const WINDOW_STATE_SCHEMA: &str = "headroom_desktop_window@1";
 const DESKTOP_THEMES: [&str; 5] = ["midnight", "minimal", "chrome", "paper", "terminal"];
+const COLLECTION_IDLE_INTERVAL: Duration = Duration::from_secs(300);
+const COLLECTION_RETRY_BASE: Duration = Duration::from_secs(5);
+const COLLECTION_RETRY_CAP: Duration = Duration::from_secs(300);
+const COLLECTION_TICK: Duration = Duration::from_secs(15);
+const ENGINE_RESTART_BASE: Duration = Duration::from_secs(2);
+const ENGINE_RESTART_CAP: Duration = Duration::from_secs(60);
+const ENGINE_DEGRADED_COOLDOWN: Duration = Duration::from_secs(300);
+const ENGINE_RESTART_LIMIT: u32 = 3;
 
 struct BridgeSession {
     child: CommandChild,
@@ -93,14 +101,94 @@ struct BridgeSession {
 #[derive(Clone)]
 struct DesktopEngine {
     session: Arc<Mutex<Option<BridgeSession>>>,
+    recovery: Arc<Mutex<EngineRecoveryPolicy>>,
 }
 
 impl Default for DesktopEngine {
     fn default() -> Self {
         Self {
             session: Arc::new(Mutex::new(None)),
+            recovery: Arc::new(Mutex::new(EngineRecoveryPolicy::default())),
         }
     }
+}
+
+#[derive(Default)]
+struct EngineRecoveryPolicy {
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
+    degraded: bool,
+}
+
+impl EngineRecoveryPolicy {
+    fn record_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= ENGINE_RESTART_LIMIT {
+            self.degraded = true;
+            self.retry_at = Some(now + ENGINE_DEGRADED_COOLDOWN);
+            return;
+        }
+        let multiplier = 1u32 << self.consecutive_failures.saturating_sub(1).min(5);
+        self.retry_at = Some(now + (ENGINE_RESTART_BASE * multiplier).min(ENGINE_RESTART_CAP));
+    }
+
+    fn admits_restart(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|retry_at| now >= retry_at)
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.retry_at = None;
+        self.degraded = false;
+    }
+}
+
+#[derive(Default)]
+struct CollectionPolicy {
+    failure_count: u32,
+    retry_at: Option<Instant>,
+    last_success_at: Option<Instant>,
+}
+
+impl CollectionPolicy {
+    fn record_success(&mut self, now: Instant) {
+        self.failure_count = 0;
+        self.retry_at = None;
+        self.last_success_at = Some(now);
+    }
+
+    fn record_failure(&mut self, now: Instant, entropy: u64) -> Duration {
+        self.failure_count = self.failure_count.saturating_add(1);
+        let multiplier = 1u32 << self.failure_count.saturating_sub(1).min(6);
+        let raw = (COLLECTION_RETRY_BASE * multiplier).min(COLLECTION_RETRY_CAP);
+        let spread = raw.as_secs() / 5;
+        let offset = if spread == 0 {
+            0
+        } else {
+            (entropy % (spread * 2 + 1)) as i64 - spread as i64
+        };
+        let seconds =
+            (raw.as_secs() as i64 + offset).clamp(1, COLLECTION_RETRY_CAP.as_secs() as i64) as u64;
+        let delay = Duration::from_secs(seconds);
+        self.retry_at = Some(now + delay);
+        delay
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        match self.retry_at {
+            Some(retry_at) => now >= retry_at,
+            None => self
+                .last_success_at
+                .is_none_or(|last| now.duration_since(last) >= COLLECTION_IDLE_INTERVAL),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CollectionScheduler {
+    enabled: AtomicBool,
+    running: AtomicBool,
+    policy: Mutex<CollectionPolicy>,
 }
 
 #[derive(Clone)]
@@ -178,7 +266,6 @@ struct DesktopUiState {
     placement: Mutex<Option<WindowPlacement>>,
     last_tray_rect: Mutex<Option<tauri::Rect>>,
     popover_opened_at: Mutex<Option<Instant>>,
-    refreshing: AtomicBool,
 }
 
 struct AppState {
@@ -964,6 +1051,7 @@ fn validate_desktop_bootstrap(
                 "onboarding",
                 "account_lifecycle",
                 "reauthentication",
+                "resilient_collection",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -1152,6 +1240,14 @@ fn snapshot_envelope(snapshot: &DesktopSnapshot) -> serde_json::Value {
     })
 }
 
+fn collection_enabled(view: &serde_json::Value) -> bool {
+    view.get("mode").and_then(serde_json::Value::as_str) == Some("ready")
+        && view
+            .get("accounts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|accounts| !accounts.is_empty())
+}
+
 fn push_snapshot_to_windows(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let payload = serde_json::to_string(&snapshot_envelope(snapshot))
         .expect("sanitized desktop snapshot serializes");
@@ -1172,6 +1268,11 @@ fn publish_desktop_view(
     view: serde_json::Value,
 ) -> Result<DesktopSnapshot, String> {
     let snapshot = app.state::<DesktopStore>().replace_view(view)?;
+    if let Some(scheduler) = app.try_state::<CollectionScheduler>() {
+        scheduler
+            .enabled
+            .store(collection_enabled(&snapshot.view), Ordering::SeqCst);
+    }
     push_snapshot_to_windows(app, &snapshot);
     Ok(snapshot)
 }
@@ -1188,6 +1289,52 @@ fn publish_result_view(app: &AppHandle, value: &serde_json::Value) -> Result<(),
         publish_desktop_view(app, value["view"].clone())?;
     }
     Ok(())
+}
+
+fn ensure_desktop_engine(app: &AppHandle, engine: &DesktopEngine) -> Result<(), String> {
+    let missing = engine
+        .session
+        .lock()
+        .map_err(|_| "desktop engine state is unavailable".to_string())?
+        .is_none();
+    if !missing {
+        return Ok(());
+    }
+    {
+        let recovery = engine
+            .recovery
+            .lock()
+            .map_err(|_| "desktop engine recovery is unavailable".to_string())?;
+        if !recovery.admits_restart(Instant::now()) {
+            return Err(if recovery.degraded {
+                "desktop engine is safely degraded".into()
+            } else {
+                "desktop engine restart is in backoff".into()
+            });
+        }
+    }
+    match bootstrap_sidecar(app) {
+        Ok((_handshake, view, session)) => {
+            let mut guard = engine
+                .session
+                .lock()
+                .map_err(|_| "desktop engine state is unavailable".to_string())?;
+            if guard.is_none() {
+                *guard = Some(session);
+            } else {
+                let _ = session.child.kill();
+            }
+            drop(guard);
+            publish_desktop_view(app, view)?;
+            Ok(())
+        }
+        Err(error) => {
+            if let Ok(mut recovery) = engine.recovery.lock() {
+                recovery.record_failure(Instant::now());
+            }
+            Err(error)
+        }
+    }
 }
 
 fn request_desktop_engine(
@@ -1248,7 +1395,12 @@ fn request_desktop_engine(
         }
     })();
     match outcome {
-        Ok(value) => Ok(value),
+        Ok(value) => {
+            if let Ok(mut recovery) = engine.recovery.lock() {
+                recovery.record_success();
+            }
+            Ok(value)
+        }
         Err((error, fatal)) => {
             // A malformed, late, or missing response makes frame ordering
             // unknowable. Retire that session so a later request cannot
@@ -1257,6 +1409,9 @@ fn request_desktop_engine(
             if fatal {
                 if let Some(session) = guard.take() {
                     let _ = session.child.kill();
+                }
+                if let Ok(mut recovery) = engine.recovery.lock() {
+                    recovery.record_failure(Instant::now());
                 }
             }
             Err(error)
@@ -1344,13 +1499,9 @@ async fn desktop_adopt(
 }
 
 #[tauri::command]
-async fn desktop_refresh(
-    app: AppHandle,
-    state: tauri::State<'_, DesktopEngine>,
-) -> Result<serde_json::Value, String> {
-    let value = engine_command(state.inner().clone(), "refresh", serde_json::json!({})).await?;
-    publish_result_view(&app, &value)?;
-    Ok(value)
+async fn desktop_refresh(app: AppHandle) -> Result<serde_json::Value, String> {
+    request_scheduled_collection(&app, "manual");
+    Ok(app.state::<DesktopStore>().snapshot()?.view)
 }
 
 #[tauri::command]
@@ -1462,6 +1613,11 @@ fn desktop_set_theme(
     Ok(snapshot_envelope(&snapshot))
 }
 
+#[tauri::command]
+fn desktop_snapshot(state: tauri::State<'_, DesktopStore>) -> Result<serde_json::Value, String> {
+    Ok(snapshot_envelope(&state.snapshot()?))
+}
+
 fn show_desktop_window(app: &AppHandle, panel: Option<&str>) -> Result<(), String> {
     let window = app
         .get_webview_window(DESKTOP_WINDOW_LABEL)
@@ -1571,24 +1727,192 @@ fn set_refresh_state_windows(app: &AppHandle, state: &str) {
     }
 }
 
-fn refresh_desktop_async(app: &AppHandle) {
-    let state = app.state::<DesktopUiState>();
-    if state.refreshing.swap(true, Ordering::SeqCst) {
+fn collection_view_outcome(view: &serde_json::Value) -> (bool, bool) {
+    let accounts = view
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if accounts.is_empty() {
+        return (true, false);
+    }
+    let codes: Vec<&str> = accounts
+        .iter()
+        .filter_map(|account| {
+            account
+                .get("diagnostic_code")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    let transient = codes.iter().any(|code| {
+        matches!(
+            *code,
+            "provider_rate_limited"
+                | "provider_server_error"
+                | "provider_timeout"
+                | "provider_offline"
+                | "provider_unavailable"
+                | "malformed_provider_response"
+                | "codex_provider_backoff"
+                | "codex_app_server_throttled"
+                | "usage_source_rate_limited"
+        )
+    });
+    let has_usable = accounts.iter().any(|account| {
+        matches!(
+            account.get("state").and_then(serde_json::Value::as_str),
+            Some("current" | "limited")
+        )
+    });
+    let offline = !has_usable
+        && codes
+            .iter()
+            .any(|code| matches!(*code, "provider_offline" | "provider_unavailable"));
+    (!transient, offline)
+}
+
+fn collection_entropy() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64)
+}
+
+fn engine_recovery_state(engine: &DesktopEngine) -> &'static str {
+    engine
+        .recovery
+        .lock()
+        .map(|policy| {
+            if policy.degraded {
+                "degraded"
+            } else {
+                "recovering"
+            }
+        })
+        .unwrap_or("degraded")
+}
+
+fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
+    let scheduler = app.state::<CollectionScheduler>();
+    if !scheduler.enabled.load(Ordering::SeqCst) {
+        return;
+    }
+    let now = Instant::now();
+    let (in_backoff, recently_current) = scheduler.policy.lock().map_or((false, false), |policy| {
+        (
+            policy.retry_at.is_some_and(|retry_at| now < retry_at),
+            policy.retry_at.is_none()
+                && policy
+                    .last_success_at
+                    .is_some_and(|last| now.duration_since(last) < Duration::from_secs(60)),
+        )
+    });
+    if trigger == "wake" && recently_current {
+        return;
+    }
+    if in_backoff && !matches!(trigger, "wake" | "connectivity") {
+        set_refresh_state_windows(app, "backoff");
+        return;
+    }
+    if scheduler.running.swap(true, Ordering::SeqCst) {
         return;
     }
     set_refresh_state_windows(app, "refreshing");
     let app = app.clone();
     let engine = app.state::<DesktopEngine>().inner().clone();
     tauri::async_runtime::spawn(async move {
-        let result = engine_command(engine, "refresh", serde_json::json!({})).await;
-        let settled = match result {
-            Ok(view) if publish_result_view(&app, &view).is_ok() => "current",
-            _ => "offline",
+        let bootstrap_app = app.clone();
+        let bootstrap_engine = engine.clone();
+        let ensured = tauri::async_runtime::spawn_blocking(move || {
+            ensure_desktop_engine(&bootstrap_app, &bootstrap_engine)
+        })
+        .await
+        .map_err(|_| "desktop engine restart task failed".to_string())
+        .and_then(|result| result);
+        let result = match ensured {
+            Ok(()) => engine_command(engine.clone(), "refresh", serde_json::json!({})).await,
+            Err(error) => Err(error),
         };
-        app.state::<DesktopUiState>()
-            .refreshing
+        let now = Instant::now();
+        let settled = match result {
+            Ok(view) => {
+                let published = publish_result_view(&app, &view).is_ok();
+                let current_view = view
+                    .get("view")
+                    .filter(|nested| nested.get("schema").is_some())
+                    .unwrap_or(&view);
+                let (success, offline) = collection_view_outcome(current_view);
+                if published && success {
+                    if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+                        policy.record_success(now);
+                    }
+                    "current"
+                } else {
+                    if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+                        policy.record_failure(now, collection_entropy());
+                    }
+                    if offline {
+                        "offline"
+                    } else {
+                        "backoff"
+                    }
+                }
+            }
+            Err(_) => {
+                if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+                    policy.record_failure(now, collection_entropy());
+                }
+                engine_recovery_state(&engine)
+            }
+        };
+        app.state::<CollectionScheduler>()
+            .running
             .store(false, Ordering::SeqCst);
         set_refresh_state_windows(&app, settled);
+    });
+}
+
+fn start_collection_scheduler(app: &AppHandle, snapshot: &DesktopSnapshot) {
+    let enabled = collection_enabled(&snapshot.view);
+    app.state::<CollectionScheduler>()
+        .enabled
+        .store(enabled, Ordering::SeqCst);
+    if enabled {
+        let now = Instant::now();
+        let freshness_current = snapshot
+            .view
+            .pointer("/freshness/state")
+            .and_then(serde_json::Value::as_str)
+            == Some("current");
+        let age = snapshot
+            .view
+            .pointer("/freshness/age_seconds")
+            .and_then(serde_json::Value::as_u64);
+        if freshness_current {
+            if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+                policy.last_success_at = age
+                    .and_then(|seconds| now.checked_sub(Duration::from_secs(seconds)))
+                    .or(Some(now));
+            }
+        } else {
+            request_scheduled_collection(app, "activation");
+        }
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(COLLECTION_TICK);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let due = app
+                .state::<CollectionScheduler>()
+                .policy
+                .lock()
+                .map(|policy| policy.due(Instant::now()))
+                .unwrap_or(false);
+            if due {
+                request_scheduled_collection(&app, "schedule");
+            }
+        }
     });
 }
 
@@ -1644,7 +1968,7 @@ fn build_desktop_tray(app: &AppHandle) -> tauri::Result<()> {
             "dashboard" => {
                 let _ = show_desktop_window(app, None);
             }
-            "refresh" => refresh_desktop_async(app),
+            "refresh" => request_scheduled_collection(app, "manual"),
             "settings" => {
                 let _ = show_desktop_window(app, Some("appearance"));
             }
@@ -1806,6 +2130,7 @@ pub fn run() {
         .manage(DesktopEngine::default())
         .manage(DesktopStore::default())
         .manage(DesktopUiState::default())
+        .manage(CollectionScheduler::default())
         .invoke_handler(tauri::generate_handler![
             desktop_discover,
             desktop_onboarding,
@@ -1818,6 +2143,7 @@ pub fn run() {
             desktop_login_status,
             desktop_cancel_login,
             desktop_open_device_url,
+            desktop_snapshot,
             desktop_set_theme,
             desktop_show_dashboard,
             desktop_show_settings,
@@ -1841,6 +2167,7 @@ pub fn run() {
             round_window_corners(&popover, PANEL_RADIUS);
             build_desktop_tray(app.handle())?;
             update_desktop_tray_icon(app.handle(), &snapshot.view);
+            start_collection_scheduler(app.handle(), &snapshot);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1898,7 +2225,15 @@ pub fn run() {
         .expect("error while building Headroom desktop app");
 
     app.run(|handle, event| {
-        if matches!(event, tauri::RunEvent::Exit) {
+        if matches!(&event, tauri::RunEvent::Resumed) {
+            request_scheduled_collection(handle, "wake");
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(&event, tauri::RunEvent::Reopen { .. }) {
+            let _ = show_desktop_window(handle, None);
+            request_scheduled_collection(handle, "activation");
+        }
+        if matches!(&event, tauri::RunEvent::Exit) {
             let _ = save_window_placement(handle);
             stop_desktop_engine(handle);
         }
@@ -2082,6 +2417,7 @@ mod tests {
             "onboarding",
             "account_lifecycle",
             "reauthentication",
+            "resilient_collection",
         ];
         let compatible = serde_json::json!({
             "product": "headroom",
@@ -2094,7 +2430,7 @@ mod tests {
             "product": "headroom",
             "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
             "runtime": "frozen",
-            "capabilities": capabilities[..7],
+            "capabilities": capabilities[..8],
         });
         assert!(validate_desktop_bootstrap(&incompatible, &view).is_err());
     }
@@ -2136,6 +2472,70 @@ mod tests {
         assert_eq!(themed.theme, "terminal");
         assert_eq!(themed.view, first.view);
         assert!(store.set_theme("remote-css").is_err());
+    }
+
+    #[test]
+    fn collection_policy_is_bounded_jittered_and_single_schedule_aware() {
+        let started = Instant::now();
+        let mut policy = CollectionPolicy::default();
+        let first = policy.record_failure(started, 0);
+        assert!(first >= Duration::from_secs(4));
+        assert!(first <= Duration::from_secs(6));
+        assert!(!policy.due(started));
+        assert!(policy.due(started + first));
+        for entropy in 1..20 {
+            let delay = policy.record_failure(started, entropy);
+            assert!(delay <= COLLECTION_RETRY_CAP);
+        }
+        policy.record_success(started);
+        assert!(!policy.due(started + COLLECTION_IDLE_INTERVAL - Duration::from_secs(1)));
+        assert!(policy.due(started + COLLECTION_IDLE_INTERVAL));
+    }
+
+    #[test]
+    fn repeated_engine_failures_enter_and_leave_bounded_degraded_state() {
+        let started = Instant::now();
+        let mut policy = EngineRecoveryPolicy::default();
+        policy.record_failure(started);
+        assert!(!policy.degraded);
+        assert!(!policy.admits_restart(started));
+        policy.record_failure(started);
+        policy.record_failure(started);
+        assert!(policy.degraded);
+        assert!(!policy.admits_restart(started));
+        assert!(policy.admits_restart(started + ENGINE_DEGRADED_COOLDOWN));
+        policy.record_success();
+        assert!(!policy.degraded);
+        assert!(policy.admits_restart(started));
+    }
+
+    #[test]
+    fn collection_outcome_distinguishes_capacity_offline_and_auth_holds() {
+        assert!(!collection_enabled(
+            &serde_json::json!({"mode": "onboarding", "accounts": []})
+        ));
+        assert!(collection_enabled(&serde_json::json!({
+            "mode": "ready", "accounts": [{"name": "a"}]
+        })));
+        let current = serde_json::json!({"accounts": [{"state": "current"}]});
+        assert_eq!(collection_view_outcome(&current), (true, false));
+        let offline = serde_json::json!({"accounts": [{
+            "state": "stale", "diagnostic_code": "provider_offline"
+        }]});
+        assert_eq!(collection_view_outcome(&offline), (false, true));
+        let partial = serde_json::json!({"accounts": [
+            {"state": "current"},
+            {"state": "stale", "diagnostic_code": "provider_timeout"}
+        ]});
+        assert_eq!(collection_view_outcome(&partial), (false, false));
+        let malformed = serde_json::json!({"accounts": [{
+            "state": "held", "diagnostic_code": "malformed_provider_response"
+        }]});
+        assert_eq!(collection_view_outcome(&malformed), (false, false));
+        let auth = serde_json::json!({"accounts": [{
+            "state": "held", "diagnostic_code": "provider_auth_rejected"
+        }]});
+        assert_eq!(collection_view_outcome(&auth), (true, false));
     }
 
     #[test]

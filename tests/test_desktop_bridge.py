@@ -270,6 +270,7 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(offline["note"], "provider unavailable")
         self.assertEqual(offline["diagnostic_code"],
                          "provider_auth_rejected")
+        self.assertEqual(offline["observation_age_seconds"], 0)
         self.assertIsNone(desktop_bridge._diagnostic_code("../../raw-output"))
         self.assertEqual(limited["policy"]["position"], 1)
         self.assertTrue(limited["policy"]["home_retained_on_remove"])
@@ -530,6 +531,8 @@ class DesktopBridgeSubprocess(unittest.TestCase):
         self.assertTrue(all(frame["ok"] for frame in frames))
         self.assertEqual(frames[0]["result"]["bridge_schema"],
                          desktop_bridge.SCHEMA)
+        self.assertIn("resilient_collection",
+                      frames[0]["result"]["capabilities"])
         self.assertEqual(frames[1]["result"]["schema"], "headroom_widget@1")
         self.assertIn("prepared sanitized fixture", process.stderr)
         self.assertNotIn("prepared sanitized fixture", process.stdout)
