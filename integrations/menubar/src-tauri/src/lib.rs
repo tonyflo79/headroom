@@ -854,6 +854,7 @@ fn validate_desktop_bootstrap(
                 "refresh",
                 "claude_login",
                 "codex_device_login",
+                "onboarding",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -1088,6 +1089,19 @@ async fn desktop_discover(
 }
 
 #[tauri::command]
+async fn desktop_onboarding(
+    state: tauri::State<'_, DesktopEngine>,
+    action: String,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        state.inner().clone(),
+        "onboarding",
+        serde_json::json!({"action": action}),
+    )
+    .await
+}
+
+#[tauri::command]
 async fn desktop_adopt(
     state: tauri::State<'_, DesktopEngine>,
     candidate_id: String,
@@ -1226,6 +1240,7 @@ pub fn run() {
         .manage(DesktopEngine::default())
         .invoke_handler(tauri::generate_handler![
             desktop_discover,
+            desktop_onboarding,
             desktop_adopt,
             desktop_refresh,
             desktop_start_claude_login,
@@ -1421,6 +1436,36 @@ mod tests {
             "startup-handshake"
         )
         .is_err());
+    }
+
+    #[test]
+    fn desktop_bootstrap_requires_onboarding_capability() {
+        let view = serde_json::json!({
+            "schema": DESKTOP_VIEW_SCHEMA,
+            "accounts": [],
+        });
+        let capabilities = [
+            "discover",
+            "adopt",
+            "refresh",
+            "claude_login",
+            "codex_device_login",
+            "onboarding",
+        ];
+        let compatible = serde_json::json!({
+            "product": "headroom",
+            "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
+            "runtime": "frozen",
+            "capabilities": capabilities,
+        });
+        assert!(validate_desktop_bootstrap(&compatible, &view).is_ok());
+        let incompatible = serde_json::json!({
+            "product": "headroom",
+            "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
+            "runtime": "frozen",
+            "capabilities": capabilities[..5],
+        });
+        assert!(validate_desktop_bootstrap(&incompatible, &view).is_err());
     }
 
     #[test]

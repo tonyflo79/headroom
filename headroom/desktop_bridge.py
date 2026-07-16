@@ -22,6 +22,8 @@ from . import __version__, collect as collector, connect, paths, registry, widge
 SCHEMA = "headroom_desktop_bridge@1"
 VIEW_SCHEMA = "headroom_desktop_view@1"
 LOGIN_SCHEMA = "headroom_desktop_login@1"
+ONBOARDING_SCHEMA = "headroom_desktop_onboarding@1"
+ONBOARDING_STEPS = {"welcome", "providers", "accounts", "demo", "complete"}
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_REQUEST_ID = 128
 
@@ -81,6 +83,90 @@ def _redacted_identity(value):
     return collector.redact_email(value) if isinstance(value, str) else None
 
 
+def _onboarding_path():
+    return os.path.join(paths.state_dir(), "desktop-onboarding.json")
+
+
+def _load_onboarding(config=None):
+    """Read non-secret first-run progress without creating or repairing it."""
+    if (config or {}).get("accounts"):
+        return "complete", None
+    path = _onboarding_path()
+    if not os.path.exists(path):
+        return "welcome", None
+    if os.path.islink(path) or not os.path.isfile(path):
+        return "welcome", "onboarding_progress_unreadable"
+    raw = paths.load_json(path)
+    if not isinstance(raw, dict) or raw.get("schema") != ONBOARDING_SCHEMA \
+            or raw.get("step") not in ONBOARDING_STEPS:
+        return "welcome", "onboarding_progress_unreadable"
+    step = raw["step"]
+    # Completion without an account is meaningful only for the demo. A stale
+    # or hand-edited complete marker may never bypass setup into an empty app.
+    if step == "complete":
+        return "welcome", "onboarding_completion_unbound"
+    return step, None
+
+
+def _save_onboarding(step):
+    if step not in ONBOARDING_STEPS:
+        raise BridgeError("invalid_onboarding_step", "onboarding step is invalid")
+    paths.ensure_private(paths.state_dir())
+    paths.write_json_atomic(_onboarding_path(), {
+        "schema": ONBOARDING_SCHEMA,
+        "step": step,
+        "updated_at": int(time.time()),
+    })
+
+
+def _complete_onboarding():
+    """Best-effort marker; a registered account independently proves done."""
+    try:
+        _save_onboarding("complete")
+    except OSError:
+        pass
+
+
+def _provider_state(provider):
+    """Sanitized capability probe performed only after user disclosure."""
+    binary = connect.provider_binary(provider)
+    if binary is None:
+        return "missing"
+    try:
+        supported = (connect.desktop_login_prerequisite(provider, binary)
+                     if provider == "claude"
+                     else connect.desktop_codex_prerequisite(binary))
+    except (OSError, ValueError):
+        supported = False
+    return "ready" if supported else "upgrade_required"
+
+
+def _onboarding_projection(step, *, candidates=None, config=None,
+                           recovery_code=None, probe=False):
+    candidates = list(candidates or [])
+    connected = {
+        provider: sum(1 for row in (config or {}).get("accounts", [])
+                      if row.get("provider") == provider)
+        for provider in sorted(registry.PROVIDERS)
+    }
+    providers = []
+    for provider in ("claude", "codex"):
+        providers.append({
+            "provider": provider,
+            "state": _provider_state(provider) if probe else "unchecked",
+            "candidate_available": any(
+                row.get("provider") == provider for row in candidates),
+            "connected_count": connected.get(provider, 0),
+        })
+    return {
+        "schema": ONBOARDING_SCHEMA,
+        "step": step,
+        "resumable": os.path.exists(_onboarding_path()),
+        "recovery_code": recovery_code,
+        "providers": providers,
+    }
+
+
 def _held_account(row):
     """Project a configured slot safely when no public observation exists."""
     return {
@@ -97,7 +183,7 @@ def _held_account(row):
 
 
 def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
-          recovery_code=None, now=None):
+          recovery_code=None, onboarding=None, now=None):
     now = time.time() if now is None else float(now)
     projected = widget.project(public_snapshot or {}, evaluated_at=now)
     public_rows = {
@@ -128,11 +214,16 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
     for row in configured.values():
         if row["name"] not in projected_names:
             accounts.append(_held_account(row))
+    if onboarding is None:
+        step = "complete" if configured else "welcome"
+        onboarding = _onboarding_projection(
+            step, candidates=candidates, config=config, probe=False)
     return {
         "schema": VIEW_SCHEMA,
         "mode": mode,
         "settings": _settings(config),
         "candidates": list(candidates or []),
+        "onboarding": onboarding,
         "recovery_code": recovery_code,
         "freshness": projected["freshness"],
         "headline": projected["headline"],
@@ -140,14 +231,97 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
     }
 
 
+def _demo_view(now=None):
+    now = time.time() if now is None else float(now)
+    if not math.isfinite(now):
+        raise BridgeError("invalid_clock", "demo clock must be finite")
+    captured = now - 12
+    config = {
+        "schema_version": 1,
+        "dashboard": {"title": "Headroom // Demo", "theme": "midnight",
+                      "redact_emails": True},
+        "accounts": [
+            {"name": "claude-demo", "provider": "claude",
+             "home": "/demo/claude"},
+            {"name": "codex-demo", "provider": "codex",
+             "home": "/demo/codex"},
+        ],
+    }
+    snapshot = {"generated": captured, "accounts": [
+        {"name": "claude-demo", "provider": "claude", "ok": True,
+         "email": "claude-demo@example.invalid", "plan": "Pro",
+         "trust_state": "verified", "captured_at": captured, "stale": False,
+         "windows": {
+             "5h": {"used_percent": 28, "observed_at": captured,
+                    "resets_at": now + 6400},
+             "7d": {"used_percent": 43, "observed_at": captured,
+                    "resets_at": now + 280000}}},
+        {"name": "codex-demo", "provider": "codex", "ok": True,
+         "email": "codex-demo@example.invalid", "plan": "ChatGPT Plus",
+         "trust_state": "verified", "captured_at": captured, "stale": False,
+         "windows": {
+             "5h": {"used_percent": 61, "observed_at": captured,
+                    "resets_at": now + 4200},
+             "7d": {"used_percent": 17, "observed_at": captured,
+                    "resets_at": now + 420000}}},
+    ]}
+    onboarding = _onboarding_projection("demo", config=None, probe=False)
+    return _view(config, snapshot, mode="demo", onboarding=onboarding, now=now)
+
+
 def discover_desktop(now=None):
     state, config, recovery_code = _registry_discovery()
     if state == "recovery":
         return _view(None, mode="recovery", recovery_code=recovery_code, now=now)
+    step, progress_recovery = _load_onboarding(config)
+    if step == "demo":
+        return _demo_view(now=now)
+    if step == "welcome":
+        onboarding = _onboarding_projection(
+            step, config=config, recovery_code=progress_recovery, probe=False)
+        return _view(config, mode="onboarding", onboarding=onboarding, now=now)
     candidates = _candidate_projection(connect.detect_existing(), config)
-    public = paths.load_json(paths.public_snapshot_path()) if config else None
-    mode = "ready" if config else "empty"
-    return _view(config, public, mode=mode, candidates=candidates, now=now)
+    if step in {"providers", "accounts"}:
+        onboarding = _onboarding_projection(
+            step, candidates=candidates, config=config,
+            recovery_code=progress_recovery, probe=True)
+        return _view(config, mode="onboarding", candidates=candidates,
+                     onboarding=onboarding, now=now)
+    public = paths.load_json(paths.public_snapshot_path())
+    onboarding = _onboarding_projection(
+        "complete", candidates=candidates, config=config, probe=False)
+    return _view(config, public, mode="ready", candidates=candidates,
+                 onboarding=onboarding, now=now)
+
+
+def onboarding_desktop(action, now=None):
+    if action not in {"begin", "accounts", "demo", "back", "restart"}:
+        raise BridgeError("invalid_onboarding_action",
+                          "onboarding action is invalid")
+    state, config, recovery_code = _registry_discovery()
+    if state == "recovery":
+        raise BridgeError("recovery_required", recovery_code)
+    if (config or {}).get("accounts"):
+        return discover_desktop(now=now)
+    step, _progress_recovery = _load_onboarding(config)
+    if action == "begin" and step in {"welcome", "providers"}:
+        target = "providers"
+    elif action == "accounts" and step in {"providers", "accounts"}:
+        target = "accounts"
+    elif action == "demo" and step in {
+            "welcome", "providers", "accounts", "demo"}:
+        target = "demo"
+    elif action == "back" and step == "providers":
+        target = "welcome"
+    elif action == "back" and step in {"accounts", "demo"}:
+        target = "providers"
+    elif action == "restart":
+        target = "welcome"
+    else:
+        raise BridgeError("invalid_onboarding_transition",
+                          "onboarding action is not valid from this step")
+    _save_onboarding(target)
+    return discover_desktop(now=now)
 
 
 def refresh_desktop(now=None):
@@ -195,7 +369,11 @@ def adopt_desktop(candidate_id, name, now=None):
     if adopted is None or adopted["provider"] != provider \
             or registry.expand(adopted["home"]) != registry.expand(candidate["home"]):
         raise BridgeError("adoption_conflict", "account registry changed during adoption")
-    return refresh_desktop(now=now)
+    _complete_onboarding()
+    try:
+        return refresh_desktop(now=now)
+    except Exception:  # noqa: BLE001 - adoption remains usable while offline
+        return discover_desktop(now=now)
 
 
 class DesktopLoginManager:
@@ -275,6 +453,7 @@ class DesktopLoginManager:
                     cancel_event=job["cancel"], progress=progress)
             if outcome.get("ok"):
                 progress("publishing")
+                _complete_onboarding()
                 if job["provider"] == "codex" and outcome.get("observation"):
                     now = int(time.time())
                     observed = outcome["observation"]
@@ -421,7 +600,7 @@ def _handle(command, args):
             "architecture": platform.machine(),
             "capabilities": [
                 "fixture_snapshot", "discover", "adopt", "refresh",
-                "claude_login", "codex_device_login", "shutdown"],
+                "claude_login", "codex_device_login", "onboarding", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
@@ -433,6 +612,10 @@ def _handle(command, args):
         if set(args) - {"now"}:
             raise BridgeError("invalid_args", "discover arguments are invalid")
         return discover_desktop(args.get("now")), False
+    if command == "onboarding":
+        if set(args) - {"action", "now"}:
+            raise BridgeError("invalid_args", "onboarding arguments are invalid")
+        return onboarding_desktop(args.get("action"), args.get("now")), False
     if command == "adopt":
         if set(args) - {"candidate_id", "name", "now"}:
             raise BridgeError("invalid_args", "adopt arguments are invalid")

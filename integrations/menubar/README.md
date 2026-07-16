@@ -7,6 +7,13 @@ sanitized live account state, and can adopt one verified existing login into a
 named slot. It does not require `headroom serve`, a browser, a localhost URL,
 or a system Python installation.
 
+On a clean first launch, the app presents its local-data, provider-read, and
+credential-ownership disclosures before probing either provider. Continuing
+starts a resumable provider-readiness and account journey; choosing demo mode
+renders fresh bundled sample data without a provider CLI, account, credential,
+or network read. The only persisted onboarding data is a private schema and
+step marker.
+
 The app can also start fresh Claude and Codex logins in Headroom-owned slots.
 Both run without a controlling Terminal, require verified current provider
 CLIs, publish stable progress/diagnostic codes, support cancel, and roll back
@@ -19,8 +26,8 @@ The dashboard's deliberate visual language is a black terminal canvas with
 phosphor-green monospace text and glowing capacity bars. Limited and uncertain
 states retain distinct red and amber treatments for accessibility.
 
-This is still an implementation build, not a production release. Fresh-login
-setup, complete account management, signing, notarization, updates, and release
+This is still an implementation build, not a production release. Complete
+account management, signing, notarization, updates, and release
 distribution are delivered by the follow-on desktop issues linked from
 [the desktop PRD](https://github.com/tonyflo79/headroom/issues/1).
 
@@ -39,9 +46,9 @@ Headroom.app
   `headroom_desktop_bridge@1` schema, frozen runtime, and required capability.
 - Engine stdout is protocol-only. Imported or child-process output is diverted
   to stderr and Rust never logs its contents.
-- The bridge exposes only narrow account, refresh, and login-job commands. Calls
-  are serialized, bounded, and a timed-out or malformed session is retired so
-  a late frame cannot be mistaken for a later response.
+- The bridge exposes only narrow onboarding, account, refresh, and login-job
+  commands. Calls are serialized, bounded, and a timed-out or malformed session
+  is retired so a late frame cannot be mistaken for a later response.
 - Only `headroom_desktop_view@1`, derived from the existing fail-closed widget
   projection, crosses the bridge. Identity is always email-redacted; credential
   paths, fingerprints, raw credentials, and provider payloads never cross it.

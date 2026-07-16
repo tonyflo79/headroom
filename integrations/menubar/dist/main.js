@@ -1,5 +1,27 @@
 const VALID_STATES = new Set(["current", "limited", "held", "stale"]);
-const VALID_MODES = new Set(["ready", "empty", "recovery"]);
+const VALID_MODES = new Set(["ready", "onboarding", "demo", "recovery"]);
+const ONBOARDING_STEPS = new Set(["welcome", "providers", "accounts", "demo", "complete"]);
+const PROVIDER_STATES = new Set(["unchecked", "ready", "missing", "upgrade_required"]);
+
+export function accountNameError(value, existingNames = []) {
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(value)) {
+    return "Use lowercase letters, digits, - or _ (32 characters maximum)";
+  }
+  if (new Set(existingNames).has(value)) return "That slot name is already in use";
+  return null;
+}
+
+export function suggestedAccountName(provider, existingNames = [], suffix = "1") {
+  const base = provider === "claude" || provider === "codex" ? provider : "account";
+  const used = new Set(existingNames);
+  const preferred = `${base}-${suffix}`;
+  if (!used.has(preferred)) return preferred;
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${base}-${index}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return `${base}-${Date.now().toString(36).slice(-6)}`;
+}
 
 export function percentLeft(windowValue) {
   if (!windowValue || windowValue.state !== "current") {
@@ -86,10 +108,30 @@ export function normalizeBootstrap(raw) {
   const candidates = Array.isArray(view.candidates) ? view.candidates.filter((row) =>
     typeof row?.id === "string" && typeof row?.identity === "string" &&
     (row.provider === "claude" || row.provider === "codex")) : [];
+  const rawOnboarding = view.onboarding && typeof view.onboarding === "object"
+    ? view.onboarding : {};
+  const step = ONBOARDING_STEPS.has(rawOnboarding.step)
+    ? rawOnboarding.step : (view.mode === "ready" ? "complete" : "welcome");
+  const providers = Array.isArray(rawOnboarding.providers)
+    ? rawOnboarding.providers.filter((row) =>
+      (row?.provider === "claude" || row?.provider === "codex") &&
+      PROVIDER_STATES.has(row?.state)).map((row) => ({
+        provider: row.provider,
+        state: row.state,
+        candidate_available: row.candidate_available === true,
+        connected_count: Number.isInteger(row.connected_count) && row.connected_count >= 0
+          ? row.connected_count : 0,
+      })) : [];
   return {
     bridge: raw.bridge,
     view: { ...view, mode: VALID_MODES.has(view.mode) ? view.mode : "recovery",
-      accounts, candidates },
+      accounts, candidates, onboarding: {
+        schema: "headroom_desktop_onboarding@1", step,
+        resumable: rawOnboarding.resumable === true,
+        recovery_code: typeof rawOnboarding.recovery_code === "string"
+          ? rawOnboarding.recovery_code : null,
+        providers,
+      } },
   };
 }
 
@@ -151,7 +193,7 @@ function accountCard(account) {
   return article;
 }
 
-function candidateCard(candidate, invoke, update) {
+function candidateCard(candidate, invoke, update, existingNames = []) {
   const form = document.createElement("form");
   form.className = "candidate";
   const text = document.createElement("span");
@@ -159,30 +201,44 @@ function candidateCard(candidate, invoke, update) {
   const input = document.createElement("input");
   input.required = true;
   input.pattern = "[a-z0-9][a-z0-9_-]{0,31}";
-  input.value = `${candidate.provider}-1`;
+  input.value = suggestedAccountName(candidate.provider, existingNames);
   input.setAttribute("aria-label", `Slot name for ${candidate.provider}`);
   const button = document.createElement("button");
   button.type = "submit";
   button.textContent = "Adopt";
-  form.append(text, input, button);
+  const diagnostic = document.createElement("p");
+  diagnostic.className = "diagnostic inline-diagnostic";
+  diagnostic.setAttribute("aria-live", "polite");
+  const validate = () => {
+    const error = accountNameError(input.value, existingNames);
+    input.setCustomValidity(error || "");
+    diagnostic.textContent = error || "";
+    button.disabled = Boolean(error);
+    return !error;
+  };
+  input.addEventListener("input", validate);
+  form.append(text, input, button, diagnostic);
+  validate();
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!validate()) return;
     button.disabled = true;
     button.textContent = "Adopting…";
     try {
       update(await invoke("desktop_adopt", {
         candidateId: candidate.id, name: input.value,
       }));
-    } catch (error) {
-      button.textContent = String(error);
+    } catch {
+      diagnostic.textContent = "Account adoption could not be completed safely";
     } finally {
+      button.textContent = "Adopt";
       button.disabled = false;
     }
   });
   return form;
 }
 
-function providerLoginCard(provider, invoke, update) {
+function providerLoginCard(provider, invoke, update, existingNames = []) {
   const form = document.createElement("form");
   form.className = "provider-login";
   const title = document.createElement("strong");
@@ -193,7 +249,7 @@ function providerLoginCard(provider, invoke, update) {
   const name = document.createElement("input");
   name.required = true;
   name.pattern = "[a-z0-9][a-z0-9_-]{0,31}";
-  name.value = `${provider}-new`;
+  name.value = suggestedAccountName(provider, existingNames, "new");
   name.placeholder = "slot name";
   name.setAttribute("aria-label", `${label} slot name`);
   const expected = document.createElement("input");
@@ -216,6 +272,19 @@ function providerLoginCard(provider, invoke, update) {
   fields.append(name, expected, start, cancel);
   form.append(title, fields, device, diagnostic);
 
+  let running = false;
+  const validate = () => {
+    const error = accountNameError(name.value, existingNames);
+    name.setCustomValidity(error || "");
+    if (!running) {
+      diagnostic.textContent = error || "";
+      start.disabled = Boolean(error);
+    }
+    return !error;
+  };
+  name.addEventListener("input", validate);
+  validate();
+
   const showInstructions = (raw) => {
     const instructions = normalizeDeviceInstructions(raw);
     if (!instructions) { device.hidden = true; device.replaceChildren(); return; }
@@ -232,6 +301,8 @@ function providerLoginCard(provider, invoke, update) {
   };
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!validate()) return;
+    running = true;
     start.disabled = true;
     name.disabled = true;
     expected.disabled = true;
@@ -256,9 +327,10 @@ function providerLoginCard(provider, invoke, update) {
       diagnostic.textContent = loginMessage(job.result_code);
       showInstructions(null);
       if (job.state === "succeeded" && job.view) update(job.view);
-    } catch (error) {
-      diagnostic.textContent = String(error);
+    } catch {
+      diagnostic.textContent = loginMessage("internal_error");
     } finally {
+      running = false;
       start.disabled = false;
       name.disabled = false;
       expected.disabled = false;
@@ -267,6 +339,159 @@ function providerLoginCard(provider, invoke, update) {
     }
   });
   return form;
+}
+
+export function onboardingPresentation(onboarding) {
+  const step = ONBOARDING_STEPS.has(onboarding?.step) ? onboarding.step : "welcome";
+  if (step === "providers") return {
+    title: "> provider readiness",
+    headline: "Choose which provider accounts to use",
+  };
+  if (step === "accounts") return {
+    title: "> add accounts",
+    headline: "Adopt an existing login or connect a new one",
+  };
+  if (step === "demo") return {
+    title: "> demo mode",
+    headline: "Bundled sample data · no provider access",
+  };
+  if (step === "complete") return {
+    title: "> setup complete",
+    headline: "Your verified dashboard is ready",
+  };
+  return {
+    title: "> welcome to headroom",
+    headline: "Review privacy and credential ownership before setup",
+  };
+}
+
+function actionButton(label, handler, className = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.className = className;
+  button.onclick = async () => {
+    button.disabled = true;
+    try { await handler(); }
+    catch {
+      document.getElementById("headline").textContent =
+        "Setup action could not be completed safely";
+    }
+    finally { button.disabled = false; }
+  };
+  return button;
+}
+
+function providerReadinessCard(provider) {
+  const card = document.createElement("article");
+  card.className = `provider-readiness provider-${provider.state}`;
+  const name = document.createElement("strong");
+  name.textContent = provider.provider === "claude" ? "Claude" : "Codex";
+  const state = document.createElement("span");
+  state.className = "state";
+  state.textContent = provider.state.replace("_", " ");
+  const detail = document.createElement("p");
+  const messages = {
+    unchecked: "Not checked yet",
+    ready: "CLI supports a verified desktop login",
+    missing: "CLI not found; demo and the other provider remain available",
+    upgrade_required: "Installed CLI must be updated before a new login",
+  };
+  detail.textContent = messages[provider.state] || messages.unchecked;
+  if (provider.candidate_available) detail.textContent += " · existing login available";
+  card.append(name, state, detail);
+  return card;
+}
+
+function prerequisiteCard(provider) {
+  const card = document.createElement("article");
+  card.className = "provider-prerequisite";
+  const label = provider.provider === "claude" ? "Claude Code" : "Codex";
+  const title = document.createElement("strong");
+  title.textContent = `> ${label} unavailable for a new login`;
+  const detail = document.createElement("p");
+  detail.textContent = provider.state === "missing"
+    ? `Install ${label}, then return to provider readiness.`
+    : `Update ${label} to a supported version, then return to provider readiness.`;
+  card.append(title, detail);
+  return card;
+}
+
+function onboardingPanel(view, invoke, update) {
+  const onboarding = view.onboarding;
+  const presentation = onboardingPresentation(onboarding);
+  const panel = document.createElement("section");
+  panel.className = "onboarding-panel";
+  panel.setAttribute("aria-labelledby", "onboarding-title");
+  const title = document.createElement("h3");
+  title.id = "onboarding-title";
+  title.textContent = presentation.title;
+  panel.append(title);
+
+  const run = async (action) => update(await invoke("desktop_onboarding", { action }));
+  const controls = document.createElement("div");
+  controls.className = "onboarding-controls";
+  if (onboarding.step === "welcome") {
+    const intro = document.createElement("p");
+    intro.textContent = "Headroom keeps its registry and usage snapshots on this Mac.";
+    const disclosures = document.createElement("ul");
+    for (const copy of [
+      "Claude and Codex keep ownership of their own credential files and Keychain items.",
+      "After you continue, Headroom may ask provider CLIs for identity and subscription capacity.",
+      "Account routing is optional and can be configured after setup.",
+      "Raw credentials and provider payloads never enter this dashboard.",
+    ]) {
+      const item = document.createElement("li");
+      item.textContent = copy;
+      disclosures.append(item);
+    }
+    const recovery = onboarding.recovery_code ? document.createElement("p") : null;
+    if (recovery) {
+      recovery.className = "onboarding-warning";
+      recovery.textContent = "Prior setup progress could not be trusted; setup restarted safely.";
+    }
+    panel.append(intro, disclosures);
+    if (recovery) panel.append(recovery);
+    controls.append(
+      actionButton("Begin setup", () => run("begin"), "primary"),
+      actionButton("Explore demo", () => run("demo")),
+    );
+  } else if (onboarding.step === "providers") {
+    const copy = document.createElement("p");
+    copy.textContent = "Provider checks reveal only readiness—not paths, versions, or credentials.";
+    const grid = document.createElement("div");
+    grid.className = "provider-grid";
+    grid.append(...onboarding.providers.map(providerReadinessCard));
+    panel.append(copy, grid);
+    controls.append(
+      actionButton("Choose accounts", () => run("accounts"), "primary"),
+      actionButton("View demo", () => run("demo")),
+      actionButton("Back", () => run("back")),
+    );
+  } else if (onboarding.step === "accounts") {
+    const copy = document.createElement("p");
+    copy.textContent = "Add Claude, Codex, both, or use demo mode with neither provider.";
+    panel.append(copy);
+    controls.append(
+      actionButton("View demo", () => run("demo")),
+      actionButton("Back", () => run("back")),
+    );
+  }
+  panel.append(controls);
+  return panel;
+}
+
+function demoPanel(invoke, update) {
+  const panel = document.createElement("section");
+  panel.className = "demo-panel";
+  const title = document.createElement("strong");
+  title.textContent = "> sample fleet only";
+  const copy = document.createElement("p");
+  copy.textContent = "These bundled readings are illustrative. No provider CLI, account, credential, or network read was used.";
+  panel.append(title, copy, actionButton("Set up real accounts", async () => {
+    update(await invoke("desktop_onboarding", { action: "back" }));
+  }, "primary"));
+  return panel;
 }
 
 export function renderBootstrap(raw, invoke = null) {
@@ -279,18 +504,39 @@ export function renderBootstrap(raw, invoke = null) {
     `Engine ${value.bridge.product_version} · ${value.bridge.architecture}`;
   const average = typeof view.headline?.avg_5h_left_percent === "number"
     ? view.headline.avg_5h_left_percent : Number.NaN;
+  const presentation = onboardingPresentation(view.onboarding);
+  document.getElementById("fleet-title").textContent = view.mode === "onboarding"
+    ? "$ headroom setup" : view.mode === "demo" ? "$ headroom demo" : "$ headroom status";
   document.getElementById("headline").textContent = view.mode === "recovery"
     ? `Safe recovery required (${view.recovery_code || "unknown"}); no files were changed`
-    : Number.isFinite(average) ? `${Math.round(average)}% average five-hour headroom`
-      : view.mode === "empty" ? "Adopt an existing login to begin" : "No current five-hour reading";
+    : view.mode === "onboarding" || view.mode === "demo" ? presentation.headline
+      : Number.isFinite(average) ? `${Math.round(average)}% average five-hour headroom`
+        : "No current five-hour reading";
   document.getElementById("accounts").replaceChildren(...view.accounts.map(accountCard));
   const actions = document.getElementById("actions");
   const update = (nextView) => renderBootstrap({ bridge: value.bridge, view: nextView }, invoke);
-  const actionCards = invoke && view.mode !== "recovery" ? [
-    ...view.candidates.map((row) => candidateCard(row, invoke, update)),
-    providerLoginCard("claude", invoke, update),
-    providerLoginCard("codex", invoke, update),
-  ] : [];
+  const existingNames = view.accounts.map((row) => row.name);
+  let actionCards = [];
+  if (invoke && view.mode === "onboarding") {
+    actionCards = [onboardingPanel(view, invoke, update)];
+    if (view.onboarding.step === "accounts") {
+      actionCards.push(...view.candidates.map((row) =>
+        candidateCard(row, invoke, update, existingNames)));
+      for (const provider of view.onboarding.providers) {
+        actionCards.push(provider.state === "ready"
+          ? providerLoginCard(provider.provider, invoke, update, existingNames)
+          : prerequisiteCard(provider));
+      }
+    }
+  } else if (invoke && view.mode === "demo") {
+    actionCards = [demoPanel(invoke, update)];
+  } else if (invoke && view.mode === "ready") {
+    actionCards = [
+      ...view.candidates.map((row) => candidateCard(row, invoke, update, existingNames)),
+      providerLoginCard("claude", invoke, update, existingNames),
+      providerLoginCard("codex", invoke, update, existingNames),
+    ];
+  }
   actions.replaceChildren(...actionCards);
   const refresh = document.getElementById("refresh");
   refresh.disabled = !invoke || view.mode !== "ready";
@@ -300,7 +546,8 @@ export function renderBootstrap(raw, invoke = null) {
     refresh.setAttribute("aria-busy", String(pending.busy));
     refresh.textContent = pending.label;
     try { update(await invoke("desktop_refresh")); }
-    catch (error) { document.getElementById("headline").textContent = String(error); }
+    catch { document.getElementById("headline").textContent =
+      "Refresh could not be completed safely"; }
     finally {
       const settled = refreshPresentation(false);
       refresh.textContent = settled.label;
