@@ -61,11 +61,24 @@ paths, or unredacted identities.
 
 ## Evidence record
 
-Status: automated contract tests complete; exact packaged-app evidence pending
+Status: complete for implementation commit `49ef11a3c410592829039e06e186b432496ef2fa`
 
 | UTC time | Build commit | Scenario | Result | Status |
 |---|---|---|---|---|
-| pending | pending | exact frozen and signed build | pending | pending |
+| 2026-07-16T14:02:36Z | `49ef11a` | automated lifecycle contracts | 135 focused Python, 19 Rust, and 15 frontend tests passed | pass |
+| 2026-07-16T14:02:36Z | `49ef11a` | exact frozen and ad-hoc-signed arm64 build | Frozen handshake advertised `resilient_collection`; strict deep code-sign verification passed | pass |
+| 2026-07-16T14:02:36Z | `49ef11a` | 12 simultaneous launches | One app, one two-process PyInstaller engine tree, one private activation socket, and one private lock holder survived | pass |
+| 2026-07-16T14:02:36Z | `49ef11a` | idle engine exit | Original app PID stayed alive, `RECOVERING` appeared without Refresh, and one replacement engine tree reached `CURRENT` | pass |
+| 2026-07-16T14:02:36Z | `49ef11a` | three rolling engine exits | Third exit stopped automatic restart in `DEGRADED` with an allowlisted stable engine code and no engine process | pass |
+| 2026-07-16T14:02:36Z | `49ef11a` | manual Retry engine | One accessible Retry action launched one replacement engine tree and restored `CURRENT` | pass |
+| 2026-07-16T14:02:36Z | `49ef11a` | force-quit and stale-endpoint relaunch | Sidecar tree exited when the bridge closed; relaunch replaced the stale socket and produced one app plus one engine tree | pass |
+| 2026-07-16T14:02:36Z | `49ef11a` | normal Quit | App and sidecar exited, socket pathname was removed, lock had no holder, and no TCP listener was present | pass |
+
+Startup timeout, pre-handshake exit, incompatible handshake, mid-request exit,
+and fail-closed diagnostic projection are covered by the automated bridge,
+Rust lifecycle, and frontend contract tests. The exact packaged run additionally
+proved that startup and recovery remained interactive and that an idle engine
+exit was detected without a user command.
 
 The Midnight presentation remains a black canvas with phosphor-green text and
 glowing bars. `RECOVERING` retains the green glow; `DEGRADED` uses amber plus
