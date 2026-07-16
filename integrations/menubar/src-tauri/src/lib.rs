@@ -15,7 +15,7 @@ use std::{
     net::TcpStream,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -30,6 +30,7 @@ use tauri::{
     AppHandle, Manager, PhysicalPosition, PhysicalSize, Url, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tauri_plugin_positioner::{Position, WindowExt};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
@@ -95,6 +96,8 @@ const DESKTOP_POPOVER_HEIGHT: f64 = 680.0;
 const WINDOW_STATE_SCHEMA: &str = "headroom_desktop_window@1";
 const DESKTOP_THEMES: [&str; 5] = ["midnight", "minimal", "chrome", "paper", "terminal"];
 const COLLECTION_IDLE_INTERVAL: Duration = Duration::from_secs(300);
+const COLLECTION_INTERVAL_MIN_SECONDS: u64 = 60;
+const COLLECTION_INTERVAL_MAX_SECONDS: u64 = 3600;
 const COLLECTION_RETRY_BASE: Duration = Duration::from_secs(5);
 const COLLECTION_RETRY_CAP: Duration = Duration::from_secs(300);
 const COLLECTION_TICK: Duration = Duration::from_secs(15);
@@ -357,21 +360,37 @@ impl CollectionPolicy {
         delay
     }
 
-    fn due(&self, now: Instant) -> bool {
+    fn due(&self, now: Instant, interval: Duration) -> bool {
         match self.retry_at {
             Some(retry_at) => now >= retry_at,
             None => self
                 .last_success_at
-                .is_none_or(|last| now.duration_since(last) >= COLLECTION_IDLE_INTERVAL),
+                .is_none_or(|last| now.duration_since(last) >= interval),
         }
     }
 }
 
-#[derive(Default)]
 struct CollectionScheduler {
     enabled: AtomicBool,
     running: AtomicBool,
+    interval_seconds: AtomicU64,
     policy: Mutex<CollectionPolicy>,
+}
+
+impl Default for CollectionScheduler {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            interval_seconds: AtomicU64::new(COLLECTION_IDLE_INTERVAL.as_secs()),
+            policy: Mutex::new(CollectionPolicy::default()),
+        }
+    }
+}
+
+struct StartupRouting {
+    login_launch: bool,
+    decision_complete: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -394,10 +413,10 @@ impl DesktopStore {
             .lock()
             .map_err(|_| "desktop snapshot store is unavailable".to_string())?;
         let revision = current.as_ref().map_or(1, |snapshot| snapshot.revision + 1);
-        let theme = current
-            .as_ref()
-            .map(|snapshot| snapshot.theme.clone())
-            .unwrap_or_else(|| configured_theme(&view).to_string());
+        // The engine owns the authoritative, validated preference. Every
+        // settings mutation returns a fresh view, so theme propagation must
+        // follow that view instead of retaining the previous in-memory value.
+        let theme = configured_theme(&view).to_string();
         let snapshot = DesktopSnapshot {
             revision,
             theme,
@@ -444,11 +463,24 @@ struct WindowPlacement {
     height: u32,
 }
 
-#[derive(Default)]
 struct DesktopUiState {
     placement: Mutex<Option<WindowPlacement>>,
     last_tray_rect: Mutex<Option<tauri::Rect>>,
     popover_opened_at: Mutex<Option<Instant>>,
+    remember_window: AtomicBool,
+    window_preference_seen: AtomicBool,
+}
+
+impl Default for DesktopUiState {
+    fn default() -> Self {
+        Self {
+            placement: Mutex::new(None),
+            last_tray_rect: Mutex::new(None),
+            popover_opened_at: Mutex::new(None),
+            remember_window: AtomicBool::new(true),
+            window_preference_seen: AtomicBool::new(false),
+        }
+    }
 }
 
 struct AppState {
@@ -1235,6 +1267,7 @@ fn validate_desktop_bootstrap(
                 "account_lifecycle",
                 "reauthentication",
                 "resilient_collection",
+                "validated_settings",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -1291,7 +1324,14 @@ fn desktop_startup_view() -> serde_json::Value {
         "settings": {
             "title": "Headroom", "theme": "terminal",
             "redact_emails": true, "reserve_percent": 0,
-            "auto_handoff": true,
+            "auto_handoff": true, "refresh_interval_seconds": 300,
+            "provider_paths": {}, "preferred_terminal": "terminal",
+            "remember_window": true,
+            "notifications": {
+                "enabled": false, "reset_enabled": false,
+                "global_threshold_percent": 20,
+                "provider_threshold_percent": {},
+            },
         },
     })
 }
@@ -1411,6 +1451,7 @@ fn build_desktop_window(
     app: &AppHandle,
     handshake: &serde_json::Value,
     snapshot: &DesktopSnapshot,
+    visible: bool,
 ) -> tauri::Result<WebviewWindow> {
     let script = desktop_initialization_script(handshake, snapshot, "main");
     WebviewWindowBuilder::new(
@@ -1422,7 +1463,7 @@ fn build_desktop_window(
     .inner_size(900.0, 650.0)
     .min_inner_size(680.0, 480.0)
     .resizable(true)
-    .visible(true)
+    .visible(visible)
     .initialization_script(&script)
     .on_navigation(|url| url.as_str() == "about:blank" || is_bundled_page(url))
     .build()
@@ -1482,6 +1523,75 @@ fn collection_enabled(view: &serde_json::Value) -> bool {
             .is_some_and(|accounts| !accounts.is_empty())
 }
 
+fn configured_refresh_interval(view: &serde_json::Value) -> Duration {
+    let seconds = view
+        .pointer("/settings/refresh_interval_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(COLLECTION_IDLE_INTERVAL.as_secs())
+        .clamp(
+            COLLECTION_INTERVAL_MIN_SECONDS,
+            COLLECTION_INTERVAL_MAX_SECONDS,
+        );
+    Duration::from_secs(seconds)
+}
+
+fn login_launch_requires_window(view: &serde_json::Value) -> bool {
+    matches!(
+        view.get("mode").and_then(serde_json::Value::as_str),
+        Some("onboarding" | "recovery")
+    )
+}
+
+fn finish_login_launch_routing(app: &AppHandle, view: &serde_json::Value) {
+    let Some(startup) = app.try_state::<StartupRouting>() else {
+        return;
+    };
+    if !startup.login_launch || startup.decision_complete.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if login_launch_requires_window(view) {
+        let _ = show_desktop_window(app, Some("settings"));
+    }
+}
+
+fn apply_window_preference(app: &AppHandle, view: &serde_json::Value) {
+    let remember = view
+        .pointer("/settings/remember_window")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let ui = app.state::<DesktopUiState>();
+    let previous = ui.remember_window.swap(remember, Ordering::SeqCst);
+    let seen = ui.window_preference_seen.swap(true, Ordering::SeqCst);
+    if remember || (seen && !previous) {
+        return;
+    }
+    if let Ok(path) = window_state_path(app) {
+        let _ = fs::remove_file(path);
+    }
+    if let Some(window) = app.get_webview_window(DESKTOP_WINDOW_LABEL) {
+        let _ = window.center();
+        if let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) {
+            if let Ok(mut placement) = ui.placement.lock() {
+                *placement = Some(WindowPlacement {
+                    x: position.x,
+                    y: position.y,
+                    width: size.width,
+                    height: size.height,
+                });
+            }
+        }
+    }
+}
+
+fn show_login_launch_recovery(app: &AppHandle) {
+    let Some(startup) = app.try_state::<StartupRouting>() else {
+        return;
+    };
+    if startup.login_launch && !startup.decision_complete.swap(true, Ordering::SeqCst) {
+        let _ = show_desktop_window(app, None);
+    }
+}
+
 fn push_snapshot_to_windows(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let payload = serde_json::to_string(&snapshot_envelope(snapshot))
         .expect("sanitized desktop snapshot serializes");
@@ -1519,8 +1629,14 @@ fn publish_desktop_view(
         scheduler
             .enabled
             .store(collection_enabled(&snapshot.view), Ordering::SeqCst);
+        scheduler.interval_seconds.store(
+            configured_refresh_interval(&snapshot.view).as_secs(),
+            Ordering::SeqCst,
+        );
     }
+    apply_window_preference(app, &snapshot.view);
     push_snapshot_to_windows(app, &snapshot);
+    finish_login_launch_routing(app, &snapshot.view);
     Ok(snapshot)
 }
 
@@ -1918,15 +2034,71 @@ async fn desktop_cancel_login(
     Ok(value)
 }
 
-#[tauri::command]
-fn desktop_set_theme(
+async fn update_desktop_settings(
     app: AppHandle,
-    state: tauri::State<'_, DesktopStore>,
+    engine: DesktopEngine,
+    patch: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if !patch.is_object() {
+        return Err("desktop settings patch is invalid".into());
+    }
+    let value = engine_command(
+        app.clone(),
+        engine,
+        "update_settings",
+        serde_json::json!({"patch": patch}),
+    )
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
+}
+
+#[tauri::command]
+async fn desktop_set_theme(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
     theme: String,
 ) -> Result<serde_json::Value, String> {
-    let snapshot = state.set_theme(&theme)?;
-    push_snapshot_to_windows(&app, &snapshot);
-    Ok(snapshot_envelope(&snapshot))
+    update_desktop_settings(
+        app,
+        state.inner().clone(),
+        serde_json::json!({"theme": theme}),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn desktop_update_settings(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    patch: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    update_desktop_settings(app, state.inner().clone(), patch).await
+}
+
+#[tauri::command]
+fn desktop_launch_at_login_status(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|_| "launch at login status is unavailable".to_string())
+}
+
+#[tauri::command]
+fn desktop_set_launch_at_login(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|_| "launch at login could not be updated".to_string())?;
+    let actual = manager
+        .is_enabled()
+        .map_err(|_| "launch at login status is unavailable".to_string())?;
+    if actual != enabled {
+        return Err("launch at login did not reach the requested state".into());
+    }
+    Ok(actual)
 }
 
 #[tauri::command]
@@ -1983,7 +2155,16 @@ fn desktop_show_dashboard(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn desktop_show_settings(app: AppHandle) -> Result<(), String> {
-    show_desktop_window(&app, Some("appearance"))
+    show_desktop_window(&app, Some("settings"))
+}
+
+#[tauri::command]
+fn desktop_hide_dashboard(app: AppHandle) -> Result<(), String> {
+    save_window_placement(&app)?;
+    app.get_webview_window(DESKTOP_WINDOW_LABEL)
+        .ok_or_else(|| "desktop window is unavailable".to_string())?
+        .hide()
+        .map_err(|_| "desktop window could not be hidden".to_string())
 }
 
 #[tauri::command]
@@ -2220,6 +2401,7 @@ fn start_desktop_engine_async(app: &AppHandle) {
                 }
             }
             Err(_) => {
+                show_login_launch_recovery(&app);
                 let (state, code, retry) = engine.recovery.lock().map_or(
                     ("degraded", Some("engine_state_unavailable"), None),
                     |policy| {
@@ -2407,9 +2589,12 @@ fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
 
 fn start_collection_scheduler(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let enabled = collection_enabled(&snapshot.view);
-    app.state::<CollectionScheduler>()
-        .enabled
-        .store(enabled, Ordering::SeqCst);
+    let scheduler = app.state::<CollectionScheduler>();
+    scheduler.enabled.store(enabled, Ordering::SeqCst);
+    scheduler.interval_seconds.store(
+        configured_refresh_interval(&snapshot.view).as_secs(),
+        Ordering::SeqCst,
+    );
     if enabled {
         let now = Instant::now();
         let freshness_current = snapshot
@@ -2441,7 +2626,13 @@ fn start_collection_scheduler(app: &AppHandle, snapshot: &DesktopSnapshot) {
                 .state::<CollectionScheduler>()
                 .policy
                 .lock()
-                .map(|policy| policy.due(Instant::now()))
+                .map(|policy| {
+                    let seconds = app
+                        .state::<CollectionScheduler>()
+                        .interval_seconds
+                        .load(Ordering::SeqCst);
+                    policy.due(Instant::now(), Duration::from_secs(seconds))
+                })
                 .unwrap_or(false);
             if due {
                 request_scheduled_collection(&app, "schedule");
@@ -2484,7 +2675,7 @@ fn toggle_desktop_popover(app: &AppHandle) {
 fn build_desktop_tray(app: &AppHandle) -> tauri::Result<()> {
     let dashboard = MenuItem::with_id(app, "dashboard", "Open Dashboard", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
-    let settings = MenuItem::with_id(app, "settings", "Appearance…", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&dashboard, &refresh, &settings, &quit])?;
     let snapshot = app.state::<DesktopStore>().snapshot().ok();
@@ -2504,7 +2695,7 @@ fn build_desktop_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "refresh" => request_scheduled_collection(app, "manual"),
             "settings" => {
-                let _ = show_desktop_window(app, Some("appearance"));
+                let _ = show_desktop_window(app, Some("settings"));
             }
             "quit" => app.exit(0),
             _ => {}
@@ -2583,6 +2774,16 @@ fn load_window_placement(app: &AppHandle) -> Option<WindowPlacement> {
 }
 
 fn save_window_placement(app: &AppHandle) -> Result<(), String> {
+    if !app
+        .state::<DesktopUiState>()
+        .remember_window
+        .load(Ordering::SeqCst)
+    {
+        if let Ok(path) = window_state_path(app) {
+            let _ = fs::remove_file(path);
+        }
+        return Ok(());
+    }
     let Some(placement) = *app
         .state::<DesktopUiState>()
         .placement
@@ -2658,6 +2859,8 @@ fn restore_window_placement(window: &WebviewWindow) {
 }
 
 pub fn run() {
+    let login_launch = std::env::args_os()
+        .any(|argument| argument == std::ffi::OsStr::new("--headroom-login-launch"));
     #[cfg(unix)]
     let SingletonPrimary {
         lock,
@@ -2679,12 +2882,22 @@ pub fn run() {
         listener: Mutex::new(Some(listener)),
     });
     let app = builder
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg("--headroom-login-launch")
+                .app_name("Headroom")
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_positioner::init())
         .manage(DesktopEngine::default())
         .manage(DesktopStore::default())
         .manage(DesktopUiState::default())
         .manage(CollectionScheduler::default())
+        .manage(StartupRouting {
+            login_launch,
+            decision_complete: AtomicBool::new(false),
+        })
         .invoke_handler(tauri::generate_handler![
             desktop_discover,
             desktop_onboarding,
@@ -2700,8 +2913,12 @@ pub fn run() {
             desktop_snapshot,
             desktop_retry_engine,
             desktop_set_theme,
+            desktop_update_settings,
+            desktop_launch_at_login_status,
+            desktop_set_launch_at_login,
             desktop_show_dashboard,
             desktop_show_settings,
+            desktop_hide_dashboard,
             desktop_quit
         ])
         .setup(|app| {
@@ -2724,7 +2941,8 @@ pub fn run() {
                 .state::<DesktopStore>()
                 .replace_view(desktop_startup_view())
                 .map_err(std::io::Error::other)?;
-            let main = build_desktop_window(app.handle(), &handshake, &snapshot)?;
+            let login_launch = app.state::<StartupRouting>().login_launch;
+            let main = build_desktop_window(app.handle(), &handshake, &snapshot, !login_launch)?;
             restore_window_placement(&main);
             let popover = build_desktop_popover(app.handle(), &handshake, &snapshot)?;
             #[cfg(target_os = "macos")]
@@ -3006,6 +3224,7 @@ mod tests {
             "account_lifecycle",
             "reauthentication",
             "resilient_collection",
+            "validated_settings",
         ];
         let compatible = serde_json::json!({
             "product": "headroom",
@@ -3018,7 +3237,7 @@ mod tests {
             "product": "headroom",
             "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
             "runtime": "frozen",
-            "capabilities": capabilities[..8],
+            "capabilities": capabilities[..9],
         });
         assert!(validate_desktop_bootstrap(&incompatible, &view).is_err());
     }
@@ -3059,6 +3278,15 @@ mod tests {
         assert_eq!(themed.revision, 2);
         assert_eq!(themed.theme, "terminal");
         assert_eq!(themed.view, first.view);
+        let persisted = store
+            .replace_view(serde_json::json!({
+                "schema": DESKTOP_VIEW_SCHEMA,
+                "settings": {"theme": "paper"},
+                "accounts": [],
+            }))
+            .unwrap();
+        assert_eq!(persisted.revision, 3);
+        assert_eq!(persisted.theme, "paper");
         assert!(store.set_theme("remote-css").is_err());
     }
 
@@ -3066,18 +3294,57 @@ mod tests {
     fn collection_policy_is_bounded_jittered_and_single_schedule_aware() {
         let started = Instant::now();
         let mut policy = CollectionPolicy::default();
+        let interval = Duration::from_secs(120);
         let first = policy.record_failure(started, 0);
         assert!(first >= Duration::from_secs(4));
         assert!(first <= Duration::from_secs(6));
-        assert!(!policy.due(started));
-        assert!(policy.due(started + first));
+        assert!(!policy.due(started, interval));
+        assert!(policy.due(started + first, interval));
         for entropy in 1..20 {
             let delay = policy.record_failure(started, entropy);
             assert!(delay <= COLLECTION_RETRY_CAP);
         }
         policy.record_success(started);
-        assert!(!policy.due(started + COLLECTION_IDLE_INTERVAL - Duration::from_secs(1)));
-        assert!(policy.due(started + COLLECTION_IDLE_INTERVAL));
+        assert!(!policy.due(started + interval - Duration::from_secs(1), interval));
+        assert!(policy.due(started + interval, interval));
+    }
+
+    #[test]
+    fn configured_collection_interval_is_bounded() {
+        assert_eq!(
+            configured_refresh_interval(&serde_json::json!({
+                "settings": {"refresh_interval_seconds": 420}
+            })),
+            Duration::from_secs(420)
+        );
+        assert_eq!(
+            configured_refresh_interval(&serde_json::json!({
+                "settings": {"refresh_interval_seconds": 5}
+            })),
+            Duration::from_secs(COLLECTION_INTERVAL_MIN_SECONDS)
+        );
+        assert_eq!(
+            configured_refresh_interval(&serde_json::json!({
+                "settings": {"refresh_interval_seconds": 99_999}
+            })),
+            Duration::from_secs(COLLECTION_INTERVAL_MAX_SECONDS)
+        );
+    }
+
+    #[test]
+    fn login_launch_stays_hidden_except_for_required_operator_action() {
+        assert!(!login_launch_requires_window(
+            &serde_json::json!({"mode": "ready"})
+        ));
+        assert!(!login_launch_requires_window(
+            &serde_json::json!({"mode": "demo"})
+        ));
+        assert!(login_launch_requires_window(
+            &serde_json::json!({"mode": "onboarding"})
+        ));
+        assert!(login_launch_requires_window(
+            &serde_json::json!({"mode": "recovery"})
+        ));
     }
 
     #[test]

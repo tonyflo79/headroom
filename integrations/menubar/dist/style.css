@@ -145,21 +145,65 @@ body[data-refresh-state="offline"] .surface-status,
 body[data-refresh-state="backoff"] .surface-status,
 body[data-refresh-state="degraded"] .surface-status { color: var(--warning); }
 
-.appearance-panel {
+.settings-panel {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
-  align-items: end;
-  gap: 14px;
+  gap: 18px;
   margin-top: 18px;
-  padding: 18px;
+  padding: 22px;
   border: 1px solid var(--line);
   background: var(--panel);
-  box-shadow: inset 0 0 24px color-mix(in srgb, var(--glow-color) 8%, transparent);
+  box-shadow: inset 0 0 34px color-mix(in srgb, var(--glow-color) 10%, transparent), var(--glow);
 }
-.appearance-panel[hidden] { display: none; }
-.appearance-panel h2, .appearance-panel p { margin: 0; }
-.appearance-panel p { margin-top: 6px; color: var(--phosphor-dim); font-size: 12px; }
-.appearance-panel label { color: var(--phosphor-dim); font-size: 11px; text-transform: uppercase; }
+.settings-panel[hidden] { display: none; }
+.settings-heading, .settings-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+.settings-panel h2, .settings-panel p { margin: 0; }
+.settings-panel h2 { color: var(--phosphor-bright); font-size: 21px; text-shadow: var(--glow); }
+.settings-heading p:last-child { margin-top: 7px; color: var(--phosphor-dim); font-size: 12px; }
+.settings-panel form { display: grid; gap: 15px; }
+.settings-panel fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 15px;
+  border: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--canvas) 35%, transparent);
+}
+.settings-panel legend {
+  padding: 0 7px;
+  color: var(--phosphor-bright);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-shadow: var(--glow);
+}
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; }
+.settings-field { display: grid; align-content: start; gap: 7px; min-width: 0; }
+.settings-field > span, .settings-check span {
+  color: var(--phosphor-dim);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.settings-field input, .settings-field select { width: 100%; min-width: 0; }
+.settings-field small, .settings-disclosure, .settings-status {
+  color: var(--phosphor-dim);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.settings-check { display: flex; align-items: center; gap: 9px; min-height: 37px; cursor: pointer; }
+.settings-check input { width: 16px; height: 16px; margin: 0; accent-color: var(--phosphor); }
+.settings-disclosure { margin-bottom: 13px !important; }
+.settings-status { grid-column: 1 / -1; min-height: 1.45em; }
+.settings-errors { min-height: 1.45em; color: var(--warning); font-size: 11px; }
+.settings-actions { align-items: center; padding-top: 2px; }
+.settings-actions span { color: var(--phosphor-dim); font-size: 10px; }
+.settings-actions button { flex: 0 0 auto; }
+.settings-panel input:invalid { border-color: var(--danger); }
 .candidate {
   display: grid;
   grid-template-columns: minmax(180px, 1fr) 150px auto;
@@ -321,7 +365,7 @@ body[data-surface="popover"] .summary { font-size: 11px; }
 body[data-surface="popover"] .toolbar { justify-content: flex-end; flex-wrap: wrap; }
 body[data-surface="popover"] .surface-actions { order: 3; width: 100%; justify-content: flex-end; }
 body[data-surface="popover"] .surface-actions button { padding: 7px 9px; font-size: 10px; }
-body[data-surface="popover"] .appearance-panel,
+body[data-surface="popover"] .settings-panel,
 body[data-surface="popover"] #actions { display: none; }
 body[data-surface="popover"] .fleet { margin-top: 22px; }
 body[data-surface="popover"] .section-heading { align-items: flex-start; flex-direction: column; gap: 6px; }
@@ -343,7 +387,9 @@ body[data-surface="popover"] footer { margin-top: 18px; font-size: 9px; }
   .candidate { display: flex; }
   .candidate input, .login-fields input:first-child, .login-fields input[type="email"] { width: 100%; }
   .provider-grid { grid-template-columns: 1fr; }
-  .appearance-panel { grid-template-columns: 1fr; align-items: stretch; }
+  .settings-heading, .settings-actions { align-items: stretch; flex-direction: column; }
+  .settings-grid { grid-template-columns: 1fr; }
+  .settings-actions button { width: 100%; }
   .onboarding-controls { align-items: stretch; flex-direction: column; }
   .lifecycle-controls, .lifecycle-form, .reauthentication { flex-direction: column; }
   .lifecycle-form input { width: 100%; }

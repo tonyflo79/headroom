@@ -34,11 +34,27 @@ from . import paths
 
 PROVIDERS = ("claude", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+THEMES = ("midnight", "minimal", "chrome", "paper", "terminal")
+PREFERRED_TERMINALS = ("terminal", "iterm", "warp")
+REFRESH_INTERVAL_MIN = 60
+REFRESH_INTERVAL_MAX = 3600
 DEFAULT_DASHBOARD = {
     "theme": "midnight",
     "title": "AI Fleet",
     "redact_emails": True,
     "port": 8377,
+}
+DEFAULT_DESKTOP = {
+    "refresh_interval_seconds": 300,
+    "provider_paths": {},
+    "preferred_terminal": "terminal",
+    "remember_window": True,
+    "notifications": {
+        "enabled": False,
+        "reset_enabled": False,
+        "global_threshold_percent": 20,
+        "provider_threshold_percent": {},
+    },
 }
 
 # Model-family -> provider. `pick`/`run` accept any model string; family()
@@ -84,6 +100,33 @@ def expand(path):
 def validate(config):
     if not isinstance(config, dict) or config.get("schema_version") != 1:
         raise RegistryError("config.json missing or wrong schema_version (expected 1)")
+    dashboard = config.get("dashboard")
+    if dashboard is not None and not isinstance(dashboard, dict):
+        raise RegistryError("dashboard settings must be an object")
+    dashboard = dashboard or {}
+    if "theme" in dashboard and dashboard["theme"] not in THEMES:
+        raise RegistryError(f"dashboard theme must be one of {THEMES}")
+    if "title" in dashboard and not _valid_title(dashboard["title"]):
+        raise RegistryError("dashboard title must be 1-80 printable characters")
+    if "redact_emails" in dashboard \
+            and not isinstance(dashboard["redact_emails"], bool):
+        raise RegistryError("dashboard redact_emails must be true or false")
+
+    routing = config.get("routing")
+    if routing is not None and not isinstance(routing, dict):
+        raise RegistryError("routing settings must be an object")
+    routing = routing or {}
+    if "reserve_percent" in routing \
+            and not _valid_number(routing["reserve_percent"], 0, 99):
+        raise RegistryError("routing reserve_percent must be between 0 and 99")
+    if "auto_handoff" in routing \
+            and not isinstance(routing["auto_handoff"], bool):
+        raise RegistryError("routing auto_handoff must be true or false")
+
+    desktop = config.get("desktop")
+    if desktop is not None:
+        _validate_desktop(desktop)
+
     accounts = config.get("accounts")
     if not isinstance(accounts, list) or not accounts:
         raise RegistryError("config.json has no accounts; run `headroom setup`")
@@ -127,6 +170,72 @@ def validate(config):
     return config
 
 
+def _valid_number(value, minimum, maximum):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and minimum <= value <= maximum)
+
+
+def _valid_title(value):
+    return (isinstance(value, str) and value == value.strip()
+            and 1 <= len(value) <= 80
+            and all(ord(character) >= 32 and ord(character) != 127
+                    for character in value))
+
+
+def _valid_provider_path(value):
+    return (isinstance(value, str) and 1 <= len(value) <= 4096
+            and "\0" not in value and os.path.isabs(value))
+
+
+def _validate_desktop(desktop):
+    if not isinstance(desktop, dict):
+        raise RegistryError("desktop settings must be an object")
+    interval = desktop.get("refresh_interval_seconds", 300)
+    if not isinstance(interval, int) or isinstance(interval, bool) \
+            or not REFRESH_INTERVAL_MIN <= interval <= REFRESH_INTERVAL_MAX:
+        raise RegistryError(
+            f"desktop refresh interval must be {REFRESH_INTERVAL_MIN}-"
+            f"{REFRESH_INTERVAL_MAX} seconds")
+    terminal = desktop.get("preferred_terminal", "terminal")
+    if terminal not in PREFERRED_TERMINALS:
+        raise RegistryError(
+            f"desktop preferred terminal must be one of {PREFERRED_TERMINALS}")
+    if "remember_window" in desktop \
+            and not isinstance(desktop["remember_window"], bool):
+        raise RegistryError("desktop remember_window must be true or false")
+    provider_paths = desktop.get("provider_paths", {})
+    if not isinstance(provider_paths, dict) \
+            or set(provider_paths) - set(PROVIDERS):
+        raise RegistryError("desktop provider paths are invalid")
+    for provider, value in provider_paths.items():
+        if not _valid_provider_path(value):
+            raise RegistryError(
+                f"desktop {provider} path must be an absolute executable path")
+    notifications = desktop.get("notifications", {})
+    if not isinstance(notifications, dict):
+        raise RegistryError("desktop notification settings must be an object")
+    allowed = {"enabled", "reset_enabled", "global_threshold_percent",
+               "provider_threshold_percent"}
+    if set(notifications) - allowed:
+        raise RegistryError("desktop notification settings contain unknown fields")
+    for key in ("enabled", "reset_enabled"):
+        if key in notifications and not isinstance(notifications[key], bool):
+            raise RegistryError(f"desktop notifications {key} must be true or false")
+    threshold = notifications.get("global_threshold_percent", 20)
+    if not isinstance(threshold, int) or isinstance(threshold, bool) \
+            or not 1 <= threshold <= 99:
+        raise RegistryError("desktop notification threshold must be 1-99 percent")
+    provider_thresholds = notifications.get("provider_threshold_percent", {})
+    if not isinstance(provider_thresholds, dict) \
+            or set(provider_thresholds) - set(PROVIDERS):
+        raise RegistryError("desktop provider notification thresholds are invalid")
+    for provider, value in provider_thresholds.items():
+        if not isinstance(value, int) or isinstance(value, bool) \
+                or not 1 <= value <= 99:
+            raise RegistryError(
+                f"desktop {provider} notification threshold must be 1-99 percent")
+
+
 def load():
     path = paths.config_path()
     if not os.path.exists(path):
@@ -160,6 +269,27 @@ def dashboard_settings(config=None):
     except (TypeError, ValueError):
         settings["port"] = 8377
     return settings
+
+
+def desktop_settings(config=None):
+    """Return the validated desktop preference projection with safe defaults."""
+    config = load() if config is None else validate(config)
+    source = config.get("desktop") or {}
+    notifications = dict(DEFAULT_DESKTOP["notifications"])
+    notifications.update(source.get("notifications") or {})
+    notifications["provider_threshold_percent"] = dict(
+        (source.get("notifications") or {}).get(
+            "provider_threshold_percent") or {})
+    return {
+        "refresh_interval_seconds": source.get(
+            "refresh_interval_seconds", DEFAULT_DESKTOP["refresh_interval_seconds"]),
+        "provider_paths": dict(source.get("provider_paths") or {}),
+        "preferred_terminal": source.get(
+            "preferred_terminal", DEFAULT_DESKTOP["preferred_terminal"]),
+        "remember_window": source.get(
+            "remember_window", DEFAULT_DESKTOP["remember_window"]),
+        "notifications": notifications,
+    }
 
 
 def ordered_for(fam, config=None):
