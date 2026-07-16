@@ -13,12 +13,13 @@ use std::{
     net::TcpStream,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 
 use tauri::{
+    async_runtime::Receiver,
     image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -68,13 +69,27 @@ const FEED_DEADLINE: Duration = Duration::from_secs(6);
 
 const DESKTOP_WINDOW_LABEL: &str = "main";
 const DESKTOP_BRIDGE_SCHEMA: &str = "headroom_desktop_bridge@1";
-const DESKTOP_SNAPSHOT_SCHEMA: &str = "headroom_widget@1";
+const DESKTOP_VIEW_SCHEMA: &str = "headroom_desktop_view@1";
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
+const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_BRIDGE_FRAME_BYTES: usize = 1024 * 1024;
 
-#[derive(Default)]
+struct BridgeSession {
+    child: CommandChild,
+    events: Receiver<CommandEvent>,
+}
+
+#[derive(Clone)]
 struct DesktopEngine {
-    child: Mutex<Option<CommandChild>>,
+    session: Arc<Mutex<Option<BridgeSession>>>,
+}
+
+impl Default for DesktopEngine {
+    fn default() -> Self {
+        Self {
+            session: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 struct AppState {
@@ -818,7 +833,7 @@ fn parse_bridge_response(frame: &[u8], expected_id: &str) -> Result<serde_json::
 
 fn validate_desktop_bootstrap(
     handshake: &serde_json::Value,
-    snapshot: &serde_json::Value,
+    view: &serde_json::Value,
 ) -> Result<(), String> {
     if handshake.get("product").and_then(serde_json::Value::as_str) != Some("headroom")
         || handshake
@@ -829,15 +844,19 @@ fn validate_desktop_bootstrap(
     {
         return Err("bundled desktop engine is incompatible".into());
     }
-    let supports_fixture = handshake
+    let supports_desktop = handshake
         .get("capabilities")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|values| values.iter().any(|value| value == "fixture_snapshot"));
-    if !supports_fixture {
+        .is_some_and(|values| {
+            ["discover", "adopt", "refresh"]
+                .iter()
+                .all(|name| values.iter().any(|value| value == name))
+        });
+    if !supports_desktop {
         return Err("bundled desktop engine lacks the required capability".into());
     }
-    if snapshot.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_SNAPSHOT_SCHEMA)
-        || !snapshot
+    if view.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_VIEW_SCHEMA)
+        || !view
             .get("accounts")
             .is_some_and(serde_json::Value::is_array)
     {
@@ -848,7 +867,7 @@ fn validate_desktop_bootstrap(
 
 fn bootstrap_sidecar(
     app: &AppHandle,
-) -> Result<(serde_json::Value, serde_json::Value, CommandChild), String> {
+) -> Result<(serde_json::Value, serde_json::Value, BridgeSession), String> {
     let command = app
         .shell()
         .sidecar("headroom-engine")
@@ -869,20 +888,20 @@ fn bootstrap_sidecar(
     }
     if child
         .write(&bridge_request(
-            "startup-snapshot",
-            "fixture_snapshot",
+            "startup-view",
+            "discover",
             serde_json::json!({}),
         ))
         .is_err()
     {
         let _ = child.kill();
-        return Err("bundled desktop engine did not accept the snapshot request".into());
+        return Err("bundled desktop engine did not accept the discovery request".into());
     }
 
     let deadline = Instant::now() + SIDECAR_STARTUP_TIMEOUT;
     let mut handshake = None;
-    let mut snapshot = None;
-    while handshake.is_none() || snapshot.is_none() {
+    let mut view = None;
+    while handshake.is_none() || view.is_none() {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             let _ = child.kill();
             return Err("bundled desktop engine startup timed out".into());
@@ -895,11 +914,11 @@ fn bootstrap_sidecar(
                 let parsed = if handshake.is_none() {
                     parse_bridge_response(&frame, "startup-handshake")
                 } else {
-                    parse_bridge_response(&frame, "startup-snapshot")
+                    parse_bridge_response(&frame, "startup-view")
                 };
                 match parsed {
                     Ok(value) if handshake.is_none() => handshake = Some(value),
-                    Ok(value) => snapshot = Some(value),
+                    Ok(value) => view = Some(value),
                     Err(error) => {
                         let _ = child.kill();
                         return Err(error);
@@ -930,19 +949,19 @@ fn bootstrap_sidecar(
     }
 
     let handshake = handshake.expect("startup loop collected handshake");
-    let snapshot = snapshot.expect("startup loop collected snapshot");
-    if let Err(error) = validate_desktop_bootstrap(&handshake, &snapshot) {
+    let view = view.expect("startup loop collected desktop view");
+    if let Err(error) = validate_desktop_bootstrap(&handshake, &view) {
         let _ = child.kill();
         return Err(error);
     }
-    Ok((handshake, snapshot, child))
+    Ok((handshake, view, BridgeSession { child, events }))
 }
 
 fn desktop_initialization_script(
     handshake: &serde_json::Value,
-    snapshot: &serde_json::Value,
+    view: &serde_json::Value,
 ) -> String {
-    let payload = serde_json::json!({"bridge": handshake, "snapshot": snapshot});
+    let payload = serde_json::json!({"bridge": handshake, "view": view});
     let payload_json = serde_json::to_string(&payload).expect("desktop bootstrap serializes");
     let payload_literal = serde_json::to_string(&payload_json).expect("JSON string serializes");
     format!(
@@ -953,9 +972,9 @@ fn desktop_initialization_script(
 fn build_desktop_window(
     app: &AppHandle,
     handshake: &serde_json::Value,
-    snapshot: &serde_json::Value,
+    view: &serde_json::Value,
 ) -> tauri::Result<WebviewWindow> {
-    let script = desktop_initialization_script(handshake, snapshot);
+    let script = desktop_initialization_script(handshake, view);
     WebviewWindowBuilder::new(
         app,
         DESKTOP_WINDOW_LABEL,
@@ -971,36 +990,153 @@ fn build_desktop_window(
     .build()
 }
 
+fn request_desktop_engine(
+    engine: &DesktopEngine,
+    command: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut guard = engine
+        .session
+        .lock()
+        .map_err(|_| "desktop engine state is unavailable".to_string())?;
+    let outcome: Result<serde_json::Value, (String, bool)> = (|| {
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| ("desktop engine is not running".to_string(), false))?;
+        let request_id = format!("desktop-{command}");
+        session
+            .child
+            .write(&bridge_request(&request_id, command, args))
+            .map_err(|_| {
+                (
+                    "desktop engine did not accept the request".to_string(),
+                    true,
+                )
+            })?;
+        let deadline = Instant::now() + SIDECAR_REQUEST_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| ("desktop engine request timed out".to_string(), true))?;
+            let next = tauri::async_runtime::block_on(async {
+                tokio::time::timeout(remaining, session.events.recv()).await
+            });
+            match next {
+                Ok(Some(CommandEvent::Stdout(frame))) => {
+                    return parse_bridge_response(&frame, &request_id).map_err(|error| {
+                        let fatal = !error.starts_with("desktop engine rejected request (");
+                        (error, fatal)
+                    });
+                }
+                Ok(Some(CommandEvent::Stderr(bytes))) => {
+                    eprintln!(
+                        "headroom-desktop: engine diagnostic ({} bytes)",
+                        bytes.len()
+                    );
+                }
+                Ok(Some(CommandEvent::Terminated(_))) | Ok(None) => {
+                    return Err(("desktop engine stopped unexpectedly".into(), true));
+                }
+                Ok(Some(CommandEvent::Error(_))) => {
+                    return Err(("desktop engine communication failed".into(), true));
+                }
+                Ok(Some(_)) => {}
+                Err(_) => {
+                    return Err(("desktop engine request timed out".into(), true));
+                }
+            }
+        }
+    })();
+    match outcome {
+        Ok(value) => Ok(value),
+        Err((error, fatal)) => {
+            // A malformed, late, or missing response makes frame ordering
+            // unknowable. Retire that session so a later request cannot
+            // accidentally consume the prior response. A well-formed bridge
+            // rejection is a business error and leaves the engine usable.
+            if fatal {
+                if let Some(session) = guard.take() {
+                    let _ = session.child.kill();
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn engine_command(
+    engine: DesktopEngine,
+    command: &'static str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || request_desktop_engine(&engine, command, args))
+        .await
+        .map_err(|_| "desktop engine task failed".to_string())?
+}
+
+#[tauri::command]
+async fn desktop_discover(
+    state: tauri::State<'_, DesktopEngine>,
+) -> Result<serde_json::Value, String> {
+    engine_command(state.inner().clone(), "discover", serde_json::json!({})).await
+}
+
+#[tauri::command]
+async fn desktop_adopt(
+    state: tauri::State<'_, DesktopEngine>,
+    candidate_id: String,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        state.inner().clone(),
+        "adopt",
+        serde_json::json!({"candidate_id": candidate_id, "name": name}),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn desktop_refresh(
+    state: tauri::State<'_, DesktopEngine>,
+) -> Result<serde_json::Value, String> {
+    engine_command(state.inner().clone(), "refresh", serde_json::json!({})).await
+}
+
 fn stop_desktop_engine(app: &AppHandle) {
-    let Some(mut child) = app
+    let Some(mut session) = app
         .state::<DesktopEngine>()
-        .child
+        .session
         .lock()
         .expect("desktop engine mutex poisoned")
         .take()
     else {
         return;
     };
-    let _ = child.write(&bridge_request(
+    let _ = session.child.write(&bridge_request(
         "desktop-shutdown",
         "shutdown",
         serde_json::json!({}),
     ));
-    let _ = child.kill();
+    let _ = session.child.kill();
 }
 
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(DesktopEngine::default())
+        .invoke_handler(tauri::generate_handler![
+            desktop_discover,
+            desktop_adopt,
+            desktop_refresh
+        ])
         .setup(|app| {
-            let (handshake, snapshot, child) =
+            let (handshake, view, session) =
                 bootstrap_sidecar(app.handle()).map_err(std::io::Error::other)?;
             *app.state::<DesktopEngine>()
-                .child
+                .session
                 .lock()
-                .expect("desktop engine mutex poisoned") = Some(child);
-            build_desktop_window(app.handle(), &handshake, &snapshot)?;
+                .expect("desktop engine mutex poisoned") = Some(session);
+            build_desktop_window(app.handle(), &handshake, &view)?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1189,8 +1325,8 @@ mod tests {
             "product_version": "0.4.0</script><script>bad()</script>",
             "bridge_schema": DESKTOP_BRIDGE_SCHEMA
         });
-        let snapshot = serde_json::json!({"schema": DESKTOP_SNAPSHOT_SCHEMA, "accounts": []});
-        let script = desktop_initialization_script(&handshake, &snapshot);
+        let view = serde_json::json!({"schema": DESKTOP_VIEW_SCHEMA, "accounts": []});
+        let script = desktop_initialization_script(&handshake, &view);
         assert!(script.contains("Object.defineProperty"));
         assert!(script.contains("writable:false"));
         assert!(!script.contains("JSON.parse({\"bridge\""));
