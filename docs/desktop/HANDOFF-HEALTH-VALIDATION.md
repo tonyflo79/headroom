@@ -86,8 +86,28 @@ macOS version, test totals, each semantic state, active-child preference
 behavior, history permissions, strict signature result, absence of TCP
 listeners, and cleanup state.
 
-Status: implementation complete; exact-package validation pending.
+Status: implementation and exact-package validation complete for commit
+`d13eb69c4223a5a75811357dd21a7ac9ec3182bd`.
+
+Validated on macOS 26.5.2 (25F84), arm64. The exact packaged executables
+were ad-hoc signed for local QA; Developer ID signing and notarization remain
+release-pipeline gates.
+
+- App executable SHA-256:
+  `1042c8fa52888308a31fcabfaae8b26fee30796dc7ead47a9f0666d08a43d123`
+- Frozen engine SHA-256:
+  `db4f86b2d9786412e580e5ef58f533f309e9d398002f1a4af79d4fd93889d2b1`
+- `codesign --verify --deep --strict` passed; both executables are arm64.
+- The final app visually showed the black terminal surface, phosphor-green
+  typography and glow, five signal bars, stable state/code/action text, and
+  explicit non-color status labels.
 
 | UTC time | Build commit | Scenario | Result | Status |
 |---|---|---|---|---|
-| pending | pending | automated handoff contracts | 227 focused Python, 23 frontend, and 25 Rust tests passed locally | pass |
+| 2026-07-16T16:13:01Z | `d13eb69` | automated handoff contracts | 227 focused Python, 23 frontend, and 25 Rust tests passed locally; the final inactive-metadata correction additionally passed all 35 desktop-bridge unit tests | pass |
+| 2026-07-16T16:13:01Z | `d13eb69` | exact frozen bridge | Required `handoff_health` capability advertised; the strict `headroom_handoff_health@1` projection crossed the packaged stdio boundary | pass |
+| 2026-07-16T16:13:01Z | `d13eb69` | semantic state matrix | Packaged engine returned configured, downgraded, armed, supervision-lost, loop-guard, disabled, and fail-closed unavailable states with bounded code/action copy | pass |
+| 2026-07-16T16:13:01Z | `d13eb69` | live preference update | Disabling the saved preference left the controlled armed child active, preserved its armed classification, added next-launch-only copy, and left the supervision journal hash unchanged | pass |
+| 2026-07-16T16:13:01Z | `d13eb69` | privacy and hostile history | Raw fixture reasons were absent; history and config remained `0600`; a symlink journal returned `handoff_health_unreadable` without following, modifying, or repairing its target | pass |
+| 2026-07-16T16:13:01Z | `d13eb69` | terminal health console | Configured, armed, armed-with-disabled-preference, and loop-guard captures were inspected in the exact package; state remained readable without color | pass |
+| 2026-07-16T16:13:01Z | `d13eb69` | process and network cleanup | App and frozen engine opened no TCP listener; all Headroom and controlled-provider processes exited after QA | pass |
