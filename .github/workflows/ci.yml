@@ -52,11 +52,9 @@ jobs:
         run: cargo fmt --check --manifest-path integrations/menubar/src-tauri/Cargo.toml
       - name: Test the native shell
         run: cargo test --locked --manifest-path integrations/menubar/src-tauri/Cargo.toml
-      - name: Install the pinned Tauri packager
-        run: cargo install tauri-cli --version 2.11.4 --locked
       - name: Build the unsigned app
         working-directory: integrations/menubar
-        run: cargo tauri build --bundles app
+        run: npx --yes @tauri-apps/cli@2.11.4 build --bundles app
       - name: Archive the unsigned tracer
         run: >-
           ditto -c -k --sequesterRsrc --keepParent
