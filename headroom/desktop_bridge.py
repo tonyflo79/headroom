@@ -676,13 +676,13 @@ def _routing_reason_projection(reason):
         return ("capacity_unavailable",
                 "Verified capacity is at or below the routing threshold.",
                 "wait_for_reset")
-    if "stale" in text or "expired" in text or "clock invalid" in text:
-        return ("stale_reading", "The capacity proof is no longer current.",
-                "refresh_capacity")
     if "auth" in text or "login" in text or "token" in text:
         return ("authentication_required",
                 "This slot needs a verified provider login.",
                 "reauthenticate_account")
+    if "stale" in text or "expired" in text or "clock invalid" in text:
+        return ("stale_reading", "The capacity proof is no longer current.",
+                "refresh_capacity")
     if "identity" in text or "credential" in text or "trust" in text \
             or "lineage" in text or "bound" in text:
         return ("unverified_reading",

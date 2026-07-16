@@ -679,6 +679,7 @@ class DesktopBridgeUnit(unittest.TestCase):
             {"name": "selected", "provider": "claude", "home": "/selected"},
             {"name": "reserved", "provider": "claude", "home": "/reserved"},
             {"name": "stale", "provider": "claude", "home": "/stale"},
+            {"name": "expired", "provider": "claude", "home": "/expired"},
             {"name": "unverified", "provider": "claude", "home": "/unverified"},
             {"name": "cooled", "provider": "claude", "home": "/cooled"},
             {"name": "quarantined", "provider": "claude", "home": "/quarantined"},
@@ -690,11 +691,12 @@ class DesktopBridgeUnit(unittest.TestCase):
             (accounts[0], None),
             (accounts[1], "reserved (config): private detail"),
             (accounts[2], "reading stale: raw-provider-secret"),
-            (accounts[3], "slot identity changed since snapshot — recollect"),
-            (accounts[4], "cooldown until private timestamp"),
-            (accounts[5], "quarantined: raw auth response"),
-            (accounts[6], "slot leased by another live launch"),
-            (accounts[7], "cooldown ledger unreadable — /private/path"),
+            (accounts[3], "held: claude_usage_token_expired"),
+            (accounts[4], "slot identity changed since snapshot — recollect"),
+            (accounts[5], "cooldown until private timestamp"),
+            (accounts[6], "quarantined: raw auth response"),
+            (accounts[7], "slot leased by another live launch"),
+            (accounts[8], "cooldown ledger unreadable — /private/path"),
         ]
         with mock.patch.object(desktop_bridge.route, "ensure_fresh_snapshot",
                                return_value={"generated": time.time()}), \
@@ -708,14 +710,37 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(value["selected"], {
             "name": "selected", "provider": "claude"})
         self.assertEqual([row["code"] for row in value["candidates"]], [
-            "selected", "reserved", "stale_reading", "unverified_reading",
-            "cooled_down", "quarantined", "leased",
+            "selected", "reserved", "stale_reading", "authentication_required",
+            "unverified_reading", "cooled_down", "quarantined", "leased",
             "infrastructure_unavailable",
         ])
         encoded = json.dumps(value)
         for private in ("raw-provider-secret", "raw auth response", "/private/path"):
             self.assertNotIn(private, encoded)
         self.assertEqual(value["launch"]["code"], "launch_ready")
+
+    def test_routing_preview_treats_expired_usage_token_as_authentication(self):
+        account = {"name": "claude-main", "provider": "claude",
+                   "home": "/claude-main"}
+        registry.save({"schema_version": 1, "accounts": [account]})
+        with mock.patch.object(desktop_bridge.route, "ensure_fresh_snapshot",
+                               return_value={"generated": time.time()}), \
+                mock.patch.object(desktop_bridge.route, "candidates",
+                                  return_value=[(
+                                      account,
+                                      "held: claude_usage_token_expired")]), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value="/bin/echo"):
+            value = desktop_bridge.routing_preview_desktop("claude")
+        self.assertIsNone(value["selected"])
+        self.assertEqual(value["candidates"][0]["code"],
+                         "authentication_required")
+        self.assertEqual(value["candidates"][0]["action"],
+                         "reauthenticate_account")
+        self.assertEqual(value["launch"]["code"],
+                         "authentication_required")
+        self.assertEqual(value["launch"]["action"],
+                         "reauthenticate_account")
 
     def test_launch_intent_is_engine_generated_quoted_and_allowlisted(self):
         binary = os.path.join(self.temp.name, "provider cli")
