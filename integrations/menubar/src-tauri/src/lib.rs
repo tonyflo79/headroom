@@ -848,7 +848,7 @@ fn validate_desktop_bootstrap(
         .get("capabilities")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|values| {
-            ["discover", "adopt", "refresh"]
+            ["discover", "adopt", "refresh", "claude_login"]
                 .iter()
                 .all(|name| values.iter().any(|value| value == name))
         });
@@ -1102,6 +1102,46 @@ async fn desktop_refresh(
     engine_command(state.inner().clone(), "refresh", serde_json::json!({})).await
 }
 
+#[tauri::command]
+async fn desktop_start_claude_login(
+    state: tauri::State<'_, DesktopEngine>,
+    name: String,
+    expected_email: Option<String>,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        state.inner().clone(),
+        "start_claude_login",
+        serde_json::json!({"name": name, "expected_email": expected_email}),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn desktop_login_status(
+    state: tauri::State<'_, DesktopEngine>,
+    job_id: String,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        state.inner().clone(),
+        "login_status",
+        serde_json::json!({"job_id": job_id}),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn desktop_cancel_login(
+    state: tauri::State<'_, DesktopEngine>,
+    job_id: String,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        state.inner().clone(),
+        "cancel_login",
+        serde_json::json!({"job_id": job_id}),
+    )
+    .await
+}
+
 fn stop_desktop_engine(app: &AppHandle) {
     let Some(mut session) = app
         .state::<DesktopEngine>()
@@ -1117,6 +1157,21 @@ fn stop_desktop_engine(app: &AppHandle) {
         "shutdown",
         serde_json::json!({}),
     ));
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let next = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(remaining, session.events.recv()).await
+        });
+        match next {
+            Ok(Some(CommandEvent::Stdout(frame))) => {
+                if parse_bridge_response(&frame, "desktop-shutdown").is_ok() {
+                    break;
+                }
+            }
+            Ok(Some(CommandEvent::Terminated(_))) | Ok(None) | Err(_) => break,
+            Ok(Some(_)) => {}
+        }
+    }
     let _ = session.child.kill();
 }
 
@@ -1127,7 +1182,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             desktop_discover,
             desktop_adopt,
-            desktop_refresh
+            desktop_refresh,
+            desktop_start_claude_login,
+            desktop_login_status,
+            desktop_cancel_login
         ])
         .setup(|app| {
             let (handshake, view, session) =

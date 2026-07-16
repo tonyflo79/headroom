@@ -7,6 +7,12 @@ sanitized live account state, and can adopt one verified existing login into a
 named slot. It does not require `headroom serve`, a browser, a localhost URL,
 or a system Python installation.
 
+The app can also start a fresh Claude browser login in a Headroom-owned slot.
+That flow runs without a controlling Terminal, requires a verified current
+Claude CLI on macOS, publishes stable progress/diagnostic codes, supports
+cancel, and rolls back file and per-slot Keychain credentials on every failed
+terminal state. Provider output never crosses the desktop bridge.
+
 The dashboard's deliberate visual language is a black terminal canvas with
 phosphor-green monospace text and glowing capacity bars. Limited and uncertain
 states retain distinct red and amber treatments for accessibility.
@@ -31,7 +37,7 @@ Headroom.app
   `headroom_desktop_bridge@1` schema, frozen runtime, and required capability.
 - Engine stdout is protocol-only. Imported or child-process output is diverted
   to stderr and Rust never logs its contents.
-- The bridge exposes only narrow discover, adopt, and refresh commands. Calls
+- The bridge exposes only narrow account, refresh, and login-job commands. Calls
   are serialized, bounded, and a timed-out or malformed session is retired so
   a late frame cannot be mistaken for a later response.
 - Only `headroom_desktop_view@1`, derived from the existing fail-closed widget
@@ -89,6 +95,7 @@ From the repository root:
 
 ```sh
 uv run --python 3.13.12 python -m unittest tests.test_desktop_bridge
+uv run --python 3.13.12 python -m unittest tests.test_desktop_login
 npm --prefix integrations/menubar test
 cargo fmt --check --manifest-path integrations/menubar/src-tauri/Cargo.toml
 cargo test --locked --manifest-path integrations/menubar/src-tauri/Cargo.toml
@@ -108,8 +115,10 @@ system `python` process. Quitting Headroom must remove both processes.
 ## Current limitations
 
 - The app is macOS-only and is built for the runner's native architecture.
-- It adopts already-authenticated provider homes; creating a new isolated login
-  is a later slice.
+- Fresh GUI login currently supports Claude only; Codex device authentication
+  is the next provider slice.
+- A real Claude flow still requires the human validation checklist in
+  `docs/desktop/CLAUDE-LOGIN-VALIDATION.md` before this slice can ship.
 - Recovery is currently a safe read-only state, not a repair workflow.
 - There is no complete account-management UI, launch-at-login, updater,
   diagnostics export, signing, or notarization yet.

@@ -15,6 +15,8 @@ the connect is refused — duplicate logins silently eating each other's
 headroom is the classic multi-account failure mode.
 """
 import os
+import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -28,14 +30,210 @@ CREDENTIAL_FILES = {
     "codex": ["auth.json"],
 }
 DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex"}
+DESKTOP_LOGIN_TIMEOUT = 10 * 60
 
 
 def provider_binary(provider):
-    return shutil.which("claude" if provider == "claude" else "codex")
+    name = "claude" if provider == "claude" else "codex"
+    found = shutil.which(name)
+    if found:
+        return found
+    # Finder-launched macOS apps receive a deliberately small PATH. Probe only
+    # fixed, operator-owned install locations; never invoke a shell or search
+    # the working directory.
+    candidates = [
+        os.path.expanduser(f"~/.local/bin/{name}"),
+        os.path.expanduser(f"~/.claude/local/{name}"),
+        f"/opt/homebrew/bin/{name}",
+        f"/usr/local/bin/{name}",
+    ]
+    return next((path for path in candidates
+                 if os.path.isfile(path) and os.access(path, os.X_OK)), None)
 
 
 def login_argv(provider, binary):
     return [binary, "auth", "login"] if provider == "claude" else [binary, "login"]
+
+
+def desktop_login_prerequisite(provider, binary, runner=None):
+    """Capability probe for a GUI-owned login, without trusting version text."""
+    runner = subprocess.run if runner is None else runner
+    try:
+        if provider == "claude" and sys.platform == "darwin":
+            version = runner(
+                [binary, "--version"], env=collector.scrubbed_env(),
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=5, check=False)
+            match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b",
+                              version.stdout or version.stderr or "")
+            # 2.1.207 is the first official macOS build whose per-home
+            # Keychain namespacing Headroom has verified. Older/unknown builds
+            # are refused before they can overwrite a shared token.
+            if version.returncode != 0 or not match \
+                    or tuple(map(int, match.groups())) < (2, 1, 207):
+                return False
+        command = ([binary, "auth", "--help"] if provider == "claude"
+                   else [binary, "login", "--help"])
+        completed = runner(
+            command, env=collector.scrubbed_env(), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = f"{completed.stdout or ''}\n{completed.stderr or ''}".lower()
+    return completed.returncode == 0 and "login" in output
+
+
+def delete_claude_keychain_item(home, runner=None):
+    """Delete only the per-home item created by a failed desktop login."""
+    if sys.platform != "darwin":
+        return
+    runner = subprocess.run if runner is None else runner
+    security = shutil.which("security")
+    if not security:
+        return
+    try:
+        runner([security, "delete-generic-password", "-s",
+                collector.claude_keychain_service(home)],
+               stdin=subprocess.DEVNULL, capture_output=True, text=True,
+               timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _stop_login_process(process):
+    """Terminate the isolated provider process group and bound the wait."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def desktop_connect_fresh(config, name, provider, *, expected_email=None,
+                          cancel_event=None, progress=None,
+                          timeout=DESKTOP_LOGIN_TIMEOUT, popen=None,
+                          prerequisite=None):
+    """Run a fresh provider login without a terminal and return stable codes.
+
+    Provider stdout/stderr are discarded, never returned to the GUI. Every
+    unsuccessful terminal state restores the exact pre-login credential set.
+    """
+    progress = (lambda _code: None) if progress is None else progress
+    cancel_event = cancel_event or type("NeverCancel", (), {
+        "is_set": lambda self: False})()
+    popen = subprocess.Popen if popen is None else popen
+    prerequisite = (desktop_login_prerequisite if prerequisite is None
+                    else prerequisite)
+    if provider not in registry.PROVIDERS:
+        return {"ok": False, "code": "invalid_provider"}
+    if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
+        return {"ok": False, "code": "invalid_account_name"}
+    if any(row.get("name") == name for row in config.get("accounts", [])):
+        return {"ok": False, "code": "duplicate_account_name"}
+    home = os.path.join(paths.homes_dir(), name)
+    expected_home = os.path.join(paths.homes_dir(), os.path.basename(name))
+    if os.path.realpath(home) != os.path.realpath(expected_home):
+        return {"ok": False, "code": "invalid_account_home"}
+
+    progress("preflight")
+    binary = provider_binary(provider)
+    if binary is None:
+        return {"ok": False, "code": f"{provider}_cli_missing"}
+    if not prerequisite(provider, binary):
+        return {"ok": False, "code": f"{provider}_upgrade_required"}
+    if not darwin_keychain_guard(config, provider, quiet=True):
+        return {"ok": False, "code": "claude_shared_keychain_conflict"}
+    if cancel_event.is_set():
+        return {"ok": False, "code": "cancelled"}
+
+    keychain_existed = (provider == "claude" and sys.platform == "darwin"
+                        and collector.claude_keychain_item_exists(home))
+    if keychain_existed:
+        # A leftover item may contain a credential Headroom cannot export and
+        # restore byte-for-byte. Refuse before the provider can overwrite it.
+        return {"ok": False, "code": "claude_slot_keychain_occupied"}
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    backup_dir, saved = backup_credentials(home, provider)
+    duplicates = existing_fingerprints(config, provider)
+    completed = False
+
+    def rollback():
+        if backup_dir:
+            restore_credentials(home, provider, backup_dir, saved)
+        else:
+            for filename in CREDENTIAL_FILES[provider]:
+                target = os.path.join(home, filename)
+                if os.path.exists(target):
+                    os.remove(target)
+        if provider == "claude" and not keychain_existed:
+            delete_claude_keychain_item(home)
+
+    try:
+        env = collector.scrubbed_env()
+        env["CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"] = home
+        progress("browser_login")
+        try:
+            process = popen(
+                login_argv(provider, binary), env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except OSError:
+            return {"ok": False, "code": "login_launch_failed"}
+        deadline = time.monotonic() + max(1, float(timeout))
+        while process.poll() is None:
+            if cancel_event.is_set():
+                _stop_login_process(process)
+                return {"ok": False, "code": "cancelled"}
+            if time.monotonic() >= deadline:
+                _stop_login_process(process)
+                return {"ok": False, "code": "login_timed_out"}
+            time.sleep(0.1)
+        if process.returncode != 0:
+            return {"ok": False, "code": "provider_login_failed"}
+
+        progress("verifying_identity")
+        if provider == "claude" and sys.platform == "darwin" \
+                and not os.path.isfile(os.path.join(home, ".credentials.json")) \
+                and not collector.claude_keychain_item_exists(home):
+            # Never let claude_identity fall through to the legacy shared
+            # Keychain item and mis-bind a new slot to an unrelated login.
+            return {"ok": False, "code": "claude_keychain_isolation_missing"}
+        identity = slot_identity(provider, home)
+        if not identity or not identity.get("email"):
+            return {"ok": False, "code": "identity_unreadable"}
+        if expected_email and identity["email"].lower() != expected_email.lower():
+            return {"ok": False, "code": "wrong_identity"}
+        fingerprint = identity.get("account_fingerprint")
+        if fingerprint and fingerprint in duplicates:
+            return {"ok": False, "code": "duplicate_identity"}
+        entry = add_account(config, name, provider, home, identity["email"])
+        saved_config = registry.load()
+        actual = next((row for row in saved_config["accounts"]
+                       if row["name"] == name), None)
+        if actual is None or actual["provider"] != provider \
+                or registry.expand(actual["home"]) != registry.expand(home):
+            return {"ok": False, "code": "registry_conflict"}
+        completed = True
+        return {"ok": True, "code": "connected", "entry": entry}
+    finally:
+        if not completed:
+            rollback()
+        discard_backup(backup_dir)
+        if not completed:
+            try:
+                if os.path.isdir(home) and not os.listdir(home):
+                    os.rmdir(home)
+            except OSError:
+                pass
 
 
 def darwin_keychain_guard(config, provider, quiet=False, runner=None):

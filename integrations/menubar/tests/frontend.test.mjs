@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  normalizeBootstrap, percentLeft, refreshPresentation,
+  loginMessage, normalizeBootstrap, percentLeft, refreshPresentation,
 } from "../dist/main.js";
 
 const bootstrap = {
@@ -64,4 +64,13 @@ test("refresh progress has deterministic busy and settled presentations", () => 
     { label: "Refreshing…", busy: true });
   assert.deepEqual(refreshPresentation(false),
     { label: "Refresh", busy: false });
+});
+
+test("Claude login diagnostics are stable and never echo unknown provider text", () => {
+  assert.equal(loginMessage("browser_login"),
+    "Waiting for Claude browser sign-in");
+  assert.equal(loginMessage("wrong_identity"),
+    "Signed-in identity did not match; credentials restored");
+  assert.equal(loginMessage("raw provider secret"),
+    "Login could not be completed safely");
 });
