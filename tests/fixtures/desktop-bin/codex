@@ -86,6 +86,8 @@ def app_server():
             emit({"jsonrpc": "2.0", "id": request_id,
                   "result": {"status": "cancelled"}})
         elif method == "account/rateLimits/read":
+            if os.environ.get("HEADROOM_FAKE_CODEX_LIVE_WAIT") == "1":
+                continue
             emit({"jsonrpc": "2.0", "id": request_id, "result": {
                 "rateLimits": {
                     "primary": {"usedPercent": 25, "windowDurationMins": 300,
@@ -96,6 +98,8 @@ def app_server():
                 }
             }})
         elif method == "account/read":
+            if os.environ.get("HEADROOM_FAKE_CODEX_LIVE_WAIT") == "1":
+                continue
             emit({"jsonrpc": "2.0", "id": request_id, "result": {
                 "account": {"type": "chatgpt", "email": "fixture@example.test",
                             "planType": "plus"},

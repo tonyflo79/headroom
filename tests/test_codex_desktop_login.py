@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -145,6 +146,27 @@ class CodexDesktopLogin(unittest.TestCase):
 
         value = self.login(cancel_event=cancel, live_reader=live_reader)
         self.assertEqual(value["code"], "cancelled")
+        self.assertFalse(os.path.exists(self.auth))
+        self.assertFalse(os.path.exists(paths.config_path()))
+
+    def test_blocked_live_app_server_cancels_within_shutdown_budget(self):
+        cancel = threading.Event()
+        timer = None
+
+        def progress(code, _details=None):
+            nonlocal timer
+            if code == "verifying_identity":
+                timer = threading.Timer(0.2, cancel.set)
+                timer.start()
+
+        started = time.monotonic()
+        with mock.patch.dict(os.environ,
+                             {"HEADROOM_FAKE_CODEX_LIVE_WAIT": "1"}):
+            value = self.login(cancel_event=cancel, progress=progress)
+        if timer:
+            timer.join(timeout=1)
+        self.assertEqual(value["code"], "cancelled")
+        self.assertLess(time.monotonic() - started, 3)
         self.assertFalse(os.path.exists(self.auth))
         self.assertFalse(os.path.exists(paths.config_path()))
 

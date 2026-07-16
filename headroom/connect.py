@@ -170,6 +170,7 @@ def desktop_connect_codex_device(config, name, *, expected_email=None,
         "is_set": lambda self: False})()
     popen = subprocess.Popen if popen is None else popen
     prerequisite = desktop_codex_prerequisite if prerequisite is None else prerequisite
+    default_live_reader = live_reader is None
     live_reader = collector.codex_live if live_reader is None else live_reader
     if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
         return {"ok": False, "code": "invalid_account_name"}
@@ -316,10 +317,14 @@ def desktop_connect_codex_device(config, name, *, expected_email=None,
         if mode != "chatgpt":
             return {"ok": False, "code": "identity_malformed"}
         try:
-            identity, plan, windows = live_reader(
-                home, expected_email=expected_email, now=int(time.time()))
+            kwargs = {"expected_email": expected_email, "now": int(time.time())}
+            if default_live_reader:
+                kwargs["cancel_event"] = cancel_event
+            identity, plan, windows = live_reader(home, **kwargs)
         except collector.IdentityBindingError as error:
             code = str(error)
+            if code == "cancelled":
+                return {"ok": False, "code": "cancelled"}
             if code == "codex_capacity_unavailable":
                 return {"ok": False, "code": "api_key_not_subscription"}
             if "auth" in code or "unexpected_email" in code:
