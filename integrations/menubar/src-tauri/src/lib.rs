@@ -848,9 +848,15 @@ fn validate_desktop_bootstrap(
         .get("capabilities")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|values| {
-            ["discover", "adopt", "refresh", "claude_login"]
-                .iter()
-                .all(|name| values.iter().any(|value| value == name))
+            [
+                "discover",
+                "adopt",
+                "refresh",
+                "claude_login",
+                "codex_device_login",
+            ]
+            .iter()
+            .all(|name| values.iter().any(|value| value == name))
         });
     if !supports_desktop {
         return Err("bundled desktop engine lacks the required capability".into());
@@ -1117,6 +1123,45 @@ async fn desktop_start_claude_login(
 }
 
 #[tauri::command]
+async fn desktop_start_codex_login(
+    state: tauri::State<'_, DesktopEngine>,
+    name: String,
+    expected_email: Option<String>,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        state.inner().clone(),
+        "start_codex_login",
+        serde_json::json!({"name": name, "expected_email": expected_email}),
+    )
+    .await
+}
+
+fn verified_device_url(raw: &str) -> Option<Url> {
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() == "https"
+        && url.host_str() == Some("auth.openai.com")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.port(), None | Some(443))
+        && url.path() == "/codex/device"
+        && url.query().is_none()
+        && url.fragment().is_none()
+    {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+async fn desktop_open_device_url(url: String) -> Result<(), String> {
+    let verified = verified_device_url(&url)
+        .ok_or_else(|| "device authorization URL is invalid".to_string())?;
+    open::that_detached(verified.as_str())
+        .map_err(|_| "device authorization URL could not be opened".to_string())
+}
+
+#[tauri::command]
 async fn desktop_login_status(
     state: tauri::State<'_, DesktopEngine>,
     job_id: String,
@@ -1184,8 +1229,10 @@ pub fn run() {
             desktop_adopt,
             desktop_refresh,
             desktop_start_claude_login,
+            desktop_start_codex_login,
             desktop_login_status,
-            desktop_cancel_login
+            desktop_cancel_login,
+            desktop_open_device_url
         ])
         .setup(|app| {
             let (handshake, view, session) =
@@ -1388,5 +1435,15 @@ mod tests {
         assert!(script.contains("Object.defineProperty"));
         assert!(script.contains("writable:false"));
         assert!(!script.contains("JSON.parse({\"bridge\""));
+    }
+
+    #[test]
+    fn device_authorization_url_is_exactly_allowlisted() {
+        assert!(verified_device_url("https://auth.openai.com/codex/device").is_some());
+        assert!(verified_device_url("http://auth.openai.com/codex/device").is_none());
+        assert!(verified_device_url("https://auth.openai.com.evil.test/codex/device").is_none());
+        assert!(verified_device_url("https://user@auth.openai.com/codex/device").is_none());
+        assert!(verified_device_url("https://auth.openai.com/other").is_none());
+        assert!(verified_device_url("https://auth.openai.com/codex/device?next=evil").is_none());
     }
 }

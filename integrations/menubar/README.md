@@ -7,11 +7,13 @@ sanitized live account state, and can adopt one verified existing login into a
 named slot. It does not require `headroom serve`, a browser, a localhost URL,
 or a system Python installation.
 
-The app can also start a fresh Claude browser login in a Headroom-owned slot.
-That flow runs without a controlling Terminal, requires a verified current
-Claude CLI on macOS, publishes stable progress/diagnostic codes, supports
-cancel, and rolls back file and per-slot Keychain credentials on every failed
-terminal state. Provider output never crosses the desktop bridge.
+The app can also start fresh Claude and Codex logins in Headroom-owned slots.
+Both run without a controlling Terminal, require verified current provider
+CLIs, publish stable progress/diagnostic codes, support cancel, and roll back
+credentials on every failed terminal state. Codex uses the CLI's structured
+device-auth app-server protocol and is not published until a live,
+identity-bound subscription-capacity read succeeds. Provider output never
+crosses the desktop bridge.
 
 The dashboard's deliberate visual language is a black terminal canvas with
 phosphor-green monospace text and glowing capacity bars. Limited and uncertain
@@ -44,8 +46,10 @@ Headroom.app
   projection, crosses the bridge. Identity is always email-redacted; credential
   paths, fingerprints, raw credentials, and provider payloads never cross it.
 - The webview can navigate only to its embedded app document or `about:blank`.
-- The page receives only the three desktop commands registered by Rust. It has
-  no shell capability, arbitrary sidecar access, or filesystem capability.
+- The page receives only the narrow desktop commands registered by Rust. It
+  has no shell capability, arbitrary sidecar access, or filesystem capability.
+  Its sole external-open command accepts only the exact
+  `https://auth.openai.com/codex/device` URL.
 - The app opens no HTTP listener.
 
 ## Supported development target
@@ -96,6 +100,7 @@ From the repository root:
 ```sh
 uv run --python 3.13.12 python -m unittest tests.test_desktop_bridge
 uv run --python 3.13.12 python -m unittest tests.test_desktop_login
+uv run --python 3.13.12 python -m unittest tests.test_codex_desktop_login
 npm --prefix integrations/menubar test
 cargo fmt --check --manifest-path integrations/menubar/src-tauri/Cargo.toml
 cargo test --locked --manifest-path integrations/menubar/src-tauri/Cargo.toml
@@ -115,10 +120,9 @@ system `python` process. Quitting Headroom must remove both processes.
 ## Current limitations
 
 - The app is macOS-only and is built for the runner's native architecture.
-- Fresh GUI login currently supports Claude only; Codex device authentication
-  is the next provider slice.
-- A real Claude flow still requires the human validation checklist in
-  `docs/desktop/CLAUDE-LOGIN-VALIDATION.md` before this slice can ship.
+- Real Claude and Codex flows still require the human validation checklists in
+  `docs/desktop/CLAUDE-LOGIN-VALIDATION.md` and
+  `docs/desktop/CODEX-LOGIN-VALIDATION.md` before those slices can ship.
 - Recovery is currently a safe read-only state, not a repair workflow.
 - There is no complete account-management UI, launch-at-login, updater,
   diagnostics export, signing, or notarization yet.

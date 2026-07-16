@@ -259,6 +259,38 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(value["state"], "cancelled")
         self.assertEqual(value["result_code"], "cancelled")
 
+    def test_codex_login_job_publishes_only_redacted_live_observation(self):
+        manager = desktop_bridge.DesktopLoginManager()
+        config = {
+            "schema_version": 1,
+            "accounts": [{"name": "codex-new", "provider": "codex",
+                          "home": "/private/codex",
+                          "expected_email": "private@example.com"}],
+        }
+        finished = {
+            "ok": True, "code": "connected", "entry": config["accounts"][0],
+            "observation": {
+                "email": "private@example.com", "plan": "plus",
+                "windows": {"7d": {"used_percent": 20,
+                                    "observed_at": 1_800_000_000}},
+            },
+        }
+        with mock.patch.object(
+                desktop_bridge.connect, "desktop_connect_codex_device",
+                return_value=finished), mock.patch.object(
+                    desktop_bridge.registry, "load", return_value=config), \
+                mock.patch.object(desktop_bridge.time, "time",
+                                  return_value=1_800_000_000):
+            started = manager.start_codex("codex-new", "private@example.com")
+            manager._job["thread"].join(timeout=2)
+            value = manager.status(started["job_id"])
+        self.assertEqual(value["state"], "succeeded")
+        self.assertEqual(value["result_code"], "connected")
+        self.assertEqual(value["view"]["accounts"][0]["identity"],
+                         "p***@example.com")
+        self.assertEqual(value["view"]["accounts"][0]["plan"], "plus")
+        self.assertNotIn("private@example.com", json.dumps(value))
+
     def test_claude_login_job_refuses_corrupt_registry(self):
         with open(paths.config_path(), "w", encoding="utf-8") as handle:
             handle.write("bad")
@@ -354,6 +386,49 @@ class DesktopBridgeSubprocess(unittest.TestCase):
         self.assertEqual(value["view"]["accounts"][0]["identity"],
                          "f***@example.test")
         self.assertNotIn("fixture-org", json.dumps(value))
+
+    def test_codex_device_login_crosses_protocol_with_live_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ)
+            env.update({
+                "HEADROOM_DIR": os.path.join(directory, "headroom"),
+                "PATH": os.path.join(ROOT, "tests", "fixtures", "desktop-bin")
+                        + os.pathsep + env.get("PATH", ""),
+                "CLAUDE_CONFIG_DIR": os.path.join(directory, "no-claude"),
+                "CODEX_HOME": os.path.join(directory, "no-codex"),
+            })
+            process = subprocess.Popen(
+                [sys.executable, "-m", "headroom.desktop_bridge"], cwd=ROOT,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=env)
+            process.stdin.write(request("1", "start_codex_login", {
+                "name": "codex-fixture",
+                "expected_email": "fixture@example.test"}) + "\n")
+            process.stdin.flush()
+            started = json.loads(process.stdout.readline())["result"]
+            value = started
+            for index in range(100):
+                if value["state"] not in {"running", "cancelling"}:
+                    break
+                process.stdin.write(request(str(index + 2), "login_status", {
+                    "job_id": started["job_id"]}) + "\n")
+                process.stdin.flush()
+                value = json.loads(process.stdout.readline())["result"]
+                time.sleep(0.02)
+            process.stdin.write(request("stop", "shutdown") + "\n")
+            process.stdin.flush()
+            json.loads(process.stdout.readline())
+            process.wait(timeout=10)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+        self.assertEqual(value["state"], "succeeded")
+        self.assertEqual(value["result_code"], "connected")
+        account = value["view"]["accounts"][0]
+        self.assertEqual(account["identity"], "f***@example.test")
+        self.assertEqual(account["state"], "current")
+        self.assertEqual(set(account["windows"]), {"5h", "7d"})
+        self.assertNotIn("fixture-refresh", json.dumps(value))
 
 
 if __name__ == "__main__":

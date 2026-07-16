@@ -483,7 +483,8 @@ def codex_app_server_read(home, timeout=None):
             if isinstance(message, dict) and "id" in message:
                 responses[message["id"]] = message
 
-    threading.Thread(target=reader, daemon=True).start()
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
 
     def send(obj):
         stdin.write(json.dumps(obj) + "\n")
@@ -510,6 +511,12 @@ def codex_app_server_read(home, timeout=None):
             proc.wait(timeout=3)
         except (subprocess.SubprocessError, OSError):
             proc.kill()
+        reader_thread.join(timeout=1)
+        for stream in (stdin, stdout):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
     if 2 not in responses or 3 not in responses:
         raise IdentityBindingError("codex_app_server_no_response")
     for request_id in (2, 3):
