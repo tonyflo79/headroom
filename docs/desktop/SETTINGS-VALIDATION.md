@@ -79,3 +79,34 @@ Record the packaged app path and hash, architecture, macOS version, test totals,
 initial/final login-item status, window-state permissions, screenshots for the
 five themes and invalid/valid settings states, and confirmation that the exact
 package opened no TCP listener.
+
+Status: complete for implementation commit `58b0b011785f6d05ce476ad95808a01d57d922e2`
+
+| UTC time | Build commit | Scenario | Result | Status |
+|---|---|---|---|---|
+| 2026-07-16T14:43:13Z | `58b0b01` | automated settings contracts | 60 focused Python, 18 frontend, and 21 Rust tests passed | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | exact frozen arm64 package | `validated_settings` advertised; ad-hoc bundle passed strict deep signature verification on macOS 26.5.2 | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | packaged Midnight settings console | `Command-,` opened the black/phosphor-green/glow console; one app and one frozen engine ran with zero TCP listeners | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | authoritative valid settings commit | title, routing, 420-second refresh, executable path, iTerm, window, and notification preferences persisted at mode `0600` | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | rejected settings mutation | `invalid_setting_title`; before/after SHA-256 remained identical | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | all five durable themes | Midnight, Minimal, Chrome, Paper, and Terminal round-tripped through the exact frozen engine; Midnight restored | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | window memory disabled | private app-data directory remained mode `0700` and the saved window record was removed | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | launch at login enabled | native status showed enabled; `Headroom.plist` targeted the exact package with `--headroom-login-launch` | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | background login route | ready fixture stayed hidden with exactly one engine and zero TCP listeners; a normal secondary activation showed the dashboard | pass |
+| 2026-07-16T14:43:13Z | `58b0b01` | launch at login disabled | native toggle removed `Headroom.plist`; final state matched the initially absent login item | pass |
+
+The QA artifact was
+`integrations/menubar/src-tauri/target/release/bundle/macos/Headroom.app`.
+After the local QA signature, the app executable SHA-256 was
+`d7d20bae8c627a763f4f6b80266088040895bdf0b78015fb9e5fb2a6e49e1cc0`
+and the frozen engine SHA-256 was
+`d25f1beab75b039d080f7e24d911d56f5ca4ceef4af36d742fe742800f36ffe4`.
+The signature is ad hoc and has no Team ID; Developer ID signing and
+notarization remain release work.
+
+The exact packaged run began and ended with no Headroom LaunchAgent. Enabling
+created a `RunAtLoad` LaunchAgent pointing only to this package and the stable
+login-launch argument. Disabling removed it. The login argument kept a ready
+fixture in the menu bar until an ordinary secondary launch activated the one
+existing instance. Automated routing tests cover the onboarding and recovery
+branches that intentionally require a visible operator window.
