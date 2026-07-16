@@ -1150,7 +1150,24 @@ def cmd_exec(fam, command, launch_note="", fallback=False):
         env=original_env)
 
 
-def _exec_routed(fam, command, launch_note=""):
+def cmd_exec_selected(fam, account_name, command, launch_note="desktop"):
+    """Launch exactly the named, currently selected account or refuse.
+
+    Desktop launch intents use this narrow entry point after the user has seen
+    an engine preview. It deliberately cannot fall back or silently switch to
+    another slot: the account shown to the user is the only account that may
+    launch. The normal final binding, capacity, cooldown, quarantine, and lease
+    gates remain authoritative inside ``_exec_routed``.
+    """
+    if not isinstance(account_name, str) \
+            or not registry.NAME_RE.fullmatch(account_name):
+        print("[headroom] desktop launch account is invalid", file=sys.stderr)
+        return 2
+    return _exec_routed(
+        fam, command, launch_note, required_account=account_name)
+
+
+def _exec_routed(fam, command, launch_note="", required_account=None):
     if registry.family_provider(fam) == "codex" and not CODEX_ROUTING_ENABLED:
         # fail-closed: disabled routing means headroom REFUSES to launch a
         # Codex seat it cannot prove capacity for — never "just take the
@@ -1160,22 +1177,39 @@ def _exec_routed(fam, command, launch_note=""):
               "run codex directly with CODEX_HOME=<home> to bypass headroom",
               file=sys.stderr)
         return 2
-    # an explicitly exported config home that names a registered account is
-    # the caller's routing decision — consume it instead of re-routing, as
-    # long as it still has proven headroom
     account = None
-    pinned = env_pinned_account(fam)
-    if pinned is not None:
+    if required_account is not None:
         snapshot = ensure_fresh_snapshot()
-        reason = block_reason(pinned, fam,
-                              _snapshot_accounts(snapshot).get(pinned["name"]),
-                              cooldowns(), time.time())
-        if reason is None:
-            account = pinned
-        else:
-            print(f"[headroom] env-selected account {pinned['name']} is not "
-                  f"routable ({reason}) — picking another", file=sys.stderr)
-    if account is None:
+        account = next((candidate for candidate in registry.ordered_for(fam)
+                        if candidate["name"] == required_account), None)
+        reason = (
+            "account is no longer configured" if account is None else
+            block_reason(
+                account, fam,
+                _snapshot_accounts(snapshot).get(account["name"]),
+                cooldowns(), time.time())
+        )
+        if reason is not None:
+            print(f"[headroom] desktop-selected account {required_account} "
+                  f"is not routable ({reason}) — refusing to switch slots",
+                  file=sys.stderr)
+            return 2
+    else:
+        # an explicitly exported config home that names a registered account
+        # is the caller's routing decision — consume it instead of re-routing,
+        # as long as it still has proven headroom
+        pinned = env_pinned_account(fam)
+        if pinned is not None:
+            snapshot = ensure_fresh_snapshot()
+            reason = block_reason(
+                pinned, fam, _snapshot_accounts(snapshot).get(pinned["name"]),
+                cooldowns(), time.time())
+            if reason is None:
+                account = pinned
+            else:
+                print(f"[headroom] env-selected account {pinned['name']} is not "
+                      f"routable ({reason}) — picking another", file=sys.stderr)
+    if account is None and required_account is None:
         account = pick(fam)
         if account is None:
             print(f"[headroom] no account for '{fam}' has proven headroom; "
@@ -1205,6 +1239,11 @@ def _exec_routed(fam, command, launch_note=""):
     # explicit opt-in to "run something over nothing").
     try:
         if not acquire_slot_lease(account, fam):
+            if required_account is not None:
+                print(f"[headroom] desktop-selected account {account['name']} "
+                      "is leased by another live launch — refusing to switch "
+                      "slots", file=sys.stderr)
+                return 2
             print(f"[headroom] {account['name']} is leased by another live "
                   f"launch — picking another", file=sys.stderr)
             account = pick(fam)

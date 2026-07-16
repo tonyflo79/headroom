@@ -13,13 +13,14 @@ import os
 import platform
 import re
 import secrets
+import shlex
 import sys
 import threading
 import time
 
 from . import (
     __version__, account_lifecycle, collect as collector, connect, paths,
-    registry, widget,
+    registry, route, widget,
 )
 
 
@@ -28,6 +29,9 @@ VIEW_SCHEMA = "headroom_desktop_view@1"
 LOGIN_SCHEMA = "headroom_desktop_login@1"
 ONBOARDING_SCHEMA = "headroom_desktop_onboarding@1"
 ONBOARDING_STEPS = {"welcome", "providers", "accounts", "demo", "complete"}
+ROUTING_SCHEMA = "headroom_desktop_routing@1"
+LAUNCH_INTENT_SCHEMA = "headroom_provider_launch_intent@1"
+DESKTOP_FAMILIES = ("claude", "opus", "sonnet", "haiku", "fable", "codex")
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_REQUEST_ID = 128
 
@@ -527,6 +531,210 @@ def update_settings_desktop(patch, now=None):
     return discover_desktop(now=now)
 
 
+def _desktop_family(value):
+    if value not in DESKTOP_FAMILIES:
+        raise BridgeError(
+            "invalid_routing_family", "routing family is not supported")
+    return value
+
+
+def _routing_reason_projection(reason):
+    """Turn CLI gate text into bounded desktop semantics without leaking it."""
+    text = str(reason or "").lower()
+    if text.startswith("reserved"):
+        return ("reserved", "Reserved accounts are monitored but never routed.",
+                "unreserve_account")
+    if "routing disabled" in text:
+        return ("routing_disabled", "Routing is disabled for this provider.",
+                "enable_routing")
+    if "leased" in text:
+        return ("leased", "Another live launch currently owns this slot.",
+                "close_other_session")
+    if "quarantined" in text:
+        return ("quarantined", "Authentication was rejected for this slot.",
+                "reauthenticate_account")
+    if "cooldown ledger" in text or "cooldown entry" in text \
+            or "quarantine ledger" in text:
+        return ("infrastructure_unavailable",
+                "Protective routing state cannot be verified safely.",
+                "inspect_diagnostics")
+    if "cooldown until" in text:
+        return ("cooled_down", "This slot is cooling down after a limit.",
+                "wait_for_reset")
+    if "at 100%" in text or "critical" in text or "below" in text \
+            and "reserve" in text:
+        return ("capacity_unavailable",
+                "Verified capacity is at or below the routing threshold.",
+                "wait_for_reset")
+    if "stale" in text or "expired" in text or "clock invalid" in text:
+        return ("stale_reading", "The capacity proof is no longer current.",
+                "refresh_capacity")
+    if "auth" in text or "login" in text or "token" in text:
+        return ("authentication_required",
+                "This slot needs a verified provider login.",
+                "reauthenticate_account")
+    if "identity" in text or "credential" in text or "trust" in text \
+            or "lineage" in text or "bound" in text:
+        return ("unverified_reading",
+                "The current login cannot be bound to this capacity proof.",
+                "refresh_or_reauthenticate")
+    if "not found" in text or "cli_missing" in text:
+        return ("provider_cli_missing", "The provider CLI is not installed.",
+                "install_provider_cli")
+    if "no usage" in text or "no fresh" in text or "reading" in text \
+            or "window" in text or text.startswith("held:"):
+        return ("unverified_reading",
+                "No current verified capacity proof is available.",
+                "refresh_capacity")
+    return ("infrastructure_unavailable",
+            "Routing could not prove this slot safe to launch.",
+            "inspect_diagnostics")
+
+
+def _routing_failure(candidates):
+    priorities = (
+        "infrastructure_unavailable", "authentication_required", "quarantined",
+        "leased", "capacity_unavailable", "cooled_down", "stale_reading",
+        "unverified_reading", "routing_disabled", "reserved",
+    )
+    by_code = {row["code"]: row for row in candidates}
+    for code in priorities:
+        if code in by_code:
+            row = by_code[code]
+            return {"status": "unavailable", "code": code,
+                    "explanation": row["explanation"], "action": row["action"]}
+    return {"status": "unavailable", "code": "no_provider_accounts",
+            "explanation": "No connected account exists for this provider.",
+            "action": "connect_account"}
+
+
+def routing_preview_desktop(family):
+    """Return the CLI router's ordered decision as a sanitized explanation."""
+    family = _desktop_family(family)
+    state, config, recovery_code = _registry_discovery()
+    if state == "recovery":
+        raise BridgeError("routing_infrastructure_unavailable", recovery_code)
+    if config is None:
+        raise BridgeError("no_accounts", "connect an account before routing")
+    try:
+        snapshot = route.ensure_fresh_snapshot()
+        ranked = route.candidates(family, snapshot)
+    except (OSError, RuntimeError, registry.RegistryError) as error:
+        raise BridgeError(
+            "routing_infrastructure_unavailable",
+            "routing state could not be verified") from error
+    selected = next((account for account, reason in ranked if reason is None), None)
+    rows = []
+    for account, reason in ranked:
+        is_selected = selected is not None and account["name"] == selected["name"]
+        if reason is None:
+            code, explanation, action = (
+                ("selected", "This is the engine-selected account.",
+                 "copy_or_open") if is_selected else
+                ("available", "This account also has proven headroom.",
+                 "none"))
+        else:
+            code, explanation, action = _routing_reason_projection(reason)
+        rows.append({
+            "name": account["name"], "provider": account["provider"],
+            "selected": is_selected, "eligible": reason is None,
+            "code": code, "explanation": explanation, "action": action,
+        })
+    provider = registry.family_provider(family)
+    binary = connect.provider_binary(provider)
+    if selected is None:
+        launch = _routing_failure(rows)
+    elif binary is None:
+        launch = {
+            "status": "unavailable", "code": "provider_cli_missing",
+            "explanation": "The selected provider CLI is not installed.",
+            "action": "install_provider_cli",
+        }
+    else:
+        launch = {
+            "status": "ready", "code": "launch_ready",
+            "explanation": "The selected account can be launched safely.",
+            "action": "copy_or_open",
+        }
+    return {
+        "schema": ROUTING_SCHEMA, "family": family, "provider": provider,
+        "selected": None if selected is None else {
+            "name": selected["name"], "provider": selected["provider"]},
+        "candidates": rows, "launch": launch,
+    }
+
+
+def _launch_error_from_preview(preview, account_name):
+    selected = preview.get("selected")
+    if selected is not None and selected.get("name") != account_name:
+        return BridgeError(
+            "routing_selection_changed",
+            "the engine selected a different account; preview again")
+    launch = preview["launch"]
+    code = launch.get("code")
+    mapping = {
+        "provider_cli_missing": "provider_cli_missing",
+        "authentication_required": "routing_authentication_required",
+        "quarantined": "routing_authentication_required",
+        "capacity_unavailable": "routing_capacity_unavailable",
+        "cooled_down": "routing_capacity_unavailable",
+        "leased": "routing_slot_leased",
+        "infrastructure_unavailable": "routing_infrastructure_unavailable",
+    }
+    return BridgeError(mapping.get(code, "routing_no_eligible_account"),
+                       launch.get("explanation") or "routing is unavailable")
+
+
+def routing_launch_intent_desktop(family, account_name):
+    family = _desktop_family(family)
+    if not isinstance(account_name, str) \
+            or not registry.NAME_RE.fullmatch(account_name):
+        raise BridgeError("invalid_account_name", "account name is invalid")
+    preview = routing_preview_desktop(family)
+    selected = preview.get("selected")
+    if selected is None or selected.get("name") != account_name \
+            or preview["launch"].get("status") != "ready":
+        raise _launch_error_from_preview(preview, account_name)
+    provider = selected["provider"]
+    executable = connect.provider_binary(provider)
+    if executable is None:
+        raise BridgeError("provider_cli_missing", "provider CLI is unavailable")
+    executable = os.path.realpath(executable)
+    if not os.path.isabs(executable) or not os.path.isfile(executable) \
+            or not os.access(executable, os.X_OK):
+        raise BridgeError("provider_cli_missing", "provider CLI is unavailable")
+    if getattr(sys, "frozen", False):
+        launcher = [os.path.realpath(sys.executable),
+                    "--launch-provider", family, account_name]
+    else:
+        launcher = [os.path.realpath(sys.executable), "-m",
+                    "headroom.desktop_bridge", "--launch-provider",
+                    family, account_name]
+    environment = {
+        "HEADROOM_DIR": paths.base_dir(),
+        "HEADROOM_SLOT_LEASE": "1",
+    }
+    command = " ".join(
+        [f"{key}={shlex.quote(value)}" for key, value in environment.items()]
+        + [shlex.join(launcher)])
+    return {
+        "schema": LAUNCH_INTENT_SCHEMA, "family": family,
+        "provider": provider, "account_name": account_name,
+        "preferred_terminal": registry.desktop_settings()["preferred_terminal"],
+        "launcher": launcher, "environment": environment,
+        "provider_executable": executable, "copy_command": command,
+    }
+
+
+def launch_selected_provider(family, account_name):
+    """Frozen launcher entry: re-prove, lease, and exec one provider CLI."""
+    intent = routing_launch_intent_desktop(family, account_name)
+    os.environ["HEADROOM_SLOT_LEASE"] = "1"
+    return route.cmd_exec_selected(
+        intent["family"], intent["account_name"],
+        [intent["provider_executable"]], launch_note="desktop launch intent")
+
+
 def account_action_desktop(action, name, *, new_name=None,
                            reserved=None, confirmation=None, now=None):
     if action not in {
@@ -848,7 +1056,8 @@ def _handle(command, args):
                 "fixture_snapshot", "discover", "adopt", "refresh",
                 "claude_login", "codex_device_login", "onboarding",
                 "account_lifecycle", "reauthentication",
-                "resilient_collection", "validated_settings", "shutdown"],
+                "resilient_collection", "validated_settings",
+                "routing_launch", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
@@ -886,6 +1095,15 @@ def _handle(command, args):
             raise BridgeError("invalid_args", "settings arguments are invalid")
         return update_settings_desktop(
             args.get("patch"), now=args.get("now")), False
+    if command == "routing_preview":
+        if set(args) != {"family"}:
+            raise BridgeError("invalid_args", "routing preview arguments are invalid")
+        return routing_preview_desktop(args.get("family")), False
+    if command == "routing_launch_intent":
+        if set(args) != {"family", "account_name"}:
+            raise BridgeError("invalid_args", "launch intent arguments are invalid")
+        return routing_launch_intent_desktop(
+            args.get("family"), args.get("account_name")), False
     if command == "start_claude_login":
         if set(args) - {"name", "expected_email"}:
             raise BridgeError("invalid_args", "login arguments are invalid")
@@ -964,5 +1182,23 @@ def main(input_stream=None, protocol_out=None):
     return 0
 
 
+def cli_main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv:
+        if len(argv) == 3 and argv[0] == "--launch-provider":
+            try:
+                return launch_selected_provider(argv[1], argv[2])
+            except BridgeError as error:
+                print(f"headroom: provider launch refused ({error.code})",
+                      file=sys.stderr)
+                return 2
+            except Exception:  # noqa: BLE001 - terminal sees stable diagnostics only
+                print("headroom: provider launch failed safely", file=sys.stderr)
+                return 2
+        print("headroom: unsupported desktop engine arguments", file=sys.stderr)
+        return 2
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main())

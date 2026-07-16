@@ -14,6 +14,7 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     path::PathBuf,
+    process::{Command as StdCommand, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -98,6 +99,38 @@ const DESKTOP_THEMES: [&str; 5] = ["midnight", "minimal", "chrome", "paper", "te
 const COLLECTION_IDLE_INTERVAL: Duration = Duration::from_secs(300);
 const COLLECTION_INTERVAL_MIN_SECONDS: u64 = 60;
 const COLLECTION_INTERVAL_MAX_SECONDS: u64 = 3600;
+const ROUTING_SCHEMA: &str = "headroom_desktop_routing@1";
+const LAUNCH_INTENT_SCHEMA: &str = "headroom_provider_launch_intent@1";
+const ROUTING_FAMILIES: &[&str] = &["claude", "opus", "sonnet", "haiku", "fable", "codex"];
+const ROUTING_CODES: &[&str] = &[
+    "selected",
+    "available",
+    "reserved",
+    "routing_disabled",
+    "leased",
+    "quarantined",
+    "infrastructure_unavailable",
+    "cooled_down",
+    "capacity_unavailable",
+    "stale_reading",
+    "authentication_required",
+    "unverified_reading",
+    "provider_cli_missing",
+];
+const ROUTING_ACTIONS: &[&str] = &[
+    "copy_or_open",
+    "none",
+    "unreserve_account",
+    "enable_routing",
+    "close_other_session",
+    "reauthenticate_account",
+    "inspect_diagnostics",
+    "wait_for_reset",
+    "refresh_capacity",
+    "refresh_or_reauthenticate",
+    "install_provider_cli",
+    "connect_account",
+];
 const COLLECTION_RETRY_BASE: Duration = Duration::from_secs(5);
 const COLLECTION_RETRY_CAP: Duration = Duration::from_secs(300);
 const COLLECTION_TICK: Duration = Duration::from_secs(15);
@@ -1222,6 +1255,356 @@ fn parse_bridge_response(frame: &[u8], expected_id: &str) -> Result<serde_json::
         .ok_or_else(|| "desktop engine response is missing its result".to_string())
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ValidatedLaunchIntent {
+    family: String,
+    provider: String,
+    account_name: String,
+    preferred_terminal: String,
+    launcher: Vec<String>,
+    headroom_dir: String,
+    provider_executable: String,
+    copy_command: String,
+}
+
+fn valid_account_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
+        })
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn launch_command(environment_dir: &str, launcher: &[String]) -> String {
+    let mut parts = vec![
+        format!("HEADROOM_DIR={}", shell_quote(environment_dir)),
+        "HEADROOM_SLOT_LEASE=1".to_string(),
+    ];
+    parts.extend(launcher.iter().map(|value| shell_quote(value)));
+    parts.join(" ")
+}
+
+fn executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return false;
+    }
+    true
+}
+
+fn object_has_only(value: &serde_json::Value, allowed: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+}
+
+fn validate_routing_preview(value: &serde_json::Value) -> Result<(), String> {
+    if !object_has_only(
+        value,
+        &[
+            "schema",
+            "family",
+            "provider",
+            "selected",
+            "candidates",
+            "launch",
+        ],
+    ) {
+        return Err("desktop routing preview contains unknown fields".into());
+    }
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(ROUTING_SCHEMA) {
+        return Err("desktop engine returned an invalid routing preview".into());
+    }
+    let family = value
+        .get("family")
+        .and_then(serde_json::Value::as_str)
+        .filter(|family| ROUTING_FAMILIES.contains(family))
+        .ok_or_else(|| "desktop routing family is invalid".to_string())?;
+    let provider = value
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .filter(|provider| matches!(*provider, "claude" | "codex"))
+        .ok_or_else(|| "desktop routing provider is invalid".to_string())?;
+    if (family == "codex") != (provider == "codex") {
+        return Err("desktop routing family and provider disagree".into());
+    }
+    let candidates = value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .filter(|rows| rows.len() <= 256)
+        .ok_or_else(|| "desktop routing candidates are invalid".to_string())?;
+    let mut selected_count = 0;
+    let mut candidate_names = std::collections::HashSet::new();
+    for row in candidates {
+        if !object_has_only(
+            row,
+            &[
+                "name",
+                "provider",
+                "selected",
+                "eligible",
+                "code",
+                "explanation",
+                "action",
+            ],
+        ) {
+            return Err("desktop routing candidate contains unknown fields".into());
+        }
+        let name = row
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| valid_account_name(name))
+            .ok_or_else(|| "desktop routing account is invalid".to_string())?;
+        let row_provider = row.get("provider").and_then(serde_json::Value::as_str);
+        if row_provider != Some(provider) {
+            return Err("desktop routing candidate provider is invalid".into());
+        }
+        let selected = row
+            .get("selected")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "desktop routing selection is invalid".to_string())?;
+        let eligible = row
+            .get("eligible")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "desktop routing eligibility is invalid".to_string())?;
+        let code = row
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| ROUTING_CODES.contains(code))
+            .ok_or_else(|| "desktop routing code is invalid".to_string())?;
+        let action = row
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .filter(|action| ROUTING_ACTIONS.contains(action))
+            .ok_or_else(|| "desktop routing action is invalid".to_string())?;
+        let explanation = row
+            .get("explanation")
+            .and_then(serde_json::Value::as_str)
+            .filter(|copy| !copy.is_empty() && copy.len() <= 256)
+            .ok_or_else(|| "desktop routing explanation is invalid".to_string())?;
+        let _ = (name, code, action, explanation);
+        if !candidate_names.insert(name) {
+            return Err("desktop routing account appears more than once".into());
+        }
+        if selected {
+            selected_count += 1;
+            if !eligible || code != "selected" {
+                return Err("desktop routing selected account is not eligible".into());
+            }
+        } else if eligible && code != "available" {
+            return Err("desktop routing eligible account has an invalid code".into());
+        }
+    }
+    if selected_count > 1 {
+        return Err("desktop routing selected multiple accounts".into());
+    }
+    let selected = value.get("selected");
+    if selected_count == 0 {
+        if !selected.is_none_or(serde_json::Value::is_null) {
+            return Err("desktop routing selected summary is invalid".into());
+        }
+    } else {
+        if !selected.is_some_and(|row| object_has_only(row, &["name", "provider"])) {
+            return Err("desktop routing selected summary contains unknown fields".into());
+        }
+        let name = selected
+            .and_then(|row| row.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "desktop routing selected summary is missing".to_string())?;
+        let selected_provider = selected
+            .and_then(|row| row.get("provider"))
+            .and_then(serde_json::Value::as_str);
+        if !valid_account_name(name) || selected_provider != Some(provider) {
+            return Err("desktop routing selected summary is invalid".into());
+        }
+        if !candidates.iter().any(|row| {
+            row.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+                && row.get("name").and_then(serde_json::Value::as_str) == Some(name)
+        }) {
+            return Err("desktop routing selected summary disagrees".into());
+        }
+    }
+    let launch = value
+        .get("launch")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "desktop routing launch state is invalid".to_string())?;
+    if launch
+        .keys()
+        .any(|key| !["status", "code", "explanation", "action"].contains(&key.as_str()))
+    {
+        return Err("desktop routing launch state contains unknown fields".into());
+    }
+    let status = launch
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .filter(|status| matches!(*status, "ready" | "unavailable"))
+        .ok_or_else(|| "desktop routing launch status is invalid".to_string())?;
+    let code = launch
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| {
+            *code == "launch_ready"
+                || *code == "no_provider_accounts"
+                || ROUTING_CODES.contains(code)
+        })
+        .ok_or_else(|| "desktop routing launch code is invalid".to_string())?;
+    let action = launch
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .filter(|action| ROUTING_ACTIONS.contains(action))
+        .ok_or_else(|| "desktop routing launch action is invalid".to_string())?;
+    let explanation = launch
+        .get("explanation")
+        .and_then(serde_json::Value::as_str)
+        .filter(|copy| !copy.is_empty() && copy.len() <= 256)
+        .ok_or_else(|| "desktop routing launch explanation is invalid".to_string())?;
+    let _ = (status, code, action, explanation);
+    if status == "ready"
+        && (selected_count != 1 || code != "launch_ready" || action != "copy_or_open")
+    {
+        return Err("desktop routing ready state is inconsistent".into());
+    }
+    if status == "unavailable" && code == "launch_ready" {
+        return Err("desktop routing unavailable state is inconsistent".into());
+    }
+    Ok(())
+}
+
+fn validate_launch_intent(value: &serde_json::Value) -> Result<ValidatedLaunchIntent, String> {
+    if !object_has_only(
+        value,
+        &[
+            "schema",
+            "family",
+            "provider",
+            "account_name",
+            "preferred_terminal",
+            "launcher",
+            "environment",
+            "provider_executable",
+            "copy_command",
+        ],
+    ) {
+        return Err("provider launch intent contains unknown fields".into());
+    }
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(LAUNCH_INTENT_SCHEMA) {
+        return Err("desktop engine returned an invalid launch intent".into());
+    }
+    let family = value
+        .get("family")
+        .and_then(serde_json::Value::as_str)
+        .filter(|family| ROUTING_FAMILIES.contains(family))
+        .ok_or_else(|| "provider launch family is invalid".to_string())?;
+    let provider = value
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .filter(|provider| matches!(*provider, "claude" | "codex"))
+        .ok_or_else(|| "provider launch target is invalid".to_string())?;
+    if (family == "codex") != (provider == "codex") {
+        return Err("provider launch family and target disagree".into());
+    }
+    let account_name = value
+        .get("account_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| valid_account_name(name))
+        .ok_or_else(|| "provider launch account is invalid".to_string())?;
+    let preferred_terminal = value
+        .get("preferred_terminal")
+        .and_then(serde_json::Value::as_str)
+        .filter(|terminal| matches!(*terminal, "terminal" | "iterm" | "warp"))
+        .ok_or_else(|| "preferred terminal is invalid".to_string())?;
+    let launcher = value
+        .get("launcher")
+        .and_then(serde_json::Value::as_array)
+        .filter(|argv| argv.len() == 4)
+        .ok_or_else(|| "provider launcher is invalid".to_string())?
+        .iter()
+        .map(|part| {
+            part.as_str()
+                .filter(|part| !part.is_empty() && part.len() <= 4096 && !part.contains('\0'))
+                .map(str::to_string)
+                .ok_or_else(|| "provider launcher argument is invalid".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let launcher_path = std::path::Path::new(&launcher[0]);
+    let launcher_name = launcher_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !launcher_path.is_absolute()
+        || !launcher_name.starts_with("headroom-engine")
+        || !executable_file(launcher_path)
+        || launcher[1] != "--launch-provider"
+        || launcher[2] != family
+        || launcher[3] != account_name
+    {
+        return Err("provider launcher is not the bundled engine".into());
+    }
+    let environment = value
+        .get("environment")
+        .and_then(serde_json::Value::as_object)
+        .filter(|environment| environment.len() == 2)
+        .ok_or_else(|| "provider launch environment is invalid".to_string())?;
+    if environment
+        .get("HEADROOM_SLOT_LEASE")
+        .and_then(serde_json::Value::as_str)
+        != Some("1")
+    {
+        return Err("provider launch lease policy is invalid".into());
+    }
+    let headroom_dir = environment
+        .get("HEADROOM_DIR")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| {
+            std::path::Path::new(path).is_absolute() && path.len() <= 4096 && !path.contains('\0')
+        })
+        .ok_or_else(|| "provider launch state root is invalid".to_string())?;
+    let provider_executable = value
+        .get("provider_executable")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| {
+            let path = std::path::Path::new(path);
+            path.is_absolute() && executable_file(path)
+        })
+        .ok_or_else(|| "provider executable is invalid".to_string())?;
+    let copy_command = value
+        .get("copy_command")
+        .and_then(serde_json::Value::as_str)
+        .filter(|copy| copy.len() <= 16_384 && !copy.contains('\0'))
+        .ok_or_else(|| "provider copy command is invalid".to_string())?;
+    if copy_command != launch_command(headroom_dir, &launcher) {
+        return Err("provider copy command does not match its launch intent".into());
+    }
+    Ok(ValidatedLaunchIntent {
+        family: family.to_string(),
+        provider: provider.to_string(),
+        account_name: account_name.to_string(),
+        preferred_terminal: preferred_terminal.to_string(),
+        launcher,
+        headroom_dir: headroom_dir.to_string(),
+        provider_executable: provider_executable.to_string(),
+        copy_command: copy_command.to_string(),
+    })
+}
+
 fn validate_desktop_view(view: &serde_json::Value) -> Result<(), String> {
     if view.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_VIEW_SCHEMA)
         || !view
@@ -1268,6 +1651,7 @@ fn validate_desktop_bootstrap(
                 "reauthentication",
                 "resilient_collection",
                 "validated_settings",
+                "routing_launch",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -1342,7 +1726,8 @@ fn bootstrap_sidecar(
     let command = app
         .shell()
         .sidecar("headroom-engine")
-        .map_err(|_| "bundled desktop engine could not be resolved".to_string())?;
+        .map_err(|_| "bundled desktop engine could not be resolved".to_string())?
+        .env("HEADROOM_SLOT_LEASE", "1");
     let (mut events, mut child) = command
         .spawn()
         .map_err(|_| "bundled desktop engine could not be started".to_string())?;
@@ -2074,6 +2459,161 @@ async fn desktop_update_settings(
     patch: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     update_desktop_settings(app, state.inner().clone(), patch).await
+}
+
+async fn routing_launch_intent(
+    app: AppHandle,
+    engine: DesktopEngine,
+    family: String,
+    account_name: String,
+) -> Result<ValidatedLaunchIntent, String> {
+    if !ROUTING_FAMILIES.contains(&family.as_str()) || !valid_account_name(&account_name) {
+        return Err("routing launch request is invalid".into());
+    }
+    let value = engine_command(
+        app,
+        engine,
+        "routing_launch_intent",
+        serde_json::json!({"family": family, "account_name": account_name}),
+    )
+    .await?;
+    validate_launch_intent(&value)
+}
+
+#[tauri::command]
+async fn desktop_routing_preview(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    family: String,
+) -> Result<serde_json::Value, String> {
+    if !ROUTING_FAMILIES.contains(&family.as_str()) {
+        return Err("routing family is invalid".into());
+    }
+    let value = engine_command(
+        app,
+        state.inner().clone(),
+        "routing_preview",
+        serde_json::json!({"family": family}),
+    )
+    .await?;
+    validate_routing_preview(&value)?;
+    Ok(value)
+}
+
+fn copy_to_clipboard(copy: &str) -> Result<(), String> {
+    let mut child = StdCommand::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "provider command clipboard is unavailable".to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "provider command clipboard is unavailable".to_string())?
+        .write_all(copy.as_bytes())
+        .map_err(|_| "provider command could not be copied".to_string())?;
+    let status = child
+        .wait()
+        .map_err(|_| "provider command clipboard is unavailable".to_string())?;
+    if !status.success() {
+        return Err("provider command could not be copied".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn desktop_copy_routing_command(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    family: String,
+    account_name: String,
+) -> Result<serde_json::Value, String> {
+    let intent = routing_launch_intent(app, state.inner().clone(), family, account_name).await?;
+    copy_to_clipboard(&intent.copy_command)?;
+    Ok(serde_json::json!({
+        "status": "copied",
+        "account_name": intent.account_name,
+        "provider": intent.provider,
+    }))
+}
+
+fn write_terminal_launch_script(
+    app: &AppHandle,
+    intent: &ValidatedLaunchIntent,
+) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|_| "provider launch cache is unavailable".to_string())?
+        .join("launch-intents");
+    fs::create_dir_all(&directory)
+        .map_err(|_| "provider launch cache could not be prepared".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "provider launch cache permissions could not be set".to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = directory.join(format!("launch-{}-{nonce}.command", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o700);
+    let mut file = options
+        .open(&path)
+        .map_err(|_| "provider launch script could not be created".to_string())?;
+    let command = launch_command(&intent.headroom_dir, &intent.launcher);
+    writeln!(file, "#!/bin/zsh\nrm -f -- \"$0\"\n{command}")
+        .map_err(|_| "provider launch script could not be written".to_string())?;
+    file.sync_all()
+        .map_err(|_| "provider launch script could not be committed".to_string())?;
+    Ok(path)
+}
+
+fn open_launch_script(path: &std::path::Path, terminal: &str) -> Result<(), String> {
+    let application = match terminal {
+        "terminal" => "Terminal",
+        "iterm" => "iTerm",
+        "warp" => "Warp",
+        _ => return Err("preferred terminal is invalid".into()),
+    };
+    let status = StdCommand::new("/usr/bin/open")
+        .arg("-a")
+        .arg(application)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "preferred terminal could not be opened".to_string())?;
+    if !status.success() {
+        return Err("preferred terminal is unavailable".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn desktop_open_routing_launch(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    family: String,
+    account_name: String,
+) -> Result<serde_json::Value, String> {
+    let intent =
+        routing_launch_intent(app.clone(), state.inner().clone(), family, account_name).await?;
+    let script = write_terminal_launch_script(&app, &intent)?;
+    if let Err(error) = open_launch_script(&script, &intent.preferred_terminal) {
+        let _ = fs::remove_file(script);
+        return Err(error);
+    }
+    Ok(serde_json::json!({
+        "status": "opened",
+        "account_name": intent.account_name,
+        "provider": intent.provider,
+        "terminal": intent.preferred_terminal,
+    }))
 }
 
 #[tauri::command]
@@ -2914,6 +3454,9 @@ pub fn run() {
             desktop_retry_engine,
             desktop_set_theme,
             desktop_update_settings,
+            desktop_routing_preview,
+            desktop_copy_routing_command,
+            desktop_open_routing_launch,
             desktop_launch_at_login_status,
             desktop_set_launch_at_login,
             desktop_show_dashboard,
@@ -3225,6 +3768,7 @@ mod tests {
             "reauthentication",
             "resilient_collection",
             "validated_settings",
+            "routing_launch",
         ];
         let compatible = serde_json::json!({
             "product": "headroom",
@@ -3462,6 +4006,112 @@ mod tests {
             "height": 650,
         }))
         .is_none());
+    }
+
+    #[test]
+    fn routing_preview_requires_bounded_engine_semantics() {
+        let preview = serde_json::json!({
+            "schema": ROUTING_SCHEMA,
+            "family": "sonnet",
+            "provider": "claude",
+            "selected": {"name": "claude-one", "provider": "claude"},
+            "candidates": [
+                {"name": "claude-one", "provider": "claude", "selected": true,
+                 "eligible": true, "code": "selected",
+                 "explanation": "This is the engine-selected account.",
+                 "action": "copy_or_open"},
+                {"name": "claude-two", "provider": "claude", "selected": false,
+                 "eligible": false, "code": "leased",
+                 "explanation": "Another live launch currently owns this slot.",
+                 "action": "close_other_session"},
+            ],
+            "launch": {"status": "ready", "code": "launch_ready",
+                       "explanation": "The selected account can be launched safely.",
+                       "action": "copy_or_open"},
+        });
+        assert!(validate_routing_preview(&preview).is_ok());
+        let mut arbitrary = preview.clone();
+        arbitrary["command"] = serde_json::json!("rm -rf /");
+        assert!(validate_routing_preview(&arbitrary).is_err());
+        let mut mismatched = preview.clone();
+        mismatched["selected"]["name"] = serde_json::json!("claude-two");
+        assert!(validate_routing_preview(&mismatched).is_err());
+        let mut wrong_provider = preview.clone();
+        wrong_provider["selected"]["provider"] = serde_json::json!("codex");
+        assert!(validate_routing_preview(&wrong_provider).is_err());
+        let mut inconsistent = preview.clone();
+        inconsistent["launch"]["code"] = serde_json::json!("leased");
+        assert!(validate_routing_preview(&inconsistent).is_err());
+        let mut raw_reason = preview;
+        raw_reason["candidates"][1]["raw_reason"] = serde_json::json!("private provider text");
+        assert!(validate_routing_preview(&raw_reason).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_intent_accepts_only_the_bundled_launcher_contract() {
+        let directory = std::env::temp_dir().join(format!(
+            "headroom-launch-intent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("test directory exists");
+        let launcher_path = directory.join("headroom-engine-test");
+        let provider_path = directory.join("claude");
+        for path in [&launcher_path, &provider_path] {
+            fs::write(path, b"#!/bin/sh\nexit 0\n").expect("test executable writes");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("test executable permissions update");
+        }
+        let launcher = vec![
+            launcher_path.to_string_lossy().into_owned(),
+            "--launch-provider".into(),
+            "sonnet".into(),
+            "claude-one".into(),
+        ];
+        let command = launch_command(directory.to_str().unwrap(), &launcher);
+        let intent = serde_json::json!({
+            "schema": LAUNCH_INTENT_SCHEMA,
+            "family": "sonnet",
+            "provider": "claude",
+            "account_name": "claude-one",
+            "preferred_terminal": "terminal",
+            "launcher": launcher,
+            "environment": {
+                "HEADROOM_DIR": directory,
+                "HEADROOM_SLOT_LEASE": "1",
+            },
+            "provider_executable": provider_path,
+            "copy_command": command,
+        });
+        let validated = validate_launch_intent(&intent).expect("intent is valid");
+        assert_eq!(validated.account_name, "claude-one");
+        assert_eq!(validated.family, "sonnet");
+        assert_eq!(validated.provider, "claude");
+
+        let mut shell = intent.clone();
+        shell["launcher"][0] = serde_json::json!("/bin/sh");
+        assert!(validate_launch_intent(&shell).is_err());
+        let mut arbitrary = intent.clone();
+        arbitrary["command"] = serde_json::json!("touch /tmp/owned");
+        assert!(validate_launch_intent(&arbitrary).is_err());
+        let mut extra_environment = intent.clone();
+        extra_environment["environment"]["PATH"] = serde_json::json!("/tmp/evil");
+        assert!(validate_launch_intent(&extra_environment).is_err());
+        let mut wrong_copy = intent;
+        wrong_copy["copy_command"] = serde_json::json!("echo unsafe");
+        assert!(validate_launch_intent(&wrong_copy).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn shell_quote_never_reinterprets_launch_values() {
+        assert_eq!(shell_quote("/safe/path"), "/safe/path");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]

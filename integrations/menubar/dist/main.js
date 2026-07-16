@@ -10,6 +10,20 @@ const VALID_TERMINALS = new Set(["terminal", "iterm", "warp"]);
 const VALID_SURFACES = new Set(["main", "popover"]);
 const REFRESH_INTERVAL_MIN = 60;
 const REFRESH_INTERVAL_MAX = 3600;
+const ROUTING_SCHEMA = "headroom_desktop_routing@1";
+const ROUTING_FAMILIES = new Set(["claude", "opus", "sonnet", "haiku", "fable", "codex"]);
+const ROUTING_CODES = new Set([
+  "selected", "available", "reserved", "routing_disabled", "leased",
+  "quarantined", "infrastructure_unavailable", "cooled_down",
+  "capacity_unavailable", "stale_reading", "authentication_required",
+  "unverified_reading", "provider_cli_missing",
+]);
+const ROUTING_ACTIONS = new Set([
+  "copy_or_open", "none", "unreserve_account", "enable_routing",
+  "close_other_session", "reauthenticate_account", "inspect_diagnostics",
+  "wait_for_reset", "refresh_capacity", "refresh_or_reauthenticate",
+  "install_provider_cli", "connect_account",
+]);
 const TRUST_STATES = new Set([
   "verified", "verified_local", "verified_remote", "duplicate_identity", "held",
 ]);
@@ -22,6 +36,7 @@ const TRANSIENT_CODES = new Set([
 let activeBootstrap = null;
 let activeInvoke = null;
 let activeRevision = 0;
+let activeRoutingPreview = null;
 
 export function shouldApplySnapshot(currentRevision, incomingRevision) {
   return Number.isInteger(incomingRevision) && incomingRevision > currentRevision;
@@ -129,6 +144,69 @@ export function settingsPatch(draft) {
         codex: draft.codex_notification_threshold === "" ? null
           : Number(draft.codex_notification_threshold),
       },
+    },
+  };
+}
+
+export function normalizeRoutingPreview(raw) {
+  if (!raw || raw.schema !== ROUTING_SCHEMA || !ROUTING_FAMILIES.has(raw.family)) {
+    throw new Error("invalid routing preview");
+  }
+  const provider = raw.provider === "claude" || raw.provider === "codex"
+    ? raw.provider : null;
+  if (!provider || (raw.family === "codex") !== (provider === "codex")) {
+    throw new Error("invalid routing provider");
+  }
+  if (!Array.isArray(raw.candidates) || raw.candidates.length > 256) {
+    throw new Error("invalid routing candidates");
+  }
+  let selectedCount = 0;
+  const candidates = raw.candidates.map((row) => {
+    if (!row || typeof row.name !== "string" ||
+        !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(row.name) || row.provider !== provider ||
+        typeof row.selected !== "boolean" || typeof row.eligible !== "boolean" ||
+        !ROUTING_CODES.has(row.code) || !ROUTING_ACTIONS.has(row.action) ||
+        typeof row.explanation !== "string" || row.explanation.length < 1 ||
+        row.explanation.length > 256) {
+      throw new Error("invalid routing candidate");
+    }
+    if (row.selected) {
+      selectedCount += 1;
+      if (!row.eligible || row.code !== "selected") {
+        throw new Error("invalid routing selection");
+      }
+    }
+    return {
+      name: row.name, provider, selected: row.selected, eligible: row.eligible,
+      code: row.code, action: row.action, explanation: row.explanation,
+    };
+  });
+  if (selectedCount > 1) throw new Error("invalid routing selection");
+  let selected = null;
+  if (raw.selected !== null && raw.selected !== undefined) {
+    if (typeof raw.selected.name !== "string" || raw.selected.provider !== provider ||
+        !candidates.some((row) => row.selected && row.name === raw.selected.name)) {
+      throw new Error("invalid routing selection summary");
+    }
+    selected = { name: raw.selected.name, provider };
+  }
+  if ((selected === null) !== (selectedCount === 0)) {
+    throw new Error("invalid routing selection summary");
+  }
+  const launchCodes = new Set([...ROUTING_CODES, "launch_ready", "no_provider_accounts"]);
+  const launch = raw.launch;
+  if (!launch || !["ready", "unavailable"].includes(launch.status) ||
+      !launchCodes.has(launch.code) || !ROUTING_ACTIONS.has(launch.action) ||
+      typeof launch.explanation !== "string" || launch.explanation.length < 1 ||
+      launch.explanation.length > 256 ||
+      (launch.status === "ready" && (!selected || launch.code !== "launch_ready"))) {
+    throw new Error("invalid routing launch state");
+  }
+  return {
+    schema: ROUTING_SCHEMA, family: raw.family, provider, selected, candidates,
+    launch: {
+      status: launch.status, code: launch.code,
+      explanation: launch.explanation, action: launch.action,
     },
   };
 }
@@ -1172,9 +1250,127 @@ function configureSettings(value, invoke) {
   };
 }
 
+function renderRoutingPreview(preview, invoke) {
+  const result = document.getElementById("routing-result");
+  const diagnostic = document.getElementById("routing-diagnostic");
+  const selected = document.getElementById("routing-selected");
+  const explanation = document.getElementById("routing-launch-explanation");
+  const copy = document.getElementById("routing-copy");
+  const open = document.getElementById("routing-open");
+  result.hidden = false;
+  selected.textContent = preview.selected
+    ? `${preview.selected.name} // ${preview.provider}` : "No eligible account";
+  explanation.textContent = `${preview.launch.explanation} [${preview.launch.code}]`;
+  diagnostic.classList.toggle("is-error", preview.launch.status !== "ready");
+  diagnostic.textContent = preview.selected
+    ? `Engine selected ${preview.selected.name} for ${preview.family}.`
+    : `No safe route for ${preview.family}; review the candidate actions below.`;
+  const rows = preview.candidates.map((candidate) => {
+    const row = document.createElement("div");
+    row.className = "routing-candidate";
+    row.dataset.code = candidate.code;
+    const name = document.createElement("strong");
+    name.textContent = `${candidate.selected ? ">" : "-"} ${candidate.name}`;
+    const status = document.createElement("span");
+    status.textContent = `[${candidate.code.replaceAll("_", " ")}]`;
+    const reason = document.createElement("span");
+    reason.textContent = `${candidate.explanation} · action: ${candidate.action.replaceAll("_", " ")}`;
+    row.append(name, status, reason);
+    return row;
+  });
+  document.getElementById("routing-candidates").replaceChildren(...rows);
+  const canLaunch = Boolean(invoke && preview.selected && preview.launch.status === "ready");
+  copy.disabled = !canLaunch;
+  open.disabled = !canLaunch;
+  copy.onclick = canLaunch ? async () => {
+    copy.disabled = true;
+    diagnostic.classList.remove("is-error");
+    diagnostic.textContent = "Re-proving the route before copying…";
+    try {
+      await invoke("desktop_copy_routing_command", {
+        family: preview.family, accountName: preview.selected.name,
+      });
+      diagnostic.textContent = `Safe ${preview.provider} launch command copied for ${preview.selected.name}.`;
+    } catch (error) {
+      diagnostic.classList.add("is-error");
+      diagnostic.textContent = `Copy refused: ${routingCommandError(error)}`;
+    } finally {
+      copy.disabled = false;
+    }
+  } : null;
+  open.onclick = canLaunch ? async () => {
+    open.disabled = true;
+    diagnostic.classList.remove("is-error");
+    diagnostic.textContent = "Re-proving the route before opening the terminal…";
+    try {
+      const outcome = await invoke("desktop_open_routing_launch", {
+        family: preview.family, accountName: preview.selected.name,
+      });
+      diagnostic.textContent =
+        `Opened ${outcome.provider} on ${outcome.account_name} in ${outcome.terminal}.`;
+    } catch (error) {
+      diagnostic.classList.add("is-error");
+      diagnostic.textContent = `Launch refused: ${routingCommandError(error)}`;
+    } finally {
+      open.disabled = false;
+    }
+  } : null;
+}
+
+function routingCommandError(error) {
+  const text = String(error || "");
+  if (text.includes("provider_cli_missing")) return "install or configure the provider CLI";
+  if (text.includes("routing_authentication_required")) return "re-authenticate the selected account";
+  if (text.includes("routing_capacity_unavailable")) return "wait for capacity to reset, then preview again";
+  if (text.includes("routing_slot_leased")) return "close the other live session, then preview again";
+  if (text.includes("routing_selection_changed")) return "the selection changed; preview again";
+  if (text.includes("routing_infrastructure_unavailable")) return "protective state is unavailable; inspect diagnostics";
+  if (text.includes("preferred terminal")) return "the configured terminal is unavailable";
+  return "the engine could not prove this launch safe; preview again";
+}
+
+function configureRouting(value, invoke) {
+  const family = document.getElementById("routing-family");
+  const preview = document.getElementById("routing-preview");
+  preview.disabled = !invoke || value.surface !== "main" || value.view.mode !== "ready";
+  preview.onclick = invoke ? async () => {
+    if (!ROUTING_FAMILIES.has(family.value)) return;
+    preview.disabled = true;
+    const diagnostic = document.getElementById("routing-diagnostic");
+    diagnostic.classList.remove("is-error");
+    diagnostic.textContent = `Proving the current ${family.value} route…`;
+    try {
+      activeRoutingPreview = normalizeRoutingPreview(await invoke(
+        "desktop_routing_preview", { family: family.value }));
+      renderRoutingPreview(activeRoutingPreview, invoke);
+    } catch {
+      activeRoutingPreview = null;
+      document.getElementById("routing-result").hidden = true;
+      diagnostic.classList.add("is-error");
+      diagnostic.textContent =
+        "Routing preview is unavailable; refresh capacity or inspect diagnostics.";
+    } finally {
+      preview.disabled = false;
+    }
+  } : null;
+  family.onchange = () => {
+    activeRoutingPreview = null;
+    document.getElementById("routing-result").hidden = true;
+    const diagnostic = document.getElementById("routing-diagnostic");
+    diagnostic.classList.remove("is-error");
+    diagnostic.textContent = `Preview ${family.value} to compute a fresh engine decision.`;
+  };
+  if (activeRoutingPreview && activeRoutingPreview.family === family.value) {
+    renderRoutingPreview(activeRoutingPreview, invoke);
+  }
+}
+
 export function renderBootstrap(raw, invoke = null) {
   const value = normalizeBootstrap(raw);
   const { view } = value;
+  if (activeBootstrap && value.revision !== activeBootstrap.revision) {
+    activeRoutingPreview = null;
+  }
   activeBootstrap = value;
   activeInvoke = invoke;
   activeRevision = Math.max(activeRevision, value.revision);
@@ -1248,6 +1444,7 @@ export function renderBootstrap(raw, invoke = null) {
   actions.replaceChildren(...actionCards);
   configureSurfaceActions(value.surface, invoke);
   configureSettings(value, invoke);
+  configureRouting(value, invoke);
   const freshnessAge = view.freshness.age_seconds === null
     ? "age unknown" : `${view.freshness.age_seconds}s old`;
   document.getElementById("surface-status").textContent =
