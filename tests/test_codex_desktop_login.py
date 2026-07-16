@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest import mock
 
-from headroom import connect, paths, registry
+from headroom import connect, paths, registry, route
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -199,6 +199,34 @@ class CodexDesktopLogin(unittest.TestCase):
         self.assertEqual(missing["code"], "codex_cli_missing")
         self.assertEqual(unsupported["code"], "codex_upgrade_required")
         self.assertFalse(os.path.exists(self.home))
+
+    def test_reauthentication_preserves_slot_and_clears_quarantine(self):
+        first = self.login()
+        self.assertTrue(first["ok"])
+        config = registry.load()
+        original_home = config["accounts"][0]["home"]
+        route.quarantine_mark("codex-new", "token invalid")
+        with mock.patch.object(connect, "provider_binary", return_value=FAKE_CODEX):
+            value = connect.desktop_connect_codex_device(
+                config, "codex-new", reauthenticate=True)
+        self.assertEqual(value["code"], "reauthenticated")
+        self.assertEqual(len(registry.load()["accounts"]), 1)
+        self.assertEqual(registry.load()["accounts"][0]["home"], original_home)
+        self.assertEqual(route.quarantines(), {})
+
+    def test_reauthentication_wrong_identity_restores_prior_auth(self):
+        first = self.login()
+        self.assertTrue(first["ok"])
+        config = registry.load()
+        with open(self.auth, encoding="utf-8") as handle:
+            original = json.load(handle)
+        with mock.patch.object(connect, "provider_binary", return_value=FAKE_CODEX):
+            value = connect.desktop_connect_codex_device(
+                config, "codex-new", expected_email="wrong@example.test",
+                reauthenticate=True)
+        self.assertEqual(value["code"], "identity_rejected")
+        with open(self.auth, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), original)
 
 
 if __name__ == "__main__":

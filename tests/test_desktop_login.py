@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from headroom import connect, paths, registry
+from headroom import connect, paths, registry, route
 
 
 class FinishedProcess:
@@ -201,6 +201,74 @@ class DesktopFreshLogin(unittest.TestCase):
             value = self.run_login(keychain_exists=True)
         self.assertEqual(value["code"], "claude_slot_keychain_occupied")
         self.assertFalse(os.path.exists(self.home))
+
+    def test_reauthentication_reuses_owned_home_and_clears_quarantine(self):
+        os.makedirs(self.home)
+        with open(self.credential, "w", encoding="utf-8") as handle:
+            json.dump({"token": "old"}, handle)
+        config = {**self.config, "accounts": [{
+            "name": "claude-1", "provider": "claude", "home": self.home,
+            "expected_email": "owner@example.test",
+        }]}
+        registry.save(config)
+        route.quarantine_mark("claude-1", "expired")
+
+        def login(*_args, **_kwargs):
+            with open(self.credential, "w", encoding="utf-8") as handle:
+                json.dump({"token": "new"}, handle)
+            return FinishedProcess()
+
+        with mock.patch.object(connect, "provider_binary", return_value="/bin/claude"), \
+                mock.patch.object(connect, "darwin_keychain_guard", return_value=True), \
+                mock.patch.object(connect.collector,
+                                  "claude_keychain_item_exists",
+                                  return_value=False), \
+                mock.patch.object(connect, "slot_identity", return_value={
+                    "email": "owner@example.test", "account_fingerprint": "one"}), \
+                mock.patch.object(connect, "existing_fingerprints",
+                                  return_value={}):
+            value = connect.desktop_connect_fresh(
+                config, "claude-1", "claude", popen=login,
+                prerequisite=lambda provider, binary: True,
+                reauthenticate=True)
+        self.assertEqual(value["code"], "reauthenticated")
+        self.assertEqual(len(registry.load()["accounts"]), 1)
+        self.assertEqual(registry.load()["accounts"][0]["home"], self.home)
+        with open(self.credential, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"token": "new"})
+        self.assertEqual(route.quarantines(), {})
+
+    def test_reauthentication_wrong_identity_restores_owned_credentials(self):
+        os.makedirs(self.home)
+        with open(self.credential, "w", encoding="utf-8") as handle:
+            json.dump({"token": "old"}, handle)
+        config = {**self.config, "accounts": [{
+            "name": "claude-1", "provider": "claude", "home": self.home,
+            "expected_email": "owner@example.test",
+        }]}
+        registry.save(config)
+
+        def login(*_args, **_kwargs):
+            with open(self.credential, "w", encoding="utf-8") as handle:
+                json.dump({"token": "wrong"}, handle)
+            return FinishedProcess()
+
+        with mock.patch.object(connect, "provider_binary", return_value="/bin/claude"), \
+                mock.patch.object(connect, "darwin_keychain_guard", return_value=True), \
+                mock.patch.object(connect.collector,
+                                  "claude_keychain_item_exists",
+                                  return_value=False), \
+                mock.patch.object(connect, "slot_identity", return_value={
+                    "email": "wrong@example.test", "account_fingerprint": "wrong"}), \
+                mock.patch.object(connect, "existing_fingerprints",
+                                  return_value={}):
+            value = connect.desktop_connect_fresh(
+                config, "claude-1", "claude", popen=login,
+                prerequisite=lambda provider, binary: True,
+                reauthenticate=True)
+        self.assertEqual(value["code"], "wrong_identity")
+        with open(self.credential, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"token": "old"})
 
 
 if __name__ == "__main__":

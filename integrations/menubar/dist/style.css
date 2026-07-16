@@ -71,6 +71,8 @@ button { cursor: pointer; font-weight: 700; text-transform: uppercase; }
 button:hover:not(:disabled), input:focus { border-color: var(--phosphor); box-shadow: var(--glow); outline: none; }
 button:disabled { cursor: default; opacity: 0.5; }
 button.primary { border-color: var(--phosphor); box-shadow: var(--glow); color: var(--phosphor-bright); }
+button.danger { color: #ff8f8f; border-color: rgba(255, 86, 86, 0.55); }
+button.danger:hover:not(:disabled) { border-color: #ff7d7d; box-shadow: 0 0 9px rgba(255, 86, 86, 0.28); }
 .actions { display: grid; gap: 10px; margin-top: 18px; }
 .candidate {
   display: grid;
@@ -172,6 +174,40 @@ button.primary { border-color: var(--phosphor); box-shadow: var(--glow); color: 
 .window-held .meter, .window-stale .meter { border-style: dashed; opacity: 0.58; }
 .note { color: var(--phosphor-dim); font-size: 13px; line-height: 1.45; }
 
+.account-lifecycle {
+  margin-top: 18px;
+  border-top: 1px dashed var(--line);
+  padding-top: 12px;
+}
+.account-lifecycle summary {
+  cursor: pointer;
+  color: var(--phosphor-bright);
+  font-weight: 700;
+  text-shadow: var(--glow);
+  list-style: none;
+}
+.account-lifecycle summary::-webkit-details-marker { display: none; }
+.account-lifecycle[open] summary { margin-bottom: 12px; }
+.ownership-note {
+  margin: 8px 0;
+  color: var(--phosphor-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.lifecycle-controls, .lifecycle-form, .reauthentication {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+}
+.lifecycle-controls button { flex: 1; min-width: 92px; }
+.lifecycle-form input { flex: 1; min-width: 170px; }
+.reauthentication { align-items: center; }
+.reauthentication .device-instructions, .reauthentication .diagnostic {
+  width: 100%;
+}
+.lifecycle-diagnostic { margin-top: 9px; }
+
 footer { margin-top: 28px; color: var(--phosphor-dim); font-size: 11px; text-align: center; }
 
 @media (max-width: 600px) {
@@ -182,6 +218,8 @@ footer { margin-top: 28px; color: var(--phosphor-dim); font-size: 11px; text-ali
   .candidate input, .login-fields input:first-child, .login-fields input[type="email"] { width: 100%; }
   .provider-grid { grid-template-columns: 1fr; }
   .onboarding-controls { align-items: stretch; flex-direction: column; }
+  .lifecycle-controls, .lifecycle-form, .reauthentication { flex-direction: column; }
+  .lifecycle-form input { width: 100%; }
   .fleet { margin-top: 38px; }
 }
 

@@ -81,6 +81,41 @@ test("shared login diagnostics remain accurate for Codex", () => {
   assert.equal(loginMessage("connected"), "Account connected");
   assert.equal(loginMessage("duplicate_identity"),
     "That identity is already connected");
+  assert.equal(loginMessage("reauthenticated"),
+    "Account identity verified; prior protective hold cleared");
+});
+
+test("normalizes account lifecycle policy without accepting home details", () => {
+  const raw = structuredClone(bootstrap);
+  raw.view.accounts[0].policy = {
+    schema: "headroom_account_lifecycle@1",
+    home_kind: "headroom",
+    home_retained_on_remove: true,
+    rename_keeps_home: true,
+    reauthentication: "available",
+    position: 0,
+    count: 2,
+    can_move_up: false,
+    can_move_down: true,
+    can_remove: true,
+    home: "/private/provider/home",
+  };
+  const policy = normalizeBootstrap(raw).view.accounts[0].policy;
+  assert.deepEqual(policy, {
+    schema: "headroom_account_lifecycle@1",
+    home_kind: "headroom",
+    home_retained_on_remove: true,
+    rename_keeps_home: true,
+    reauthentication: "available",
+    position: 0,
+    count: 2,
+    can_move_up: false,
+    can_move_down: true,
+    can_remove: true,
+  });
+  assert.equal(JSON.stringify(policy).includes("/private"), false);
+  raw.view.accounts[0].policy.reauthentication = "invented";
+  assert.equal(normalizeBootstrap(raw).view.accounts[0].policy, null);
 });
 
 test("device instructions accept only the exact OpenAI HTTPS origin", () => {

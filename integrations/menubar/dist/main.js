@@ -2,6 +2,8 @@ const VALID_STATES = new Set(["current", "limited", "held", "stale"]);
 const VALID_MODES = new Set(["ready", "onboarding", "demo", "recovery"]);
 const ONBOARDING_STEPS = new Set(["welcome", "providers", "accounts", "demo", "complete"]);
 const PROVIDER_STATES = new Set(["unchecked", "ready", "missing", "upgrade_required"]);
+const HOME_KINDS = new Set(["headroom", "adopted"]);
+const REAUTH_STATES = new Set(["available", "provider_managed", "keychain_manual"]);
 
 export function accountNameError(value, existingNames = []) {
   if (typeof value !== "string" || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(value)) {
@@ -44,6 +46,7 @@ const LOGIN_MESSAGES = {
   cancelling: "Cancelling and restoring prior credentials",
   complete: "Complete",
   connected: "Account connected",
+  reauthenticated: "Account identity verified; prior protective hold cleared",
   cancelled: "Login cancelled; prior credentials restored",
   login_timed_out: "Login timed out; prior credentials restored",
   provider_login_failed: "Claude login failed; prior credentials restored",
@@ -85,6 +88,33 @@ export function normalizeDeviceInstructions(value) {
   return { verification_url: value.verification_url, user_code: value.user_code };
 }
 
+function showDeviceInstructions(device, invoke, raw) {
+  const instructions = normalizeDeviceInstructions(raw);
+  if (!instructions) { device.hidden = true; device.replaceChildren(); return; }
+  const code = document.createElement("code");
+  code.textContent = instructions.user_code;
+  const open = document.createElement("button");
+  open.type = "button";
+  open.textContent = "Open OpenAI";
+  open.onclick = () => invoke("desktop_open_device_url", {
+    url: instructions.verification_url,
+  });
+  device.replaceChildren(code, open);
+  device.hidden = false;
+}
+
+async function monitorLoginJob(job, invoke, diagnostic, device) {
+  while (job.state === "running" || job.state === "cancelling") {
+    diagnostic.textContent = loginMessage(job.progress_code);
+    showDeviceInstructions(device, invoke, job.instructions);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    job = await invoke("desktop_login_status", { jobId: job.job_id });
+  }
+  diagnostic.textContent = loginMessage(job.result_code);
+  showDeviceInstructions(device, invoke, null);
+  return job;
+}
+
 export function normalizeBootstrap(raw) {
   if (!raw || raw.bridge?.bridge_schema !== "headroom_desktop_bridge@1") {
     throw new Error("incompatible desktop engine");
@@ -93,18 +123,39 @@ export function normalizeBootstrap(raw) {
   if (!view || view.schema !== "headroom_desktop_view@1") {
     throw new Error("invalid sanitized desktop view");
   }
-  const accounts = Array.isArray(view.accounts) ? view.accounts.map((account) => ({
-    name: typeof account?.name === "string" ? account.name : "unknown",
-    provider: account?.provider === "claude" || account?.provider === "codex"
-      ? account.provider : "unknown",
-    identity: typeof account?.identity === "string" ? account.identity : null,
-    plan: typeof account?.plan === "string" ? account.plan : "Unknown",
-    note: typeof account?.note === "string" ? account.note : null,
-    reserved: account?.reserved === true,
-    state: VALID_STATES.has(account?.state) ? account.state : "held",
-    windows: account?.windows && typeof account.windows === "object"
-      ? account.windows : {},
-  })) : [];
+  const accounts = Array.isArray(view.accounts) ? view.accounts.map((account) => {
+    const rawPolicy = account?.policy && typeof account.policy === "object"
+      ? account.policy : null;
+    const policy = rawPolicy?.schema === "headroom_account_lifecycle@1" &&
+      HOME_KINDS.has(rawPolicy.home_kind) &&
+      REAUTH_STATES.has(rawPolicy.reauthentication) ? {
+        schema: "headroom_account_lifecycle@1",
+        home_kind: rawPolicy.home_kind,
+        home_retained_on_remove: rawPolicy.home_retained_on_remove === true,
+        rename_keeps_home: rawPolicy.rename_keeps_home === true,
+        reauthentication: rawPolicy.reauthentication,
+        position: Number.isInteger(rawPolicy.position) && rawPolicy.position >= 0
+          ? rawPolicy.position : 0,
+        count: Number.isInteger(rawPolicy.count) && rawPolicy.count >= 1
+          ? rawPolicy.count : 1,
+        can_move_up: rawPolicy.can_move_up === true,
+        can_move_down: rawPolicy.can_move_down === true,
+        can_remove: rawPolicy.can_remove === true,
+      } : null;
+    return {
+      name: typeof account?.name === "string" ? account.name : "unknown",
+      provider: account?.provider === "claude" || account?.provider === "codex"
+        ? account.provider : "unknown",
+      identity: typeof account?.identity === "string" ? account.identity : null,
+      plan: typeof account?.plan === "string" ? account.plan : "Unknown",
+      note: typeof account?.note === "string" ? account.note : null,
+      reserved: account?.reserved === true,
+      policy,
+      state: VALID_STATES.has(account?.state) ? account.state : "held",
+      windows: account?.windows && typeof account.windows === "object"
+        ? account.windows : {},
+    };
+  }) : [];
   const candidates = Array.isArray(view.candidates) ? view.candidates.filter((row) =>
     typeof row?.id === "string" && typeof row?.identity === "string" &&
     (row.provider === "claude" || row.provider === "codex")) : [];
@@ -163,7 +214,7 @@ function windowRow(label, value) {
   return row;
 }
 
-function accountCard(account) {
+function accountCard(account, lifecycle = null) {
   const article = document.createElement("article");
   article.className = `account state-${account.state}`;
   const header = document.createElement("header");
@@ -190,7 +241,151 @@ function accountCard(account) {
     note.textContent = account.note;
     article.append(note);
   }
+  if (lifecycle && account.policy) {
+    article.append(accountLifecyclePanel(account, lifecycle));
+  }
   return article;
+}
+
+function accountLifecyclePanel(account, { invoke, update, existingNames }) {
+  const details = document.createElement("details");
+  details.className = "account-lifecycle";
+  const summary = document.createElement("summary");
+  summary.textContent = "> manage account";
+  const ownership = document.createElement("p");
+  ownership.className = "ownership-note";
+  ownership.textContent = account.policy.home_kind === "headroom"
+    ? "Headroom-managed home · rename keeps its credential path · removal unregisters only"
+    : "Provider-managed adopted home · Headroom never changes or deletes its credentials";
+  const controls = document.createElement("div");
+  controls.className = "lifecycle-controls";
+  const diagnostic = document.createElement("p");
+  diagnostic.className = "diagnostic lifecycle-diagnostic";
+  diagnostic.setAttribute("aria-live", "polite");
+  const mutate = async (payload) => {
+    diagnostic.textContent = "Applying locked account change…";
+    try {
+      update(await invoke("desktop_account_action", {
+        name: account.name, ...payload,
+      }));
+    } catch {
+      diagnostic.textContent = "Account change was refused or rolled back safely";
+    }
+  };
+
+  controls.append(actionButton(
+    account.reserved ? "Unreserve" : "Reserve",
+    () => mutate({
+      action: account.reserved ? "unreserve" : "reserve",
+      reserved: !account.reserved,
+    }),
+  ));
+  const up = actionButton("Move up", () => mutate({ action: "move_up" }));
+  up.disabled = !account.policy.can_move_up;
+  const down = actionButton("Move down", () => mutate({ action: "move_down" }));
+  down.disabled = !account.policy.can_move_down;
+  controls.append(up, down);
+
+  const rename = document.createElement("form");
+  rename.className = "lifecycle-form";
+  const renameInput = document.createElement("input");
+  renameInput.value = account.name;
+  renameInput.setAttribute("aria-label", `New slot name for ${account.name}`);
+  const renameButton = document.createElement("button");
+  renameButton.type = "submit";
+  renameButton.textContent = "Rename";
+  const validateRename = () => {
+    const names = existingNames.filter((name) => name !== account.name);
+    const error = renameInput.value === account.name
+      ? "Choose a different slot name" : accountNameError(renameInput.value, names);
+    renameInput.setCustomValidity(error || "");
+    renameButton.disabled = Boolean(error);
+    diagnostic.textContent = error || "";
+    return !error;
+  };
+  renameInput.addEventListener("input", validateRename);
+  rename.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (validateRename()) {
+      await mutate({ action: "rename", newName: renameInput.value });
+    }
+  });
+  rename.append(renameInput, renameButton);
+  validateRename();
+
+  const reauthentication = document.createElement("div");
+  reauthentication.className = "reauthentication";
+  const reauthDiagnostic = document.createElement("p");
+  reauthDiagnostic.className = "diagnostic";
+  reauthDiagnostic.setAttribute("aria-live", "polite");
+  const device = document.createElement("div");
+  device.className = "device-instructions";
+  device.hidden = true;
+  if (account.policy.reauthentication === "available") {
+    const reauth = actionButton("Re-authenticate", async () => {
+      reauth.disabled = true;
+      cancel.hidden = false;
+      try {
+        let job = await invoke("desktop_start_reauthentication", {
+          name: account.name,
+        });
+        cancel.onclick = async () => {
+          cancel.disabled = true;
+          job = await invoke("desktop_cancel_login", { jobId: job.job_id });
+          reauthDiagnostic.textContent = loginMessage(job.progress_code);
+        };
+        job = await monitorLoginJob(job, invoke, reauthDiagnostic, device);
+        if (job.state === "succeeded" && job.view) update(job.view);
+      } catch {
+        reauthDiagnostic.textContent =
+          "Re-authentication failed safely; prior credentials were restored";
+      } finally {
+        reauth.disabled = false;
+        cancel.hidden = true;
+        cancel.disabled = false;
+      }
+    }, "primary");
+    const cancel = actionButton("Cancel", async () => {});
+    cancel.hidden = true;
+    reauthentication.append(reauth, cancel, device, reauthDiagnostic);
+  } else {
+    reauthDiagnostic.textContent = account.policy.reauthentication === "keychain_manual"
+      ? "Keychain-backed Claude login: re-authenticate in Claude, then refresh here"
+      : "Adopted home: re-authenticate in the provider that owns this login";
+    reauthentication.append(reauthDiagnostic);
+  }
+
+  const removal = document.createElement("form");
+  removal.className = "lifecycle-form removal-form";
+  const confirmation = document.createElement("input");
+  confirmation.placeholder = `type ${account.name} to confirm`;
+  confirmation.setAttribute("aria-label", `Type ${account.name} to confirm removal`);
+  const remove = document.createElement("button");
+  remove.type = "submit";
+  remove.textContent = "Remove";
+  remove.className = "danger";
+  const validateRemoval = () => {
+    remove.disabled = !account.policy.can_remove || confirmation.value !== account.name;
+  };
+  confirmation.addEventListener("input", validateRemoval);
+  removal.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    validateRemoval();
+    if (!remove.disabled) {
+      await mutate({ action: "remove", confirmation: confirmation.value });
+    }
+  });
+  removal.append(confirmation, remove);
+  validateRemoval();
+  const removalCopy = document.createElement("p");
+  removalCopy.className = "ownership-note";
+  removalCopy.textContent = account.policy.can_remove
+    ? "Removal keeps the provider home and credentials on disk."
+    : "The final connected account cannot be removed.";
+
+  details.append(summary, ownership, controls, rename, reauthentication,
+    removal, removalCopy, diagnostic);
+  return details;
 }
 
 function candidateCard(candidate, invoke, update, existingNames = []) {
@@ -285,20 +480,6 @@ function providerLoginCard(provider, invoke, update, existingNames = []) {
   name.addEventListener("input", validate);
   validate();
 
-  const showInstructions = (raw) => {
-    const instructions = normalizeDeviceInstructions(raw);
-    if (!instructions) { device.hidden = true; device.replaceChildren(); return; }
-    const code = document.createElement("code");
-    code.textContent = instructions.user_code;
-    const open = document.createElement("button");
-    open.type = "button";
-    open.textContent = "Open OpenAI";
-    open.onclick = () => invoke("desktop_open_device_url", {
-      url: instructions.verification_url,
-    });
-    device.replaceChildren(code, open);
-    device.hidden = false;
-  };
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!validate()) return;
@@ -318,14 +499,7 @@ function providerLoginCard(provider, invoke, update, existingNames = []) {
         job = await invoke("desktop_cancel_login", { jobId: job.job_id });
         diagnostic.textContent = loginMessage(job.progress_code);
       };
-      while (job.state === "running" || job.state === "cancelling") {
-        diagnostic.textContent = loginMessage(job.progress_code);
-        showInstructions(job.instructions);
-        await new Promise((resolve) => setTimeout(resolve, 350));
-        job = await invoke("desktop_login_status", { jobId: job.job_id });
-      }
-      diagnostic.textContent = loginMessage(job.result_code);
-      showInstructions(null);
+      job = await monitorLoginJob(job, invoke, diagnostic, device);
       if (job.state === "succeeded" && job.view) update(job.view);
     } catch {
       diagnostic.textContent = loginMessage("internal_error");
@@ -512,10 +686,14 @@ export function renderBootstrap(raw, invoke = null) {
     : view.mode === "onboarding" || view.mode === "demo" ? presentation.headline
       : Number.isFinite(average) ? `${Math.round(average)}% average five-hour headroom`
         : "No current five-hour reading";
-  document.getElementById("accounts").replaceChildren(...view.accounts.map(accountCard));
-  const actions = document.getElementById("actions");
   const update = (nextView) => renderBootstrap({ bridge: value.bridge, view: nextView }, invoke);
   const existingNames = view.accounts.map((row) => row.name);
+  const lifecycle = invoke && view.mode === "ready"
+    ? { invoke, update, existingNames } : null;
+  document.getElementById("accounts").replaceChildren(
+    ...view.accounts.map((account) => accountCard(account, lifecycle)),
+  );
+  const actions = document.getElementById("actions");
   let actionCards = [];
   if (invoke && view.mode === "onboarding") {
     actionCards = [onboardingPanel(view, invoke, update)];

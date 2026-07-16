@@ -855,6 +855,8 @@ fn validate_desktop_bootstrap(
                 "claude_login",
                 "codex_device_login",
                 "onboarding",
+                "account_lifecycle",
+                "reauthentication",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -1102,6 +1104,29 @@ async fn desktop_onboarding(
 }
 
 #[tauri::command]
+async fn desktop_account_action(
+    state: tauri::State<'_, DesktopEngine>,
+    action: String,
+    name: String,
+    new_name: Option<String>,
+    reserved: Option<bool>,
+    confirmation: Option<String>,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        state.inner().clone(),
+        "account_action",
+        serde_json::json!({
+            "action": action,
+            "name": name,
+            "new_name": new_name,
+            "reserved": reserved,
+            "confirmation": confirmation,
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
 async fn desktop_adopt(
     state: tauri::State<'_, DesktopEngine>,
     candidate_id: String,
@@ -1146,6 +1171,19 @@ async fn desktop_start_codex_login(
         state.inner().clone(),
         "start_codex_login",
         serde_json::json!({"name": name, "expected_email": expected_email}),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn desktop_start_reauthentication(
+    state: tauri::State<'_, DesktopEngine>,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    engine_command(
+        state.inner().clone(),
+        "start_reauthentication",
+        serde_json::json!({"name": name}),
     )
     .await
 }
@@ -1241,10 +1279,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             desktop_discover,
             desktop_onboarding,
+            desktop_account_action,
             desktop_adopt,
             desktop_refresh,
             desktop_start_claude_login,
             desktop_start_codex_login,
+            desktop_start_reauthentication,
             desktop_login_status,
             desktop_cancel_login,
             desktop_open_device_url
@@ -1439,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_bootstrap_requires_onboarding_capability() {
+    fn desktop_bootstrap_requires_onboarding_and_lifecycle_capabilities() {
         let view = serde_json::json!({
             "schema": DESKTOP_VIEW_SCHEMA,
             "accounts": [],
@@ -1451,6 +1491,8 @@ mod tests {
             "claude_login",
             "codex_device_login",
             "onboarding",
+            "account_lifecycle",
+            "reauthentication",
         ];
         let compatible = serde_json::json!({
             "product": "headroom",
@@ -1463,7 +1505,7 @@ mod tests {
             "product": "headroom",
             "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
             "runtime": "frozen",
-            "capabilities": capabilities[..5],
+            "capabilities": capabilities[..7],
         });
         assert!(validate_desktop_bootstrap(&incompatible, &view).is_err());
     }

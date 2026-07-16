@@ -267,6 +267,65 @@ class DesktopBridgeUnit(unittest.TestCase):
         offline = next(row for row in value["accounts"]
                        if row["name"] == "offline")
         self.assertEqual(offline["note"], "provider unavailable")
+        self.assertEqual(limited["policy"]["position"], 1)
+        self.assertTrue(limited["policy"]["home_retained_on_remove"])
+
+    def test_account_actions_reserve_reorder_rename_and_confirm_remove(self):
+        home_a = os.path.join(paths.homes_dir(), "a")
+        home_b = os.path.join(paths.homes_dir(), "b")
+        os.makedirs(home_a)
+        os.makedirs(home_b)
+        registry.save({"schema_version": 1, "accounts": [
+            {"name": "a", "provider": "claude", "home": home_a},
+            {"name": "b", "provider": "codex", "home": home_b},
+        ]})
+        with mock.patch.object(desktop_bridge.connect, "detect_existing",
+                               return_value=[]):
+            reserved = desktop_bridge.account_action_desktop("reserve", "a")
+            moved = desktop_bridge.account_action_desktop("move_up", "b")
+            renamed = desktop_bridge.account_action_desktop(
+                "rename", "a", new_name="primary")
+            with self.assertRaises(desktop_bridge.BridgeError) as unconfirmed:
+                desktop_bridge.account_action_desktop(
+                    "remove", "primary", confirmation="wrong")
+            removed = desktop_bridge.account_action_desktop(
+                "remove", "primary", confirmation="primary")
+        self.assertTrue(next(row for row in reserved["accounts"]
+                             if row["name"] == "a")["reserved"])
+        self.assertEqual([row["name"] for row in moved["accounts"]], ["b", "a"])
+        primary = next(row for row in renamed["accounts"]
+                       if row["name"] == "primary")
+        self.assertEqual(primary["policy"]["home_kind"], "headroom")
+        self.assertTrue(primary["policy"]["rename_keeps_home"])
+        self.assertEqual(unconfirmed.exception.code,
+                         "removal_confirmation_required")
+        self.assertEqual([row["name"] for row in removed["accounts"]], ["b"])
+        self.assertTrue(os.path.isdir(home_a))
+
+    def test_reauthentication_job_is_available_only_for_safe_owned_home(self):
+        manager = desktop_bridge.DesktopLoginManager()
+        home = os.path.join(paths.homes_dir(), "codex-main")
+        os.makedirs(home)
+        config = {"schema_version": 1, "accounts": [{
+            "name": "codex-main", "provider": "codex", "home": home,
+            "expected_email": "private@example.test",
+        }]}
+        registry.save(config)
+        finished = {"ok": True, "code": "reauthenticated",
+                    "entry": config["accounts"][0], "observation": {
+                        "email": "private@example.test", "plan": "plus",
+                        "windows": {"7d": {"used_percent": 20}},
+                    }}
+        with mock.patch.object(
+                desktop_bridge.connect, "desktop_connect_codex_device",
+                return_value=finished):
+            started = manager.start_reauthentication("codex-main")
+            manager._job["thread"].join(timeout=2)
+            value = manager.status(started["job_id"])
+        self.assertEqual(value["mode"], "reauthenticate")
+        self.assertEqual(value["state"], "succeeded")
+        self.assertEqual(value["result_code"], "reauthenticated")
+        self.assertNotIn("private@example.test", json.dumps(value))
 
     def test_desktop_boundary_always_redacts_identity(self):
         config = {"schema_version": 1,
@@ -284,6 +343,25 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(value["accounts"][0]["identity"],
                          "p***@example.com")
         self.assertNotIn("private@example.com", json.dumps(value))
+
+    def test_registry_order_overrides_stale_snapshot_order(self):
+        config = {"schema_version": 1, "accounts": [
+            {"name": "codex-first", "provider": "codex", "home": "/codex"},
+            {"name": "claude-second", "provider": "claude", "home": "/claude"},
+        ]}
+        snapshot = {"generated": 1_800_000_000, "accounts": [
+            {"name": "claude-second", "provider": "claude", "ok": True,
+             "captured_at": 1_800_000_000, "windows": {}},
+            {"name": "codex-first", "provider": "codex", "ok": True,
+             "captured_at": 1_800_000_000, "windows": {}},
+        ]}
+
+        value = desktop_bridge._view(config, snapshot, now=1_800_000_000)
+
+        self.assertEqual(
+            [row["name"] for row in value["accounts"]],
+            ["codex-first", "claude-second"],
+        )
 
     def test_adopt_preserves_settings_and_returns_redacted_live_view(self):
         existing = {
