@@ -1,3 +1,5 @@
 # Rust / Tauri build output
 src-tauri/target/
 src-tauri/gen/schemas/
+src-tauri/binaries/
+src-tauri/sidecar-build/

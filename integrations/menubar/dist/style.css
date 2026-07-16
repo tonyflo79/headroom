@@ -1,170 +1,88 @@
-/* Offline fallback for the headroom popover. The window itself is
-   transparent; this page draws its own dark-glass card so the failure state
-   still looks like the liquid-glass widget it stands in for. */
-
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  background: #090b10;
+  color: #f3f6ff;
 }
 
-html,
-body {
-  height: 100%;
-  background: transparent;
-}
+* { box-sizing: border-box; }
+html, body { min-height: 100%; margin: 0; }
 
 body {
-  display: flex;
-  align-items: stretch;
-  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
-    sans-serif;
-  color: rgba(235, 240, 255, 0.92);
-  -webkit-font-smoothing: antialiased;
-  user-select: none;
-  -webkit-user-select: none;
-  cursor: default;
+  background:
+    radial-gradient(circle at 15% 0%, rgba(95, 123, 255, 0.18), transparent 34rem),
+    radial-gradient(circle at 90% 85%, rgba(56, 206, 174, 0.1), transparent 28rem),
+    #090b10;
 }
 
-.card {
-  flex: 1;
-  margin: 10px;
-  padding: 28px 24px;
+.shell { width: min(960px, 100%); margin: 0 auto; padding: 44px 34px 28px; }
+.masthead, .section-heading, .account header, .window-row {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 14px;
-  text-align: center;
-  border-radius: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: linear-gradient(
-    160deg,
-    rgba(30, 33, 46, 0.96),
-    rgba(16, 18, 27, 0.96)
-  );
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  justify-content: space-between;
+  gap: 16px;
 }
 
-h1 {
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
-/* battery mark, echoing the tray glyph */
-.mark {
-  opacity: 0.9;
-}
-
-.battery {
-  position: relative;
-  display: inline-block;
-  width: 46px;
-  height: 24px;
-  border: 3px solid rgba(235, 240, 255, 0.85);
-  border-radius: 7px;
-}
-
-.battery::after {
-  content: "";
-  position: absolute;
-  top: 4px;
-  right: -9px;
-  width: 5px;
-  height: 10px;
-  border-radius: 2px;
-  background: rgba(235, 240, 255, 0.85);
-}
-
-.battery-fill {
-  position: absolute;
-  inset: 3px auto 3px 3px;
-  width: 42%;
-  border-radius: 3px;
-  background: rgba(235, 240, 255, 0.85);
-}
-
-.card[data-state="probing"] .battery-fill {
-  animation: pulse 1.6s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 0.35;
-  }
-  50% {
-    opacity: 0.95;
-  }
-}
-
-/* state switching */
-.status {
-  display: none;
-}
-
-.card[data-state="probing"] .status-probing,
-.card[data-state="down"] .status-down {
-  display: block;
-}
-
-.status-probing {
-  color: rgba(235, 240, 255, 0.65);
-}
-
-.status-down .headline {
-  font-weight: 600;
-  color: rgba(255, 190, 130, 0.95);
-}
-
-.status-down .detail {
-  margin-top: 6px;
-  color: rgba(235, 240, 255, 0.6);
-  overflow-wrap: anywhere;
-}
-
-code {
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+.eyebrow {
+  margin: 0 0 7px;
+  color: #8f9bb9;
   font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
-.hint {
-  margin: 14px auto 0;
-  padding: 8px 12px;
-  max-width: 100%;
-  overflow-x: auto;
-  text-align: left;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 11px;
-  color: rgba(180, 225, 255, 0.8);
-  background: rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 8px;
+h1 { margin: 0; font-size: clamp(32px, 5vw, 52px); letter-spacing: -0.04em; }
+.summary { margin: 8px 0 0; color: #aeb8cf; }
+
+.badge, .state {
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #c8d2ea;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
 }
 
-button {
-  margin-top: 16px;
-  padding: 7px 22px;
-  font: inherit;
-  font-weight: 600;
-  color: rgba(235, 240, 255, 0.95);
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 9px;
-  cursor: pointer;
+.fleet { margin-top: 54px; }
+.section-heading { align-items: end; }
+.section-heading h2 { margin: 0; font-size: 20px; }
+.section-heading p { margin: 0; color: #9ca8c2; }
+
+.accounts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  margin-top: 18px;
 }
 
-button:hover {
-  background: rgba(255, 255, 255, 0.16);
+.account {
+  padding: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 18px;
+  background: linear-gradient(155deg, rgba(28, 32, 45, 0.94), rgba(16, 19, 28, 0.96));
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.24);
 }
 
-button:active {
-  background: rgba(255, 255, 255, 0.22);
+.account h3 { margin: 0; font-size: 17px; }
+.account header p { margin: 3px 0 0; color: #8996b3; text-transform: capitalize; }
+.state-current .state { color: #9cf3ce; border-color: rgba(83, 221, 169, 0.3); }
+.state-limited .state { color: #ffb5ad; border-color: rgba(255, 112, 98, 0.34); }
+.windows { display: grid; gap: 9px; margin-top: 20px; }
+.window-row { border-top: 1px solid rgba(255, 255, 255, 0.07); padding-top: 9px; }
+.window-row span { color: #8f9bb9; }
+.window-row strong { font-size: 13px; }
+
+footer { margin-top: 28px; color: #6f7b96; font-size: 12px; text-align: center; }
+
+@media (max-width: 600px) {
+  .shell { padding: 28px 20px 22px; }
+  .masthead, .section-heading { align-items: flex-start; flex-direction: column; }
+  .fleet { margin-top: 38px; }
 }
 
-.auto {
-  margin-top: 10px;
-  font-size: 11px;
-  color: rgba(235, 240, 255, 0.4);
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }

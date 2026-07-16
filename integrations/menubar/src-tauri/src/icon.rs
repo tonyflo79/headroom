@@ -45,7 +45,13 @@ pub fn tray_icon_rgba(level: Option<f32>) -> (Vec<u8>, u32, u32) {
 
     // Stud on top: the piece that makes it a minifig head.
     let stud = rounded_rect(16.0, 3.0, 12.0, 8.0, 2.5);
-    pixmap.fill_path(&stud, &paint, FillRule::Winding, Transform::identity(), None);
+    pixmap.fill_path(
+        &stud,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 
     // Head outline: outer silhouette minus an inner hole (even-odd), so the
     // head is a 3px-walled tank.
@@ -55,7 +61,13 @@ pub fn tray_icon_rgba(level: Option<f32>) -> (Vec<u8>, u32, u32) {
     ring.push_path(&outer);
     ring.push_path(&inner);
     let ring = ring.finish().expect("head ring path");
-    pixmap.fill_path(&ring, &paint, FillRule::EvenOdd, Transform::identity(), None);
+    pixmap.fill_path(
+        &ring,
+        &paint,
+        FillRule::EvenOdd,
+        Transform::identity(),
+        None,
+    );
 
     // The tank interior the level fills (inset from the wall for a gap).
     let tank = rounded_rect(12.0, 14.0, 20.0, 22.0, 5.0);
@@ -67,8 +79,7 @@ pub fn tray_icon_rgba(level: Option<f32>) -> (Vec<u8>, u32, u32) {
                 let mut mask = Mask::new(SIZE, SIZE).expect("tank mask");
                 mask.fill_path(&tank, FillRule::Winding, true, Transform::identity());
                 let height = 22.0 * level;
-                if let Some(fill) = Rect::from_xywh(12.0, 14.0 + (22.0 - height), 20.0, height)
-                {
+                if let Some(fill) = Rect::from_xywh(12.0, 14.0 + (22.0 - height), 20.0, height) {
                     pixmap.fill_rect(fill, &paint, Transform::identity(), Some(&mask));
                 }
             }
@@ -76,7 +87,13 @@ pub fn tray_icon_rgba(level: Option<f32>) -> (Vec<u8>, u32, u32) {
         None => {
             // No current reading: a dash across the middle of the tank.
             let dash = rounded_rect(15.0, 23.5, 14.0, 3.0, 1.5);
-            pixmap.fill_path(&dash, &paint, FillRule::Winding, Transform::identity(), None);
+            pixmap.fill_path(
+                &dash,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
     }
 

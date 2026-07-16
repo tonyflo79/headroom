@@ -17,15 +17,18 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": [
+      "binaries/headroom-engine"
+    ],
     "category": "DeveloperTool",
-    "shortDescription": "headroom menu-bar popover",
+    "shortDescription": "Self-contained desktop dashboard for AI account headroom",
     "icon": [
       "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "10.15"
+      "minimumSystemVersion": "13.0"
     }
   }
 }
