@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# CI discovery stub. Tests mock all provider behavior; they only require that
+# a Claude executable can be resolved before exercising those mocked paths.
+exit 1

@@ -13,26 +13,28 @@ jobs:
     name: Python engine (3.13 / Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8
         with:
-          python-version: "3.13"
-          enable-cache: true
+          version: "0.11.29"
+          python-version: "3.13.12"
       - name: Compile Python sources
-        run: uv run --python 3.13 python -m compileall -q headroom
+        run: uv run --python 3.13.12 python -m compileall -q headroom
       - name: Run the complete engine suite
-        run: uv run --python 3.13 python -m unittest discover -s tests
+        run: >-
+          env PATH="$PWD/tests/fixtures/bin:$PATH"
+          uv run --python 3.13.12 python -m unittest discover -s tests
 
   desktop:
     name: Unsigned desktop tracer (macOS)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8
         with:
-          python-version: "3.13"
-          enable-cache: true
-      - uses: actions/setup-node@v4
+          version: "0.11.29"
+          python-version: "3.13.12"
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -41,7 +43,7 @@ jobs:
       - name: Build and smoke-test the frozen sidecar
         run: scripts/build-desktop-sidecar.sh
       - name: Test the private bridge
-        run: uv run --python 3.13 python -m unittest tests.test_desktop_bridge
+        run: uv run --python 3.13.12 python -m unittest tests.test_desktop_bridge
       - name: Test the frontend state boundary
         run: npm --prefix integrations/menubar test
       - name: Check Rust formatting
@@ -68,9 +70,9 @@ jobs:
     name: Secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

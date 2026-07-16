@@ -9,7 +9,7 @@ NAME="headroom-engine-$TARGET"
 
 mkdir -p "$BIN_DIR" "$BUILD_DIR/work" "$BUILD_DIR/spec"
 
-uvx --from pyinstaller==6.21.0 pyinstaller \
+uvx --python 3.13.12 --from pyinstaller==6.21.0 pyinstaller \
   --noconfirm --clean --onefile \
   --name "$NAME" \
   --distpath "$BIN_DIR" \
