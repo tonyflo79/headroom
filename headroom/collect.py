@@ -28,10 +28,13 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -46,13 +49,17 @@ CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
 # which enforces the same bound at routing time (collect must not import
 # route: route imports collect)
 OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
+COLLECT_MAX_WORKERS = max(1, min(8, paths.env_int(
+    "HEADROOM_COLLECT_MAX_WORKERS", 4)))
+COLLECT_DEADLINE = max(5, min(120, paths.env_int(
+    "HEADROOM_COLLECT_DEADLINE", 60)))
 SCHEMA_VERSION = 1
 
 PUBLIC_FIELDS = {
     "name", "email", "provider", "plan", "ok", "note", "error_code", "retry_at",
     "captured_at", "source", "stale", "windows", "identity_verified",
     "identity_method", "trust_state", "routable", "subscription",
-    "throttle_carryover",
+    "throttle_carryover", "transient_carryover",
 }
 
 
@@ -1057,7 +1064,85 @@ def _throttle_carryover(previous, account, now, fresh_identity):
     return json.loads(json.dumps(row))
 
 
-def collect(accounts, backoff=None, persist_backoff=None, previous=None):
+def _stable_collection_failure(error):
+    """Return a public-safe code and whether a prior verified row may carry.
+
+    Provider text remains private. Only transport/server failures may retain an
+    identity-matched observation; malformed readings and unknown failures hold
+    without reusing capacity.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code == 429:
+            return "provider_rate_limited", True
+        if error.code in (401, 403):
+            return "provider_auth_rejected", False
+        if 500 <= error.code <= 599:
+            return "provider_server_error", True
+        return "provider_http_error", False
+    if isinstance(error, (TimeoutError, socket.timeout,
+                          subprocess.TimeoutExpired)):
+        return "provider_timeout", True
+    if isinstance(error, urllib.error.URLError):
+        return "provider_offline", True
+    if isinstance(error, (json.JSONDecodeError, ValueError)):
+        return "malformed_provider_response", False
+    if isinstance(error, OSError):
+        return "provider_unavailable", True
+    return "collector_failed", False
+
+
+def _transient_carryover(previous, account, now, fresh_identity, code):
+    carried = _throttle_carryover(previous, account, now, fresh_identity)
+    if carried is None:
+        return None
+    carried["stale"] = True
+    carried["routable"] = False
+    carried["transient_carryover"] = True
+    carried["error_code"] = code
+    carried["note"] = (
+        "provider temporarily unavailable; showing the last verified reading "
+        "as aged until collection recovers")
+    return carried
+
+
+def _codex_current_binding(account):
+    """Best-effort local binding used only for transient carryover checks."""
+    try:
+        identity = codex_identity(account["home"])
+        identity["credential_digest"] = credential_digest(
+            "codex", account["home"])
+        identity["lineage_digest"] = codex_lineage_digest(account["home"])
+        expected = account.get("expected_email")
+        if expected and identity.get("email") \
+                and identity["email"].lower() != expected.lower():
+            return None
+        return identity
+    except Exception:  # local binding failure simply forbids carryover
+        return None
+
+
+def _collection_failure_note(code):
+    return {
+        "provider_rate_limited": (
+            "provider rate-limited collection; account held until the "
+            "bounded retry window"),
+        "provider_auth_rejected": (
+            "provider rejected authentication; reconnect this account"),
+        "provider_server_error": (
+            "provider service failed temporarily; account held until retry"),
+        "provider_timeout": (
+            "provider collection timed out; account held until retry"),
+        "provider_offline": (
+            "network unavailable; account held until connectivity recovers"),
+        "malformed_provider_response": (
+            "provider returned an invalid reading; account held"),
+        "provider_unavailable": (
+            "provider is unavailable; account held until retry"),
+    }.get(code, "collector failed safely; account held")
+
+
+def _collect_accounts_sequential(accounts, backoff=None,
+                                 persist_backoff=None, previous=None):
     now = int(time.time())
     backoff = empty_backoff() if backoff is None else backoff
     claude_backoff_until = active_backoff(backoff, "anthropic_usage_api", now)
@@ -1105,11 +1190,20 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 if codex_retry_at:
                     # transient app-server overload holds the seat; it never
                     # becomes "available", and we don't hammer the server
-                    result["ok"] = False
-                    result["error_code"] = "codex_provider_backoff"
-                    result["retry_at"] = codex_retry_at
-                    result["note"] = ("codex app-server in provider backoff; "
-                                      "seat held until the retry window")
+                    local_identity = _codex_current_binding(account)
+                    carried = _transient_carryover(
+                        previous, account, now, local_identity,
+                        "codex_provider_backoff")
+                    if carried is not None:
+                        result = carried
+                        result["retry_at"] = codex_retry_at
+                    else:
+                        result["ok"] = False
+                        result["error_code"] = "codex_provider_backoff"
+                        result["retry_at"] = codex_retry_at
+                        result["note"] = (
+                            "codex app-server in provider backoff; seat held "
+                            "until the retry window")
                     snapshot["accounts"].append(result)
                     continue
                 try:
@@ -1140,12 +1234,19 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                         retry_at = now + 300
                         if persist_backoff is not None:
                             persist_backoff(retry_at, "codex_app_server")
-                        result["ok"] = False
-                        result["error_code"] = code
-                        result["retry_at"] = retry_at
-                        result["note"] = (
-                            "codex app-server overloaded/throttled; seat "
-                            "held (transient — not a capacity signal)")
+                        local_identity = _codex_current_binding(account)
+                        carried = _transient_carryover(
+                            previous, account, now, local_identity, code)
+                        if carried is not None:
+                            result = carried
+                            result["retry_at"] = retry_at
+                        else:
+                            result["ok"] = False
+                            result["error_code"] = code
+                            result["retry_at"] = retry_at
+                            result["note"] = (
+                                "codex app-server overloaded/throttled; seat "
+                                "held (transient — not a capacity signal)")
                         snapshot["accounts"].append(result)
                         continue
                     if code not in CODEX_DASHBOARD_FALLBACK_CODES:
@@ -1195,6 +1296,7 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 # (age-bounded everywhere) instead of holding the slot
                 result = carried
                 result["throttle_carryover"] = True
+                result["error_code"] = "usage_source_rate_limited"
                 result["retry_at"] = error.retry_at
                 result["note"] = ("usage source rate-limited; serving the "
                                   "last verified reading until the provider "
@@ -1238,11 +1340,23 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                                   "account held — run `headroom connect` "
                                   "to re-login")
         except Exception as error:  # noqa: BLE001 — every account must report
-            result["ok"] = False
+            code, may_carry = _stable_collection_failure(error)
+            fresh_identity = result.get("identity")
+            if may_carry and fresh_identity is None \
+                    and account.get("provider") == "codex":
+                fresh_identity = _codex_current_binding(account)
+            carried = (_transient_carryover(
+                previous, account, now, fresh_identity, code)
+                if may_carry else None)
+            if carried is not None:
+                result = carried
+            else:
+                result["ok"] = False
+                result["error_code"] = code
+                result["note"] = _collection_failure_note(code)
             # `error` is PRIVATE-only (may contain local paths / usernames).
             # `note` is published, so it must stay generic.
             result["error"] = type(error).__name__ + ": " + str(error)[:120]
-            result["note"] = "collector error; see private snapshot for detail"
         snapshot["accounts"].append(result)
     snapshot["integrity_warnings"] = apply_integrity(snapshot["accounts"])
     completed = int(time.time())
@@ -1251,6 +1365,88 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
         completed, timezone.utc
     ).isoformat().replace("+00:00", "Z")
     return snapshot
+
+
+def collect(accounts, backoff=None, persist_backoff=None, previous=None,
+            *, deadline=None, max_workers=None):
+    """Collect accounts concurrently while preserving registry order.
+
+    Workers are daemon threads because provider libraries own their internal
+    timeout/cancellation behavior. The bounded join publishes responsive
+    accounts even if one provider violates that contract; unfinished accounts
+    are held with a stable timeout code and can never publish late into the
+    returned snapshot.
+    """
+    accounts = list(accounts)
+    run_started = int(time.time())
+    if len(accounts) <= 1:
+        return _collect_accounts_sequential(
+            accounts, backoff, persist_backoff, previous)
+    deadline = COLLECT_DEADLINE if deadline is None else max(0.01, float(deadline))
+    workers = COLLECT_MAX_WORKERS if max_workers is None else int(max_workers)
+    workers = max(1, min(len(accounts), 8, workers))
+    tasks = queue.Queue()
+    completed = queue.Queue()
+    cancelled = threading.Event()
+    for index, account in enumerate(accounts):
+        tasks.put((index, account))
+
+    def worker():
+        while not cancelled.is_set():
+            try:
+                index, account = tasks.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                snapshot = _collect_accounts_sequential(
+                    [account], backoff, persist_backoff, previous)
+                row = snapshot["accounts"][0]
+            except Exception as error:  # defensive: one worker never wins
+                code, _ = _stable_collection_failure(error)
+                row = {
+                    "name": account["name"], "provider": account["provider"],
+                    "ok": False, "error_code": code,
+                    "note": _collection_failure_note(code),
+                }
+            completed.put((index, row))
+
+    for index in range(workers):
+        threading.Thread(
+            target=worker, name=f"headroom-collect-{index}", daemon=True
+        ).start()
+
+    finish_at = time.monotonic() + deadline
+    rows = {}
+    while len(rows) < len(accounts):
+        remaining = finish_at - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            index, row = completed.get(timeout=remaining)
+        except queue.Empty:
+            break
+        rows[index] = row
+    cancelled.set()
+    for index, account in enumerate(accounts):
+        if index not in rows:
+            rows[index] = {
+                "name": account["name"], "provider": account["provider"],
+                "ok": False, "error_code": "provider_timeout",
+                "note": _collection_failure_note("provider_timeout"),
+            }
+    ordered = [rows[index] for index in range(len(accounts))]
+    warnings = apply_integrity(ordered)
+    now = int(time.time())
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": uuid.uuid4().hex,
+        "run_started": run_started,
+        "generated": now,
+        "generated_iso": datetime.fromtimestamp(
+            now, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "integrity_warnings": warnings,
+        "accounts": ordered,
+    }
 
 
 def redact_email(address):
@@ -1267,8 +1463,13 @@ def public_snapshot(snapshot, redact_emails=False):
     for account in snapshot["accounts"]:
         public = {k: v for k, v in account.items() if k in PUBLIC_FIELDS}
         if account.get("error"):
-            # never publish raw exception text, whatever `note` already holds
-            public["note"] = "collector error; see private snapshot"
+            # Rebuild the note from the allowlisted code; raw exception text
+            # and an accidentally unsafe private note can never cross.
+            public["note"] = (
+                "provider temporarily unavailable; showing the last verified "
+                "reading as aged until collection recovers"
+                if account.get("transient_carryover") else
+                _collection_failure_note(account.get("error_code")))
         if redact_emails:
             public["email"] = redact_email(public.get("email"))
         accounts.append(public)
@@ -1316,13 +1517,15 @@ def run_collect(quiet=False):
         # race a stale registry into a freshly written snapshot.
         config = registry.load()
         backoff = paths.load_json(paths.backoff_path()) or empty_backoff()
+        backoff_lock = threading.Lock()
 
         def persist(retry_at, provider="anthropic_usage_api"):
-            backoff.setdefault("providers", {})[provider] = {
-                "retry_at": int(retry_at),
-                "observed_at": min(int(time.time()), int(retry_at) - 1),
-            }
-            paths.write_json_atomic(paths.backoff_path(), backoff)
+            with backoff_lock:
+                backoff.setdefault("providers", {})[provider] = {
+                    "retry_at": int(retry_at),
+                    "observed_at": min(int(time.time()), int(retry_at) - 1),
+                }
+                paths.write_json_atomic(paths.backoff_path(), backoff)
 
         previous = paths.load_json(paths.private_snapshot_path())
         snapshot = collect(registry.accounts(config), backoff, persist,
@@ -1334,13 +1537,15 @@ def run_collect(quiet=False):
         registry.apply_pins(pins)
         # carryover rows count as throttled for the backoff ledger: only a
         # run with NO throttle evidence at all may clear the provider backoff
-        if any(a.get("provider") == "claude" and a.get("ok")
-               for a in snapshot["accounts"]) \
-                and not any(a.get("error_code") == "usage_source_rate_limited"
-                            or a.get("throttle_carryover")
-                            for a in snapshot["accounts"]):
-            (backoff.get("providers") or {}).pop("anthropic_usage_api", None)
-            paths.write_json_atomic(paths.backoff_path(), backoff)
+        claude_rows = [a for a in snapshot["accounts"]
+                       if a.get("provider") == "claude"]
+        if claude_rows and all(
+                a.get("ok") and not a.get("throttle_carryover")
+                and not a.get("transient_carryover") for a in claude_rows):
+            with backoff_lock:
+                (backoff.get("providers") or {}).pop(
+                    "anthropic_usage_api", None)
+                paths.write_json_atomic(paths.backoff_path(), backoff)
         paths.write_json_atomic(paths.private_snapshot_path(), snapshot)
         # reload settings fresh (not the config loaded at collect start) so a
         # redaction change made mid-collect governs the published projection,

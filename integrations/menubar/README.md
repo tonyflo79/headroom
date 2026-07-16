@@ -44,6 +44,15 @@ Settings, and Quit actions. Closing the dashboard keeps the tray and bundled
 engine running; Quit ends both. A private, schema-validated window record
 restores the dashboard only when its size and position remain safely visible.
 
+One Rust-owned, single-flight schedule now serves stale activation, manual,
+wake, and bounded background refreshes. Provider accounts collect concurrently
+in registry order, so a slow or hung provider cannot suppress a responsive
+one. Transient failures use stable diagnostics and capped exponential backoff
+with jitter; only an age-bounded, identity-matched verified reading may remain
+visible, explicitly stale and never routable. The app restarts a failed frozen
+engine under a separate bounded policy and enters a visible degraded state
+after repeated failures instead of looping indefinitely.
+
 This is still an implementation build, not a production release. Complete
 account management, signing, notarization, updates, and release
 distribution are delivered by the follow-on desktop issues linked from
@@ -70,6 +79,9 @@ Headroom.app
 - The bridge exposes only narrow onboarding, account, refresh, and login-job
   commands. Calls are serialized, bounded, and a timed-out or malformed session
   is retired so a late frame cannot be mistaken for a later response.
+- Bootstrap requires the `resilient_collection` capability. Rust owns one
+  refresh flight, a five-minute healthy interval, capped jittered retry, wake
+  recovery, and the bounded sidecar-restart/degraded policy.
 - Only `headroom_desktop_view@1`, derived from the existing fail-closed widget
   projection, crosses the bridge. Identity is always email-redacted; credential
   paths, fingerprints, raw credentials, and provider payloads never cross it.
@@ -127,6 +139,7 @@ From the repository root:
 
 ```sh
 uv run --python 3.13.12 python -m unittest tests.test_desktop_bridge
+uv run --python 3.13.12 python -m unittest tests.test_resilient_collection
 uv run --python 3.13.12 python -m unittest tests.test_desktop_login
 uv run --python 3.13.12 python -m unittest tests.test_codex_desktop_login
 uv run --python 3.13.12 python -m unittest tests.test_account_lifecycle
@@ -149,6 +162,9 @@ system `python` process. Quitting Headroom must remove both processes.
 For the dashboard/popover acceptance record, including synchronized refresh,
 large-fleet scrolling, close-to-tray, theme propagation, and window restore,
 see `docs/desktop/SURFACE-SYNC-VALIDATION.md`.
+
+For offline, throttled, slow-provider, wake, and frozen-engine recovery
+acceptance, see `docs/desktop/COLLECTION-RESILIENCE-VALIDATION.md`.
 
 ## Current limitations
 
