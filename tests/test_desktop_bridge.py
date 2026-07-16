@@ -761,6 +761,109 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(value["launch"]["action"],
                          "reauthenticate_account")
 
+    def test_desktop_and_cli_route_the_same_snapshot_for_claude_and_codex(self):
+        now = int(time.time())
+        accounts = [
+            {"name": "claude-first", "provider": "claude",
+             "home": "/homes/claude-first"},
+            {"name": "claude-roomy", "provider": "claude",
+             "home": "/homes/claude-roomy"},
+            {"name": "claude-reserved", "provider": "claude",
+             "home": "/homes/claude-reserved", "reserved": True},
+            {"name": "codex-first", "provider": "codex",
+             "home": "/homes/codex-first"},
+            {"name": "codex-roomy", "provider": "codex",
+             "home": "/homes/codex-roomy"},
+            {"name": "codex-capped", "provider": "codex",
+             "home": "/homes/codex-capped"},
+        ]
+        registry.save({"schema_version": 1, "accounts": accounts})
+
+        def usage_row(name, provider, used_7d, *, used_5h=None):
+            identity = {
+                "account_fingerprint": "fixture-fingerprint",
+                "credential_digest": "fixture-credential",
+            }
+            windows = {
+                "7d": {"used_percent": used_7d,
+                       "resets_at": now + 7 * 86400,
+                       "window_minutes": 10080},
+            }
+            if used_5h is not None:
+                windows["5h"] = {
+                    "used_percent": used_5h,
+                    "resets_at": now + 3600,
+                    "window_minutes": 300,
+                }
+            row = {
+                "name": name, "provider": provider, "ok": True,
+                "routable": True, "trust_state": "verified",
+                "stale": False, "captured_at": now,
+                "identity": identity, "windows": windows,
+            }
+            if provider == "codex":
+                row["source"] = "codex_app_server"
+                identity.update({
+                    "verified": True, "auth_mode": "chatgpt",
+                    "lineage_digest": "fixture-lineage",
+                })
+            return row
+
+        snapshot = {"generated": now, "accounts": [
+            usage_row("claude-first", "claude", 60, used_5h=40),
+            usage_row("claude-roomy", "claude", 5, used_5h=5),
+            usage_row("claude-reserved", "claude", 1, used_5h=1),
+            # Codex's provider-omitted 5h window remains intentionally absent.
+            usage_row("codex-first", "codex", 70),
+            usage_row("codex-roomy", "codex", 20),
+            usage_row("codex-capped", "codex", 100),
+        ]}
+        selections = {}
+        candidate_codes = {}
+        with mock.patch.object(desktop_bridge.route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(desktop_bridge.collector, "local_binding",
+                                  return_value=("fixture-fingerprint",
+                                                "fixture-credential")), \
+                mock.patch.object(
+                    desktop_bridge.collector, "codex_lineage_digest",
+                    return_value="fixture-lineage"), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value="/bin/echo"):
+            for family in ("claude", "opus", "sonnet", "haiku", "codex"):
+                with self.subTest(family=family):
+                    cli_ranked = desktop_bridge.route.candidates(
+                        family, snapshot)
+                    cli_selected = desktop_bridge.route.pick(family)
+                    preview = desktop_bridge.routing_preview_desktop(family)
+
+                    self.assertIsNotNone(cli_selected)
+                    selections[family] = cli_selected["name"]
+                    candidate_codes[family] = {
+                        row["name"]: row["code"]
+                        for row in preview["candidates"]
+                    }
+                    self.assertEqual(
+                        preview["selected"]["name"], cli_selected["name"])
+                    self.assertEqual(
+                        [row["name"] for row in preview["candidates"]],
+                        [account["name"] for account, _ in cli_ranked])
+                    self.assertEqual(
+                        [row["eligible"] for row in preview["candidates"]],
+                        [reason is None for _, reason in cli_ranked])
+
+        # Claude preserves registry preference; Codex chooses greatest proven
+        # weekly headroom even when its provider omits the lifted 5h window.
+        self.assertEqual("claude-first", selections["claude"])
+        self.assertEqual("claude-first", selections["opus"])
+        self.assertEqual("claude-first", selections["sonnet"])
+        self.assertEqual("claude-first", selections["haiku"])
+        self.assertEqual("codex-roomy", selections["codex"])
+        self.assertEqual("reserved",
+                         candidate_codes["claude"]["claude-reserved"])
+        self.assertEqual("capacity_unavailable",
+                         candidate_codes["codex"]["codex-capped"])
+
     def test_launch_intent_is_engine_generated_quoted_and_allowlisted(self):
         binary = os.path.join(self.temp.name, "provider cli")
         with open(binary, "w", encoding="utf-8") as handle:
