@@ -895,6 +895,75 @@ class SlotLease(TempDirCase):
         self.assertEqual(selected, account_b["home"])
         self.assertEqual(route.held_lease_names(), ["acct-b"])
 
+    def test_desktop_selected_exec_launches_only_the_named_account(self):
+        account_a, account_b = self.account("acct-a"), self.account("acct-b")
+        snapshot = {"generated": time.time(), "accounts": []}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=[account_a, account_b]), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "acquire_slot_lease",
+                                  return_value=True) as acquire, \
+                mock.patch.object(route, "pick") as pick, \
+                mock.patch.object(route, "write_launch_marker",
+                                  return_value=True), \
+                mock.patch.object(route.notify, "emit"), \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()):
+            code = route.cmd_exec_selected(
+                "sonnet", "acct-b", ["/fixture/claude"],
+                launch_note="desktop launch intent")
+        self.assertEqual(code, 0)
+        pick.assert_not_called()
+        acquire.assert_called_once_with(account_b, "sonnet")
+        execute.assert_called_once_with("/fixture/claude", ["/fixture/claude"])
+        self.assertEqual(os.environ.get("CLAUDE_CONFIG_DIR"), account_b["home"])
+
+    def test_desktop_selected_exec_refuses_if_account_becomes_blocked(self):
+        account_a, account_b = self.account("acct-a"), self.account("acct-b")
+        snapshot = {"generated": time.time(), "accounts": []}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=[account_a, account_b]), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason",
+                                  return_value="cooldown until later"), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "acquire_slot_lease") as acquire, \
+                mock.patch.object(route, "pick") as pick, \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = route.cmd_exec_selected(
+                "sonnet", "acct-a", ["/fixture/claude"])
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to switch slots", errors.getvalue())
+        pick.assert_not_called()
+        acquire.assert_not_called()
+        execute.assert_not_called()
+
+    def test_desktop_selected_exec_never_repicks_after_lost_lease_race(self):
+        account_a = self.account("acct-a")
+        snapshot = {"generated": time.time(), "accounts": []}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=[account_a]), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "acquire_slot_lease",
+                                  return_value=False), \
+                mock.patch.object(route, "pick") as pick, \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = route.cmd_exec_selected(
+                "sonnet", "acct-a", ["/fixture/claude"])
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to switch slots", errors.getvalue())
+        pick.assert_not_called()
+        execute.assert_not_called()
+
     def test_cmd_exec_fails_closed_on_lease_infrastructure_error(self):
         # P1-9: LeaseError -> refuse (exit 2), never launch unleased
         account = self.account()

@@ -77,6 +77,16 @@ every bridge command feed one rolling five-minute crash policy with capped ±20
 percent jitter. Three crashes enter `DEGRADED`; Retry engine permits one
 explicit attempt, and only five stable minutes clear the rolling history.
 
+The dashboard includes an engine-authoritative routing console. It shows the
+selected provider account and a stable explanation for every skipped account,
+using the same reservation, freshness, identity, capacity, cooldown,
+quarantine, and live-lease gates as the CLI router. Copy command and Open in
+Terminal are available only for that selected verified account. Both actions
+ask the engine to prove the decision again; the eventual frozen launcher
+re-proves it a final time, acquires the account lease, and refuses instead of
+silently switching slots if anything changed. The terminal-style black,
+phosphor-green, and glowing-bar treatment remains the default Midnight theme.
+
 This is still an implementation build, not a production release. Complete
 account management, signing, notarization, updates, and release
 distribution are delivered by the follow-on desktop issues linked from
@@ -107,10 +117,10 @@ Headroom.app
 - Rust owns the current sanitized view, a monotonic revision, and the live
   theme. Both webviews receive the same immutable snapshot envelope; stale or
   duplicate revisions and stale command responses are ignored.
-- The bridge exposes only narrow onboarding, account, refresh, login-job, and
-  validated-settings commands. Calls are serialized, bounded, and a timed-out
-  or malformed session is retired so a late frame cannot be mistaken for a
-  later response.
+- The bridge exposes only narrow onboarding, account, refresh, login-job,
+  validated-settings, routing-preview, and app-owned launch-intent commands.
+  Calls are serialized, bounded, and a timed-out or malformed session is
+  retired so a late frame cannot be mistaken for a later response.
 - Bootstrap requires the `resilient_collection` capability. Rust owns one
   refresh flight, a five-minute healthy interval, capped jittered retry, wake
   recovery, and the bounded sidecar-restart/degraded policy.
@@ -122,6 +132,11 @@ Headroom.app
   has no shell capability, arbitrary sidecar access, or filesystem capability.
   Its sole external-open command accepts only the exact
   `https://auth.openai.com/codex/device` URL.
+- The routing webview may send only a known model family and selected account
+  name. It cannot send a command, executable, environment variable, terminal,
+  or path. Rust accepts only the frozen engine's exact launcher schema and one
+  of Terminal, iTerm, or Warp; copied commands are recomputed from the same
+  validated intent.
 - The app opens no HTTP listener.
 
 ## Supported development target
@@ -205,6 +220,10 @@ force-quit recovery, and orphan cleanup acceptance, see
 For validated preferences, live theme propagation, window state, shortcuts,
 locale formatting, and reversible launch-at-login acceptance, see
 `docs/desktop/SETTINGS-VALIDATION.md`.
+
+For engine/CLI routing parity, safely quoted copy output, allowlisted terminal
+launch, final selection re-proof, and lease-race acceptance, see
+`docs/desktop/ROUTING-VALIDATION.md`.
 
 ## Current limitations
 

@@ -137,6 +137,43 @@
         </form>
       </section>
 
+      <section id="routing" class="routing-panel" aria-labelledby="routing-title">
+        <div class="routing-heading">
+          <div>
+            <p class="eyebrow">HEADROOM // ROUTING</p>
+            <h2 id="routing-title">$ headroom route --explain</h2>
+            <p>The bundled engine selects the account and explains every skip using the CLI’s final safety gates.</p>
+          </div>
+          <div class="routing-controls">
+            <label for="routing-family">Model family</label>
+            <select id="routing-family">
+              <option value="claude">Claude // generic</option>
+              <option value="opus">Claude Opus</option>
+              <option value="sonnet">Claude Sonnet</option>
+              <option value="haiku">Claude Haiku</option>
+              <option value="fable">Claude Fable</option>
+              <option value="codex">Codex</option>
+            </select>
+            <button id="routing-preview" type="button">Preview route</button>
+          </div>
+        </div>
+        <p id="routing-diagnostic" class="routing-diagnostic" role="status" aria-live="polite">Choose a model family to prove its current route.</p>
+        <div id="routing-result" hidden>
+          <div class="routing-selection">
+            <div>
+              <span class="routing-label">[ENGINE SELECTION]</span>
+              <strong id="routing-selected">No eligible account</strong>
+              <p id="routing-launch-explanation"></p>
+            </div>
+            <div class="routing-launch-actions">
+              <button id="routing-copy" type="button">Copy safe command</button>
+              <button id="routing-open" class="primary" type="button">Open in terminal</button>
+            </div>
+          </div>
+          <div id="routing-candidates" class="routing-candidates" aria-live="polite"></div>
+        </div>
+      </section>
+
       <section class="fleet" aria-labelledby="fleet-title">
         <div class="section-heading">
           <h2 id="fleet-title">$ headroom status</h2>

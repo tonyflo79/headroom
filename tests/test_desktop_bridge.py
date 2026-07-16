@@ -513,6 +513,139 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(settings["provider_paths"], {})
         self.assertFalse(settings["notifications"]["enabled"])
 
+    def test_routing_preview_uses_engine_order_and_sanitizes_every_reason(self):
+        accounts = [
+            {"name": "selected", "provider": "claude", "home": "/selected"},
+            {"name": "reserved", "provider": "claude", "home": "/reserved"},
+            {"name": "stale", "provider": "claude", "home": "/stale"},
+            {"name": "unverified", "provider": "claude", "home": "/unverified"},
+            {"name": "cooled", "provider": "claude", "home": "/cooled"},
+            {"name": "quarantined", "provider": "claude", "home": "/quarantined"},
+            {"name": "leased", "provider": "claude", "home": "/leased"},
+            {"name": "infra", "provider": "claude", "home": "/infra"},
+        ]
+        registry.save({"schema_version": 1, "accounts": accounts})
+        ranked = [
+            (accounts[0], None),
+            (accounts[1], "reserved (config): private detail"),
+            (accounts[2], "reading stale: raw-provider-secret"),
+            (accounts[3], "slot identity changed since snapshot — recollect"),
+            (accounts[4], "cooldown until private timestamp"),
+            (accounts[5], "quarantined: raw auth response"),
+            (accounts[6], "slot leased by another live launch"),
+            (accounts[7], "cooldown ledger unreadable — /private/path"),
+        ]
+        with mock.patch.object(desktop_bridge.route, "ensure_fresh_snapshot",
+                               return_value={"generated": time.time()}), \
+                mock.patch.object(desktop_bridge.route, "candidates",
+                                  return_value=ranked) as candidates, \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value="/bin/echo"):
+            value = desktop_bridge.routing_preview_desktop("claude")
+        candidates.assert_called_once()
+        self.assertEqual(value["schema"], desktop_bridge.ROUTING_SCHEMA)
+        self.assertEqual(value["selected"], {
+            "name": "selected", "provider": "claude"})
+        self.assertEqual([row["code"] for row in value["candidates"]], [
+            "selected", "reserved", "stale_reading", "unverified_reading",
+            "cooled_down", "quarantined", "leased",
+            "infrastructure_unavailable",
+        ])
+        encoded = json.dumps(value)
+        for private in ("raw-provider-secret", "raw auth response", "/private/path"):
+            self.assertNotIn(private, encoded)
+        self.assertEqual(value["launch"]["code"], "launch_ready")
+
+    def test_launch_intent_is_engine_generated_quoted_and_allowlisted(self):
+        binary = os.path.join(self.temp.name, "provider cli")
+        with open(binary, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(binary, 0o700)
+        registry.save({
+            "schema_version": 1,
+            "desktop": {"preferred_terminal": "warp"},
+            "accounts": [{"name": "safe-slot", "provider": "claude",
+                          "home": "/safe home"}],
+        })
+        preview = {
+            "selected": {"name": "safe-slot", "provider": "claude"},
+            "launch": {"status": "ready", "code": "launch_ready"},
+        }
+        with mock.patch.object(desktop_bridge, "routing_preview_desktop",
+                               return_value=preview), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value=binary), \
+                mock.patch.object(desktop_bridge.sys, "frozen", True,
+                                  create=True), \
+                mock.patch.object(desktop_bridge.sys, "executable",
+                                  "/Applications/Headroom App/engine"):
+            intent = desktop_bridge.routing_launch_intent_desktop(
+                "claude", "safe-slot")
+        self.assertEqual(intent["schema"], desktop_bridge.LAUNCH_INTENT_SCHEMA)
+        self.assertEqual(intent["preferred_terminal"], "warp")
+        self.assertEqual(intent["launcher"], [
+            "/Applications/Headroom App/engine", "--launch-provider",
+            "claude", "safe-slot",
+        ])
+        self.assertEqual(set(intent["environment"]), {
+            "HEADROOM_DIR", "HEADROOM_SLOT_LEASE"})
+        self.assertIn("'/Applications/Headroom App/engine'", intent["copy_command"])
+        self.assertNotIn("/safe home", intent["copy_command"])
+
+    def test_launch_intent_reports_selection_cli_and_gate_failures_distinctly(self):
+        cases = [
+            ({"selected": None, "launch": {"status": "unavailable",
+              "code": "quarantined", "explanation": "auth"}},
+             "routing_authentication_required"),
+            ({"selected": None, "launch": {"status": "unavailable",
+              "code": "capacity_unavailable", "explanation": "capacity"}},
+             "routing_capacity_unavailable"),
+            ({"selected": None, "launch": {"status": "unavailable",
+              "code": "leased", "explanation": "lease"}},
+             "routing_slot_leased"),
+            ({"selected": None, "launch": {"status": "unavailable",
+              "code": "infrastructure_unavailable", "explanation": "infra"}},
+             "routing_infrastructure_unavailable"),
+            ({"selected": {"name": "other", "provider": "claude"},
+              "launch": {"status": "ready", "code": "launch_ready"}},
+             "routing_selection_changed"),
+        ]
+        for preview, expected in cases:
+            with self.subTest(expected=expected), mock.patch.object(
+                    desktop_bridge, "routing_preview_desktop",
+                    return_value=preview), self.assertRaises(
+                        desktop_bridge.BridgeError) as raised:
+                desktop_bridge.routing_launch_intent_desktop(
+                    "claude", "safe-slot")
+            self.assertEqual(raised.exception.code, expected)
+
+        ready = {"selected": {"name": "safe-slot", "provider": "claude"},
+                 "launch": {"status": "ready", "code": "launch_ready"}}
+        with mock.patch.object(desktop_bridge, "routing_preview_desktop",
+                               return_value=ready), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value=None), \
+                self.assertRaises(desktop_bridge.BridgeError) as raised:
+            desktop_bridge.routing_launch_intent_desktop("claude", "safe-slot")
+        self.assertEqual(raised.exception.code, "provider_cli_missing")
+
+    def test_frozen_launcher_reproves_and_never_accepts_command_text(self):
+        intent = {
+            "family": "claude", "account_name": "safe-slot",
+            "provider_executable": "/verified/claude",
+        }
+        with mock.patch.object(desktop_bridge, "routing_launch_intent_desktop",
+                               return_value=intent), \
+                mock.patch.object(desktop_bridge.route, "cmd_exec_selected",
+                                  return_value=0) as execute:
+            self.assertEqual(desktop_bridge.launch_selected_provider(
+                "claude", "safe-slot"), 0)
+        execute.assert_called_once_with(
+            "claude", "safe-slot", ["/verified/claude"],
+            launch_note="desktop launch intent")
+        self.assertEqual(desktop_bridge.cli_main([
+            "--launch-provider", "claude", "safe-slot", "rm -rf /" ]), 2)
+
     def test_adopt_refuses_a_duplicate_name_before_mutation(self):
         registry.save({
             "schema_version": 1,
@@ -627,6 +760,8 @@ class DesktopBridgeSubprocess(unittest.TestCase):
         self.assertIn("resilient_collection",
                       frames[0]["result"]["capabilities"])
         self.assertIn("validated_settings",
+                      frames[0]["result"]["capabilities"])
+        self.assertIn("routing_launch",
                       frames[0]["result"]["capabilities"])
         self.assertEqual(frames[1]["result"]["schema"], "headroom_widget@1")
         self.assertIn("prepared sanitized fixture", process.stderr)

@@ -4,7 +4,8 @@ import test from "node:test";
 
 import {
   accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset, loginMessage,
-  normalizeBootstrap, normalizeDeviceInstructions, onboardingPresentation, percentLeft,
+  normalizeBootstrap, normalizeDeviceInstructions, normalizeRoutingPreview,
+  onboardingPresentation, percentLeft,
   refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
   shouldApplySnapshot, settingsPatch, suggestedAccountName, validateSettingsDraft,
 } from "../dist/main.js";
@@ -296,6 +297,65 @@ test("uses locale formatters for percentages and exposes the settings console", 
     assert.match(html, new RegExp(`id="${id}"`));
   }
   assert.match(html, /⌘, settings · ⌘R refresh · ⌘W close · ⌘Q quit/);
+});
+
+test("normalizes one bounded engine routing decision without command material", () => {
+  const preview = normalizeRoutingPreview({
+    schema: "headroom_desktop_routing@1", family: "sonnet", provider: "claude",
+    selected: { name: "claude-one", provider: "claude" },
+    candidates: [
+      { name: "claude-one", provider: "claude", selected: true, eligible: true,
+        code: "selected", explanation: "This is the engine-selected account.",
+        action: "copy_or_open" },
+      { name: "claude-two", provider: "claude", selected: false, eligible: false,
+        code: "leased", explanation: "Another live launch currently owns this slot.",
+        action: "close_other_session" },
+      { name: "claude-three", provider: "claude", selected: false, eligible: false,
+        code: "quarantined", explanation: "Authentication was rejected for this slot.",
+        action: "reauthenticate_account" },
+    ],
+    launch: { status: "ready", code: "launch_ready",
+      explanation: "The selected account can be launched safely.",
+      action: "copy_or_open" },
+    command: "rm -rf /",
+    environment: { DANGEROUS: "ignored" },
+  });
+  assert.equal(preview.selected.name, "claude-one");
+  assert.deepEqual(preview.candidates.map((row) => row.code),
+    ["selected", "leased", "quarantined"]);
+  assert.equal("command" in preview, false);
+  assert.equal("environment" in preview, false);
+});
+
+test("routing preview refuses malformed selection and unbounded explanations", () => {
+  const base = {
+    schema: "headroom_desktop_routing@1", family: "codex", provider: "codex",
+    selected: { name: "codex-one", provider: "codex" },
+    candidates: [{ name: "codex-one", provider: "codex", selected: true,
+      eligible: true, code: "selected", explanation: "Selected.",
+      action: "copy_or_open" }],
+    launch: { status: "ready", code: "launch_ready", explanation: "Ready.",
+      action: "copy_or_open" },
+  };
+  assert.throws(() => normalizeRoutingPreview({ ...base,
+    selected: { name: "other", provider: "codex" } }), /selection summary/);
+  const oversized = structuredClone(base);
+  oversized.candidates[0].explanation = "x".repeat(257);
+  assert.throws(() => normalizeRoutingPreview(oversized), /candidate/);
+  assert.throws(() => normalizeRoutingPreview({ ...base, family: "arbitrary" }),
+    /routing preview/);
+});
+
+test("routing UI exposes only family and account based native actions", () => {
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../dist/main.js", import.meta.url), "utf8");
+  for (const id of ["routing-family", "routing-preview", "routing-copy",
+    "routing-open", "routing-candidates"]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(source, /desktop_copy_routing_command/);
+  assert.match(source, /desktop_open_routing_launch/);
+  assert.doesNotMatch(source, /desktop_(copy|open)_routing_(command|launch)[\s\S]{0,180}(command|environment):/);
 });
 
 test("all five themes define the same semantic token contract", () => {
