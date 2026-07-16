@@ -224,7 +224,10 @@ test("reset and account state copy remain actionable without color", () => {
   assert.equal(refreshStatePresentation("refreshing").busy, true);
   assert.match(refreshStatePresentation("backoff").label, /jittered/);
   assert.equal(refreshStatePresentation("recovering").busy, true);
-  assert.match(refreshStatePresentation("degraded").label, /restart loop/);
+  assert.match(refreshStatePresentation("degraded", "engine_unexpected_exit").label,
+    /restart loop.*engine_unexpected_exit/);
+  assert.doesNotMatch(refreshStatePresentation("degraded", "raw private detail").label,
+    /private/);
 });
 
 test("all five themes define the same semantic token contract", () => {
