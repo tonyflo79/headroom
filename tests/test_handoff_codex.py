@@ -29,6 +29,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import collect, handoff, handoff_codex, paths, route  # noqa: E402
 
+
+def _canonical_temp_directory():
+    """Return a fixture root with the same path identity production enforces."""
+    directory = tempfile.TemporaryDirectory()
+    directory.name = os.path.realpath(directory.name)
+    return directory
+
+
 SID = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0001"
 OTHER_SID = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0002"
 THIRD_SID = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0003"
@@ -109,7 +117,7 @@ class CodexHandoffBase(unittest.TestCase):
     reloads the registry reads genuine, mutable on-disk state."""
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _canonical_temp_directory()
         self.old_headroom = os.environ.get("HEADROOM_DIR")
         os.environ["HEADROOM_DIR"] = os.path.join(self.temp.name, "headroom")
         self.old_cwd = os.getcwd()
@@ -917,7 +925,9 @@ class CodexCommit(CodexHandoffBase):
         self.assertTrue(os.path.exists(plan.destination))
         self.assertEqual(marker["components"],
                          ["sessions", "2026", "07", "13"])
-        on_disk = json.load(open(handoff._marker_path(plan.handoff_id)))
+        with open(handoff._marker_path(plan.handoff_id),
+                  encoding="utf-8") as source:
+            on_disk = json.load(source)
         self.assertEqual(on_disk["schema"], "headroom_handoff_recovery@2")
         # no staged ledger row -> the next lock rolls the publication back
         handoff.append_ledger({"session_id": "reconcile-sentinel"})

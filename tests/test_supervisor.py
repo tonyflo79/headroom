@@ -23,6 +23,13 @@ from headroom import (  # noqa: E402
 )
 
 
+def _canonical_temp_directory():
+    """Return a fixture root with the same path identity production enforces."""
+    directory = tempfile.TemporaryDirectory()
+    directory.name = os.path.realpath(directory.name)
+    return directory
+
+
 IDENTITY = {"account_fingerprint": "AAAA", "credential_digest": "BBBB"}
 
 
@@ -403,7 +410,7 @@ class HookProof(unittest.TestCase):
     SID = "11111111-1111-4111-8111-111111111111"
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _canonical_temp_directory()
         self.home = os.path.join(self.temp.name, "home")
         self.cwd = os.path.join(self.temp.name, "work")
         os.makedirs(self.cwd)
@@ -1038,7 +1045,7 @@ class CliWiring(unittest.TestCase):
 
 class SupervisorIntegration(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _canonical_temp_directory()
         self.root = os.path.join(self.temp.name, "headroom")
         self.fake_state = os.path.join(self.temp.name, "fake-state")
         self.bin_dir = os.path.join(self.temp.name, "bin")
