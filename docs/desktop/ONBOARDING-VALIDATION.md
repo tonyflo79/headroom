@@ -45,11 +45,16 @@ duplicate names must show inline errors and must not cross the bridge.
 
 ## Evidence record
 
-Status: automated contract tests complete; packaged-app run pending
+Status: automated contract tests and isolated packaged-app smoke run complete;
+live-account completion remains a human release gate
 
 | UTC time | Build commit | Path | Resume | No provider access before consent | Result |
 |---|---|---|---|---|---|
-| pending | pending | clean/demo | pending | pending | pending |
-| pending | pending | Claude-only | pending | pending | pending |
-| pending | pending | Codex-only | pending | pending | pending |
-| pending | pending | both/neither | pending | pending | pending |
+| 2026-07-16T10:45:47Z | `2ffbe6f` | clean/demo | yes | yes | pass — sample fleet resumed; no registry, provider invocation, or listener |
+| 2026-07-16T10:45:47Z | `2ffbe6f` | Claude-only fixture | automated | yes | pass — readiness matrix contract |
+| 2026-07-16T10:45:47Z | `2ffbe6f` | Codex-only fixture | automated | yes | pass — readiness matrix contract |
+| 2026-07-16T10:45:47Z | `2ffbe6f` | both/neither | yes | yes | pass — packaged UI showed both ready and both missing; demo remained available |
+
+The packaged run also confirmed valid generated names, inline rejection of
+`Bad Name`, account-step resume without a login attempt, terminal-green text
+and glowing controls/bars on black, and a clean application shutdown.
