@@ -36,7 +36,7 @@ Headroom.app
 - macOS 13 or newer
 - Apple Silicon or Intel, built natively on each architecture
 - Rust 1.88
-- Python 3.13, provisioned by `uv` and frozen into the sidecar
+- Python 3.13.12, provisioned by `uv` and frozen into the sidecar
 - PyInstaller 6.21.0
 - Tauri CLI 2.11.4
 
@@ -80,7 +80,7 @@ cargo tauri dev
 From the repository root:
 
 ```sh
-uv run --python 3.13 python -m unittest tests.test_desktop_bridge
+uv run --python 3.13.12 python -m unittest tests.test_desktop_bridge
 npm --prefix integrations/menubar test
 cargo fmt --check --manifest-path integrations/menubar/src-tauri/Cargo.toml
 cargo test --locked --manifest-path integrations/menubar/src-tauri/Cargo.toml
