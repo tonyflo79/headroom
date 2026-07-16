@@ -15,29 +15,52 @@ export function refreshPresentation(busy) {
 
 const LOGIN_MESSAGES = {
   queued: "Queued",
-  preflight: "Checking Claude CLI prerequisite",
+  preflight: "Checking provider CLI prerequisite",
   browser_login: "Waiting for Claude browser sign-in",
   verifying_identity: "Verifying account identity",
   publishing: "Publishing the verified account",
   cancelling: "Cancelling and restoring prior credentials",
   complete: "Complete",
-  connected: "Claude account connected",
+  connected: "Account connected",
   cancelled: "Login cancelled; prior credentials restored",
   login_timed_out: "Login timed out; prior credentials restored",
   provider_login_failed: "Claude login failed; prior credentials restored",
   identity_unreadable: "Claude completed but identity could not be verified",
   wrong_identity: "Signed-in identity did not match; credentials restored",
-  duplicate_identity: "That Claude identity is already connected",
+  duplicate_identity: "That identity is already connected",
   claude_cli_missing: "Install Claude Code before connecting",
   claude_upgrade_required: "Update Claude Code to a version with auth login support",
   claude_shared_keychain_conflict: "Login refused: an existing slot uses the legacy shared Keychain item",
   claude_keychain_isolation_missing: "Claude did not create an isolated Keychain item; update Claude Code",
   claude_slot_keychain_occupied: "Login refused: this unused slot name already has a Keychain item",
+  device_code: "Open OpenAI and enter the one-time code",
+  codex_cli_missing: "Install Codex before connecting",
+  codex_upgrade_required: "Update Codex to a version with structured device authentication",
+  device_code_expired: "The device code expired; no account was added",
+  device_authorization_rejected: "OpenAI rejected the device authorization",
+  device_instructions_malformed: "Codex returned unsafe device instructions; login stopped",
+  api_key_not_subscription: "API-key authentication has no ChatGPT subscription capacity",
+  identity_rejected: "The Codex identity was rejected; credentials restored",
+  identity_malformed: "Codex returned an unverifiable identity; credentials restored",
+  identity_verification_failed: "Live Codex verification failed; credentials restored",
   internal_error: "Login failed safely; prior credentials were restored",
 };
 
 export function loginMessage(code) {
   return LOGIN_MESSAGES[code] || "Login could not be completed safely";
+}
+
+export function normalizeDeviceInstructions(value) {
+  if (!value || typeof value.verification_url !== "string" ||
+      typeof value.user_code !== "string" ||
+      !/^[A-Z0-9-]{4,32}$/.test(value.user_code)) return null;
+  try {
+    const url = new URL(value.verification_url);
+    if (url.protocol !== "https:" || url.hostname !== "auth.openai.com" ||
+        url.username || url.password || (url.port && url.port !== "443") ||
+        url.pathname !== "/codex/device" || url.search || url.hash) return null;
+  } catch { return null; }
+  return { verification_url: value.verification_url, user_code: value.user_code };
 }
 
 export function normalizeBootstrap(raw) {
@@ -159,23 +182,24 @@ function candidateCard(candidate, invoke, update) {
   return form;
 }
 
-function claudeLoginCard(invoke, update) {
+function providerLoginCard(provider, invoke, update) {
   const form = document.createElement("form");
   form.className = "provider-login";
   const title = document.createElement("strong");
-  title.textContent = "> connect new Claude login";
+  const label = provider === "claude" ? "Claude" : "Codex";
+  title.textContent = `> connect new ${label} login`;
   const fields = document.createElement("div");
   fields.className = "login-fields";
   const name = document.createElement("input");
   name.required = true;
   name.pattern = "[a-z0-9][a-z0-9_-]{0,31}";
-  name.value = "claude-new";
+  name.value = `${provider}-new`;
   name.placeholder = "slot name";
-  name.setAttribute("aria-label", "Claude slot name");
+  name.setAttribute("aria-label", `${label} slot name`);
   const expected = document.createElement("input");
   expected.type = "email";
   expected.placeholder = "expected email (optional)";
-  expected.setAttribute("aria-label", "Expected Claude email, optional");
+  expected.setAttribute("aria-label", `Expected ${label} email, optional`);
   const start = document.createElement("button");
   start.type = "submit";
   start.textContent = "Connect";
@@ -186,15 +210,35 @@ function claudeLoginCard(invoke, update) {
   const diagnostic = document.createElement("p");
   diagnostic.className = "diagnostic";
   diagnostic.setAttribute("aria-live", "polite");
+  const device = document.createElement("div");
+  device.className = "device-instructions";
+  device.hidden = true;
   fields.append(name, expected, start, cancel);
-  form.append(title, fields, diagnostic);
+  form.append(title, fields, device, diagnostic);
+
+  const showInstructions = (raw) => {
+    const instructions = normalizeDeviceInstructions(raw);
+    if (!instructions) { device.hidden = true; device.replaceChildren(); return; }
+    const code = document.createElement("code");
+    code.textContent = instructions.user_code;
+    const open = document.createElement("button");
+    open.type = "button";
+    open.textContent = "Open OpenAI";
+    open.onclick = () => invoke("desktop_open_device_url", {
+      url: instructions.verification_url,
+    });
+    device.replaceChildren(code, open);
+    device.hidden = false;
+  };
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     start.disabled = true;
     name.disabled = true;
     expected.disabled = true;
     try {
-      let job = await invoke("desktop_start_claude_login", {
+      const command = provider === "claude"
+        ? "desktop_start_claude_login" : "desktop_start_codex_login";
+      let job = await invoke(command, {
         name: name.value, expectedEmail: expected.value || null,
       });
       cancel.hidden = false;
@@ -205,10 +249,12 @@ function claudeLoginCard(invoke, update) {
       };
       while (job.state === "running" || job.state === "cancelling") {
         diagnostic.textContent = loginMessage(job.progress_code);
+        showInstructions(job.instructions);
         await new Promise((resolve) => setTimeout(resolve, 350));
         job = await invoke("desktop_login_status", { jobId: job.job_id });
       }
       diagnostic.textContent = loginMessage(job.result_code);
+      showInstructions(null);
       if (job.state === "succeeded" && job.view) update(job.view);
     } catch (error) {
       diagnostic.textContent = String(error);
@@ -242,7 +288,8 @@ export function renderBootstrap(raw, invoke = null) {
   const update = (nextView) => renderBootstrap({ bridge: value.bridge, view: nextView }, invoke);
   const actionCards = invoke && view.mode !== "recovery" ? [
     ...view.candidates.map((row) => candidateCard(row, invoke, update)),
-    claudeLoginCard(invoke, update),
+    providerLoginCard("claude", invoke, update),
+    providerLoginCard("codex", invoke, update),
   ] : [];
   actions.replaceChildren(...actionCards);
   const refresh = document.getElementById("refresh");

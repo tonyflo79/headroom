@@ -14,13 +14,17 @@ that is already connected on another slot, the credentials are rolled back and
 the connect is refused — duplicate logins silently eating each other's
 headroom is the classic multi-account failure mode.
 """
+import json
 import os
+import queue
 import re
 import signal
 import shutil
 import subprocess
 import sys
 import time
+import threading
+from urllib.parse import urlsplit
 
 from . import collect as collector
 from . import paths, registry
@@ -100,9 +104,270 @@ def delete_claude_keychain_item(home, runner=None):
         pass
 
 
+def desktop_codex_prerequisite(binary, runner=None):
+    """Require the verified Codex device-auth/app-server protocol floor."""
+    runner = subprocess.run if runner is None else runner
+    try:
+        version = runner(
+            [binary, "--version"], env=collector.scrubbed_env(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=5, check=False)
+        match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b",
+                          version.stdout or version.stderr or "")
+        if version.returncode != 0 or not match \
+                or tuple(map(int, match.groups())) < (0, 144, 0):
+            return False
+        login_help = runner(
+            [binary, "login", "--help"], env=collector.scrubbed_env(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=5, check=False)
+        server_help = runner(
+            [binary, "app-server", "--help"], env=collector.scrubbed_env(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return (login_help.returncode == 0
+            and "--device-auth" in (login_help.stdout or "")
+            and server_help.returncode == 0
+            and "app-server" in (server_help.stdout or "").lower())
+
+
+def _device_instructions(value):
+    """Validate the only app-server login fields allowed to reach the GUI."""
+    if not isinstance(value, dict) or value.get("type") != "chatgptDeviceCode":
+        return None
+    login_id = value.get("loginId")
+    code = value.get("userCode")
+    raw_url = value.get("verificationUrl")
+    if not isinstance(login_id, str) or not 1 <= len(login_id) <= 256:
+        return None
+    if not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9-]{4,32}", code):
+        return None
+    if not isinstance(raw_url, str) or len(raw_url) > 512:
+        return None
+    parsed = urlsplit(raw_url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if (parsed.scheme != "https" or parsed.hostname != "auth.openai.com"
+            or parsed.username is not None or parsed.password is not None
+            or port not in (None, 443) or parsed.path != "/codex/device"
+            or parsed.query or parsed.fragment):
+        return None
+    return {"login_id": login_id, "verification_url": raw_url,
+            "user_code": code}
+
+
+def desktop_connect_codex_device(config, name, *, expected_email=None,
+                                 cancel_event=None, progress=None,
+                                 timeout=DESKTOP_LOGIN_TIMEOUT, popen=None,
+                                 prerequisite=None, live_reader=None):
+    """Complete Codex device auth through structured app-server JSON-RPC."""
+    progress = (lambda _code, _details=None: None) if progress is None else progress
+    cancel_event = cancel_event or type("NeverCancel", (), {
+        "is_set": lambda self: False})()
+    popen = subprocess.Popen if popen is None else popen
+    prerequisite = desktop_codex_prerequisite if prerequisite is None else prerequisite
+    default_live_reader = live_reader is None
+    live_reader = collector.codex_live if live_reader is None else live_reader
+    if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
+        return {"ok": False, "code": "invalid_account_name"}
+    if any(row.get("name") == name for row in config.get("accounts", [])):
+        return {"ok": False, "code": "duplicate_account_name"}
+    home = os.path.join(paths.homes_dir(), name)
+    if os.path.realpath(home) != os.path.realpath(
+            os.path.join(paths.homes_dir(), os.path.basename(name))):
+        return {"ok": False, "code": "invalid_account_home"}
+    progress("preflight")
+    binary = provider_binary("codex")
+    if binary is None:
+        return {"ok": False, "code": "codex_cli_missing"}
+    if not prerequisite(binary):
+        return {"ok": False, "code": "codex_upgrade_required"}
+    if cancel_event.is_set():
+        return {"ok": False, "code": "cancelled"}
+
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    backup_dir, saved = backup_credentials(home, "codex")
+    duplicates = existing_fingerprints(config, "codex")
+    completed = False
+
+    def rollback():
+        if backup_dir:
+            restore_credentials(home, "codex", backup_dir, saved)
+        else:
+            target = os.path.join(home, "auth.json")
+            if os.path.exists(target):
+                os.remove(target)
+
+    process = None
+    try:
+        env = collector.scrubbed_env()
+        env["CODEX_HOME"] = home
+        try:
+            process = popen(
+                [binary, "app-server"], env=env, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1, start_new_session=True)
+        except OSError:
+            return {"ok": False, "code": "login_launch_failed"}
+        if process.stdin is None or process.stdout is None:
+            return {"ok": False, "code": "codex_protocol_unavailable"}
+        messages = queue.Queue()
+
+        def reader():
+            try:
+                for line in process.stdout:
+                    try:
+                        value = json.loads(line)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                    if isinstance(value, dict):
+                        messages.put(value)
+            except (OSError, ValueError):
+                pass
+
+        threading.Thread(target=reader, name="headroom-codex-login-reader",
+                         daemon=True).start()
+
+        def send(value):
+            process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+
+        deadline = time.monotonic() + max(1, float(timeout))
+
+        def receive(predicate):
+            while time.monotonic() < deadline:
+                if cancel_event.is_set():
+                    return None, "cancelled"
+                try:
+                    value = messages.get(timeout=0.1)
+                except queue.Empty:
+                    if process.poll() is not None:
+                        return None, "codex_protocol_stopped"
+                    continue
+                if predicate(value):
+                    return value, None
+            return None, "device_code_expired"
+
+        try:
+            send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"clientInfo": {"name": "headroom", "version": "0.4"}}})
+            initialized, error = receive(lambda row: row.get("id") == 1)
+            if error:
+                return {"ok": False, "code": error}
+            if initialized.get("error") \
+                    or not isinstance(initialized.get("result"), dict):
+                return {"ok": False, "code": "codex_upgrade_required"}
+            send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+            send({"jsonrpc": "2.0", "id": 2, "method": "account/login/start",
+                  "params": {"type": "chatgptDeviceCode"}})
+            started, error = receive(lambda row: row.get("id") == 2)
+            if error:
+                return {"ok": False, "code": error}
+            if started.get("error"):
+                return {"ok": False, "code": "codex_upgrade_required"}
+            instructions = _device_instructions(started.get("result"))
+            if instructions is None:
+                return {"ok": False, "code": "device_instructions_malformed"}
+            login_id = instructions.pop("login_id")
+            progress("device_code", instructions)
+            notification, error = receive(
+                lambda row: row.get("method") == "account/login/completed"
+                and (row.get("params") or {}).get("loginId") == login_id)
+            if error == "cancelled":
+                try:
+                    send({"jsonrpc": "2.0", "id": 3,
+                          "method": "account/login/cancel",
+                          "params": {"loginId": login_id}})
+                    # Give the app-server a short bounded chance to acknowledge
+                    # the structured cancel before its isolated process group
+                    # is retired. Cancellation never waits on provider text.
+                    cancel_deadline = min(deadline, time.monotonic() + 0.5)
+                    while time.monotonic() < cancel_deadline:
+                        try:
+                            response = messages.get(timeout=0.05)
+                        except queue.Empty:
+                            if process.poll() is not None:
+                                break
+                            continue
+                        if response.get("id") == 3:
+                            break
+                except OSError:
+                    pass
+                return {"ok": False, "code": "cancelled"}
+            if error:
+                return {"ok": False, "code": error}
+            if (notification.get("params") or {}).get("success") is not True:
+                return {"ok": False, "code": "device_authorization_rejected"}
+        except (OSError, ValueError):
+            return {"ok": False, "code": "codex_protocol_failed"}
+        finally:
+            _stop_login_process(process)
+
+        if cancel_event.is_set():
+            return {"ok": False, "code": "cancelled"}
+        progress("verifying_identity")
+        auth = paths.load_json(os.path.join(home, "auth.json")) or {}
+        mode = collector.codex_auth_mode(auth)
+        if mode == "apikey":
+            return {"ok": False, "code": "api_key_not_subscription"}
+        if mode != "chatgpt":
+            return {"ok": False, "code": "identity_malformed"}
+        try:
+            kwargs = {"expected_email": expected_email, "now": int(time.time())}
+            if default_live_reader:
+                kwargs["cancel_event"] = cancel_event
+            identity, plan, windows = live_reader(home, **kwargs)
+        except collector.IdentityBindingError as error:
+            code = str(error)
+            if code == "cancelled":
+                return {"ok": False, "code": "cancelled"}
+            if code == "codex_capacity_unavailable":
+                return {"ok": False, "code": "api_key_not_subscription"}
+            if "auth" in code or "unexpected_email" in code:
+                return {"ok": False, "code": "identity_rejected"}
+            return {"ok": False, "code": "identity_malformed"}
+        except Exception:  # noqa: BLE001 - no provider detail crosses boundary
+            return {"ok": False, "code": "identity_verification_failed"}
+        if cancel_event.is_set():
+            return {"ok": False, "code": "cancelled"}
+        fingerprint = identity.get("account_fingerprint")
+        if not identity.get("verified") or not identity.get("email") or not fingerprint:
+            return {"ok": False, "code": "identity_malformed"}
+        if fingerprint in duplicates:
+            return {"ok": False, "code": "duplicate_identity"}
+        entry = add_account(config, name, "codex", home, identity["email"])
+        saved_config = registry.load()
+        actual = next((row for row in saved_config["accounts"]
+                       if row["name"] == name), None)
+        if actual is None or actual["provider"] != "codex" \
+                or registry.expand(actual["home"]) != registry.expand(home):
+            return {"ok": False, "code": "registry_conflict"}
+        completed = True
+        return {"ok": True, "code": "connected", "entry": entry,
+                "observation": {"email": identity["email"], "plan": plan,
+                                "windows": windows}}
+    finally:
+        if process is not None and process.poll() is None:
+            _stop_login_process(process)
+        if not completed:
+            rollback()
+        discard_backup(backup_dir)
+        if not completed:
+            try:
+                if os.path.isdir(home) and not os.listdir(home):
+                    os.rmdir(home)
+            except OSError:
+                pass
+
+
 def _stop_login_process(process):
     """Terminate the isolated provider process group and bound the wait."""
     if process.poll() is not None:
+        _close_login_streams(process)
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -116,6 +381,18 @@ def _stop_login_process(process):
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             pass
+    finally:
+        _close_login_streams(process)
+
+
+def _close_login_streams(process):
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream not in (None, subprocess.DEVNULL):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
 
 
 def desktop_connect_fresh(config, name, provider, *, expected_email=None,

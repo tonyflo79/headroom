@@ -214,10 +214,17 @@ class DesktopLoginManager:
             "state": job["state"],
             "progress_code": job["progress_code"],
             "result_code": job.get("result_code"),
+            "instructions": job.get("instructions"),
             "view": job.get("view"),
         }
 
     def start_claude(self, name, expected_email=None):
+        return self._start("claude", name, expected_email)
+
+    def start_codex(self, name, expected_email=None):
+        return self._start("codex", name, expected_email)
+
+    def _start(self, provider, name, expected_email=None):
         if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
             raise BridgeError("invalid_account_name", "account name is invalid")
         if expected_email is not None and (
@@ -239,30 +246,48 @@ class DesktopLoginManager:
             if self._job and self._job["state"] in {"running", "cancelling"}:
                 raise BridgeError("login_in_progress", "another login is in progress")
             job = {
-                "job_id": secrets.token_hex(12), "provider": "claude",
+                "job_id": secrets.token_hex(12), "provider": provider,
                 "name": name, "state": "running", "progress_code": "queued",
                 "cancel": threading.Event(),
             }
             self._job = job
             thread = threading.Thread(
                 target=self._run, args=(job, config, expected_email),
-                name="headroom-claude-login", daemon=False)
+                name=f"headroom-{provider}-login", daemon=False)
             job["thread"] = thread
             thread.start()
             return self._projection(job)
 
     def _run(self, job, config, expected_email):
-        def progress(code):
+        def progress(code, details=None):
             with self._lock:
                 if self._job is job and job["state"] == "running":
                     job["progress_code"] = code
+                    job["instructions"] = details
         try:
-            outcome = connect.desktop_connect_fresh(
-                config, job["name"], "claude", expected_email=expected_email,
-                cancel_event=job["cancel"], progress=progress)
+            if job["provider"] == "claude":
+                outcome = connect.desktop_connect_fresh(
+                    config, job["name"], "claude", expected_email=expected_email,
+                    cancel_event=job["cancel"], progress=progress)
+            else:
+                outcome = connect.desktop_connect_codex_device(
+                    config, job["name"], expected_email=expected_email,
+                    cancel_event=job["cancel"], progress=progress)
             if outcome.get("ok"):
                 progress("publishing")
-                view = discover_desktop()
+                if job["provider"] == "codex" and outcome.get("observation"):
+                    now = int(time.time())
+                    observed = outcome["observation"]
+                    public = {"generated": now, "accounts": [{
+                        "name": job["name"], "provider": "codex", "ok": True,
+                        "email": observed.get("email"),
+                        "plan": observed.get("plan"), "trust_state": "verified",
+                        "captured_at": now, "stale": False,
+                        "windows": observed.get("windows") or {},
+                    }]}
+                    view = _view(registry.load(), public, now=now)
+                else:
+                    view = discover_desktop()
                 state = "succeeded"
             else:
                 view = None
@@ -273,13 +298,14 @@ class DesktopLoginManager:
                     job.update({
                         "state": state, "progress_code": "complete",
                         "result_code": outcome.get("code", "internal_error"),
-                        "view": view,
+                        "instructions": None, "view": view,
                     })
         except Exception:  # noqa: BLE001 - no detail crosses desktop boundary
             with self._lock:
                 if self._job is job:
                     job.update({"state": "failed", "progress_code": "complete",
-                                "result_code": "internal_error", "view": None})
+                                "result_code": "internal_error",
+                                "instructions": None, "view": None})
 
     def status(self, job_id):
         with self._lock:
@@ -395,7 +421,7 @@ def _handle(command, args):
             "architecture": platform.machine(),
             "capabilities": [
                 "fixture_snapshot", "discover", "adopt", "refresh",
-                "claude_login", "shutdown"],
+                "claude_login", "codex_device_login", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
@@ -420,6 +446,11 @@ def _handle(command, args):
         if set(args) - {"name", "expected_email"}:
             raise BridgeError("invalid_args", "login arguments are invalid")
         return LOGIN_MANAGER.start_claude(
+            args.get("name"), args.get("expected_email")), False
+    if command == "start_codex_login":
+        if set(args) - {"name", "expected_email"}:
+            raise BridgeError("invalid_args", "login arguments are invalid")
+        return LOGIN_MANAGER.start_codex(
             args.get("name"), args.get("expected_email")), False
     if command == "login_status":
         if set(args) != {"job_id"}:

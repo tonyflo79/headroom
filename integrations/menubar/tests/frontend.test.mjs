@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  loginMessage, normalizeBootstrap, percentLeft, refreshPresentation,
+  loginMessage, normalizeBootstrap, normalizeDeviceInstructions, percentLeft,
+  refreshPresentation,
 } from "../dist/main.js";
 
 const bootstrap = {
@@ -73,4 +74,22 @@ test("Claude login diagnostics are stable and never echo unknown provider text",
     "Signed-in identity did not match; credentials restored");
   assert.equal(loginMessage("raw provider secret"),
     "Login could not be completed safely");
+});
+
+test("shared login diagnostics remain accurate for Codex", () => {
+  assert.equal(loginMessage("preflight"), "Checking provider CLI prerequisite");
+  assert.equal(loginMessage("connected"), "Account connected");
+  assert.equal(loginMessage("duplicate_identity"),
+    "That identity is already connected");
+});
+
+test("device instructions accept only the exact OpenAI HTTPS origin", () => {
+  const safe = { verification_url: "https://auth.openai.com/codex/device",
+    user_code: "ABCD-EFGH" };
+  assert.deepEqual(normalizeDeviceInstructions(safe), safe);
+  assert.equal(normalizeDeviceInstructions({ ...safe,
+    verification_url: "https://auth.openai.com.evil.test/codex/device" }), null);
+  assert.equal(normalizeDeviceInstructions({ ...safe,
+    verification_url: "https://auth.openai.com/other" }), null);
+  assert.equal(normalizeDeviceInstructions({ ...safe, user_code: "<secret>" }), null);
 });

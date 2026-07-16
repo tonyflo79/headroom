@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Deterministic Codex CLI/app-server fixture for desktop login tests."""
+
+import base64
+import json
+import os
+import sys
+
+
+def emit(value):
+    print(json.dumps(value, separators=(",", ":")), flush=True)
+
+
+def token():
+    claims = {
+        "sub": "fixture-subject",
+        "email": "fixture@example.test",
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "fixture-account",
+            "chatgpt_plan_type": "plus",
+        },
+    }
+    payload = base64.urlsafe_b64encode(
+        json.dumps(claims, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    return f"fixture.{payload}.signature"
+
+
+def write_auth():
+    home = os.environ["CODEX_HOME"]
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    path = os.path.join(home, "auth.json")
+    if os.environ.get("HEADROOM_FAKE_CODEX_AUTH") == "apikey":
+        value = {"auth_mode": "apikey", "OPENAI_API_KEY": "fixture-secret"}
+    else:
+        value = {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": token(),
+                "access_token": "fixture-access",
+                "refresh_token": "fixture-refresh",
+            },
+        }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle)
+    os.chmod(path, 0o600)
+
+
+def app_server():
+    login_id = "fixture-login"
+    mode = os.environ.get("HEADROOM_FAKE_CODEX_RESULT", "success")
+    for raw in sys.stdin:
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            continue
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "initialize":
+            emit({"jsonrpc": "2.0", "id": request_id, "result": {
+                "serverInfo": {"name": "codex-fixture", "version": "0.144.0"}
+            }})
+        elif method == "account/login/start":
+            write_auth()
+            verification_url = (
+                "https://auth.openai.com.evil.test/codex/device"
+                if mode == "malformed" else
+                "https://auth.openai.com/codex/device"
+            )
+            emit({"jsonrpc": "2.0", "id": request_id, "result": {
+                "type": "chatgptDeviceCode",
+                "loginId": login_id,
+                "userCode": "ABCD-EFGH",
+                "verificationUrl": verification_url,
+            }})
+            if mode in {"success", "rejected"}:
+                emit({"jsonrpc": "2.0", "method": "account/login/completed",
+                      "params": {"loginId": login_id,
+                                 "success": mode == "success",
+                                 "error": None if mode == "success" else "denied"}})
+        elif method == "account/login/cancel":
+            cancel_log = os.environ.get("HEADROOM_FAKE_CODEX_CANCEL_LOG")
+            if cancel_log:
+                with open(cancel_log, "w", encoding="utf-8") as handle:
+                    handle.write(str((message.get("params") or {}).get("loginId")))
+            emit({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"status": "cancelled"}})
+        elif method == "account/rateLimits/read":
+            if os.environ.get("HEADROOM_FAKE_CODEX_LIVE_WAIT") == "1":
+                continue
+            emit({"jsonrpc": "2.0", "id": request_id, "result": {
+                "rateLimits": {
+                    "primary": {"usedPercent": 25, "windowDurationMins": 300,
+                                "resetsAt": 1900000000},
+                    "secondary": {"usedPercent": 40,
+                                  "windowDurationMins": 10080,
+                                  "resetsAt": 1900600000},
+                }
+            }})
+        elif method == "account/read":
+            if os.environ.get("HEADROOM_FAKE_CODEX_LIVE_WAIT") == "1":
+                continue
+            emit({"jsonrpc": "2.0", "id": request_id, "result": {
+                "account": {"type": "chatgpt", "email": "fixture@example.test",
+                            "planType": "plus"},
+                "requiresOpenaiAuth": True,
+            }})
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--version"]:
+        print("codex-cli 0.144.0")
+        return 0
+    if args == ["login", "--help"]:
+        print("Usage: codex login --device-auth")
+        return 0
+    if args == ["app-server", "--help"]:
+        print("Run the Codex app-server")
+        return 0
+    if args == ["app-server"]:
+        app_server()
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

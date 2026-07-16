@@ -443,7 +443,7 @@ def codex_lineage_digest(home):
         return None
 
 
-def codex_app_server_read(home, timeout=None):
+def codex_app_server_read(home, timeout=None, cancel_event=None):
     """Live Codex read via the codex app-server (`codex app-server`, JSON-RPC
     over stdio): real-time rate limits AND the network-verified logged-in
     account, both bound to this slot's CODEX_HOME. This replaces stale
@@ -483,25 +483,40 @@ def codex_app_server_read(home, timeout=None):
             if isinstance(message, dict) and "id" in message:
                 responses[message["id"]] = message
 
-    threading.Thread(target=reader, daemon=True).start()
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
 
     def send(obj):
         stdin.write(json.dumps(obj) + "\n")
         stdin.flush()
 
     deadline = time.time() + timeout
+
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
     try:
+        if cancelled():
+            raise IdentityBindingError("cancelled")
         send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
               "params": {"clientInfo": {"name": "headroom", "version": "0.1"}}})
         while 1 not in responses and time.time() < deadline:
+            if cancelled():
+                raise IdentityBindingError("cancelled")
             time.sleep(0.05)
+        if cancelled():
+            raise IdentityBindingError("cancelled")
         send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
         send({"jsonrpc": "2.0", "id": 2,
               "method": "account/rateLimits/read", "params": {}})
         send({"jsonrpc": "2.0", "id": 3, "method": "account/read", "params": {}})
         while (2 not in responses or 3 not in responses) \
                 and time.time() < deadline:
+            if cancelled():
+                raise IdentityBindingError("cancelled")
             time.sleep(0.05)
+    except IdentityBindingError:
+        raise
     except (OSError, ValueError):
         raise IdentityBindingError("codex_app_server_io_failed")
     finally:
@@ -510,6 +525,12 @@ def codex_app_server_read(home, timeout=None):
             proc.wait(timeout=3)
         except (subprocess.SubprocessError, OSError):
             proc.kill()
+        reader_thread.join(timeout=1)
+        for stream in (stdin, stdout):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
     if 2 not in responses or 3 not in responses:
         raise IdentityBindingError("codex_app_server_no_response")
     for request_id in (2, 3):
@@ -619,7 +640,7 @@ def codex_windows(rate_limits, now, scoped_limits=None):
     return windows
 
 
-def codex_live(home, expected_email=None, now=None):
+def codex_live(home, expected_email=None, now=None, cancel_event=None):
     """Full live Codex read: network-verified identity + real-time windows.
     account_fingerprint/credential come from the local id token (stable);
     email/plan/usage come live from the app-server."""
@@ -633,7 +654,9 @@ def codex_live(home, expected_email=None, now=None):
     claims = decode_jwt_payload((auth.get("tokens") or {}).get("id_token"))
     provider_claims = claims.get("https://api.openai.com/auth") or {}
     account_id = provider_claims.get("chatgpt_account_id") or claims.get("sub")
-    read = codex_app_server_read(home)
+    read = (codex_app_server_read(home)
+            if cancel_event is None
+            else codex_app_server_read(home, cancel_event=cancel_event))
     account = read["account"]
     email = account.get("email") or claims.get("email")
     if not email:
