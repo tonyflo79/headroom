@@ -53,6 +53,16 @@ visible, explicitly stale and never routable. The app restarts a failed frozen
 engine under a separate bounded policy and enters a visible degraded state
 after repeated failures instead of looping indefinitely.
 
+Headroom is also a process-level singleton. A synchronous, owner-checked claim
+binds its private activation channel before Tauri setup, so simultaneous
+launches cannot cross a listener-startup race: every secondary process
+activates the existing dashboard and exits before it can start a frozen engine.
+The first window renders immediately from a fail-closed recovery projection
+while the handshake runs off the UI thread. A two-second sidecar watchdog and
+every bridge command feed one rolling five-minute crash policy with capped ±20
+percent jitter. Three crashes enter `DEGRADED`; Retry engine permits one
+explicit attempt, and only five stable minutes clear the rolling history.
+
 This is still an implementation build, not a production release. Complete
 account management, signing, notarization, updates, and release
 distribution are delivered by the follow-on desktop issues linked from
@@ -69,8 +79,15 @@ Headroom.app
 ```
 
 - Rust starts `headroom-engine` as a Tauri sidecar and owns its lifecycle.
+- Before sidecar setup, the app takes a non-blocking owner-checked file lock and
+  synchronously binds a `0600` Unix-domain activation channel. Secondaries wait
+  only for that bounded startup claim, activate the primary, and exit. A new
+  owner removes a safely owned stale endpoint after force-quit; normal exit
+  removes the live endpoint and releases the kernel lock.
 - Startup has a 12-second bound and requires the exact
   `headroom_desktop_bridge@1` schema, frozen runtime, and required capability.
+- Startup and restart handshakes run on the blocking pool; the native UI stays
+  responsive and fail-closed while the engine starts.
 - Engine stdout is protocol-only. Imported or child-process output is diverted
   to stderr and Rust never logs its contents.
 - Rust owns the current sanitized view, a monotonic revision, and the live
@@ -165,6 +182,10 @@ see `docs/desktop/SURFACE-SYNC-VALIDATION.md`.
 
 For offline, throttled, slow-provider, wake, and frozen-engine recovery
 acceptance, see `docs/desktop/COLLECTION-RESILIENCE-VALIDATION.md`.
+
+For singleton activation, startup, watchdog, crash-loop, manual retry,
+force-quit recovery, and orphan cleanup acceptance, see
+`docs/desktop/LIFECYCLE-VALIDATION.md`.
 
 ## Current limitations
 

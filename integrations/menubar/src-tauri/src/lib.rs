@@ -9,7 +9,8 @@
 #![allow(dead_code)] // Removed when the legacy popover helpers move onto the bridge.
 
 use std::{
-    fs::{self, OpenOptions},
+    collections::VecDeque,
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::TcpStream,
     path::PathBuf,
@@ -36,7 +37,16 @@ use tauri_plugin_shell::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::{
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::{UnixListener, UnixStream},
+        },
+    },
+    thread,
+};
 
 mod icon;
 
@@ -92,16 +102,142 @@ const ENGINE_RESTART_BASE: Duration = Duration::from_secs(2);
 const ENGINE_RESTART_CAP: Duration = Duration::from_secs(60);
 const ENGINE_DEGRADED_COOLDOWN: Duration = Duration::from_secs(300);
 const ENGINE_RESTART_LIMIT: u32 = 3;
+const ENGINE_CRASH_WINDOW: Duration = Duration::from_secs(300);
+const ENGINE_STABLE_RESET: Duration = Duration::from_secs(300);
+const ENGINE_WATCHDOG_TICK: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const SINGLETON_LOCK_PATH: &str = "/tmp/dev_headroom_menubar.lock";
+#[cfg(unix)]
+const SINGLETON_SOCKET_PATH: &str = "/tmp/dev_headroom_menubar.sock";
 
 struct BridgeSession {
     child: CommandChild,
     events: Receiver<CommandEvent>,
 }
 
+#[cfg(unix)]
+struct SingletonPrimary {
+    lock: File,
+    listener: UnixListener,
+    socket_path: PathBuf,
+}
+
+#[cfg(unix)]
+struct SingletonState {
+    _lock: File,
+    socket_path: PathBuf,
+    listener: Mutex<Option<UnixListener>>,
+}
+
+#[cfg(unix)]
+impl Drop for SingletonState {
+    fn drop(&mut self) {
+        self.cleanup_endpoint();
+    }
+}
+
+#[cfg(unix)]
+impl SingletonState {
+    fn cleanup_endpoint(&self) {
+        let _ = remove_owned_stale_socket(&self.socket_path);
+    }
+}
+
+#[cfg(unix)]
+enum SingletonClaim {
+    Primary(SingletonPrimary),
+    Secondary,
+}
+
+#[cfg(unix)]
+fn notify_primary(socket_path: &PathBuf) -> bool {
+    UnixStream::connect(socket_path).is_ok()
+}
+
+#[cfg(unix)]
+fn remove_owned_stale_socket(socket_path: &PathBuf) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("singleton activation endpoint is unavailable".into()),
+    };
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+    {
+        return Err("singleton activation endpoint is not safely owned".into());
+    }
+    fs::remove_file(socket_path)
+        .map_err(|_| "stale singleton activation endpoint could not be removed".to_string())
+}
+
+#[cfg(unix)]
+fn claim_singleton() -> Result<SingletonClaim, String> {
+    let lock_path = PathBuf::from(SINGLETON_LOCK_PATH);
+    let socket_path = PathBuf::from(SINGLETON_SOCKET_PATH);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|_| "singleton lock could not be opened safely".to_string())?;
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| "singleton lock could not be made private".to_string())?;
+    let metadata = lock
+        .metadata()
+        .map_err(|_| "singleton lock metadata is unavailable".to_string())?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err("singleton lock is not safely owned".into());
+    }
+    let claimed = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !claimed {
+        for _ in 0..40 {
+            if notify_primary(&socket_path) {
+                return Ok(SingletonClaim::Secondary);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        return Err("existing Headroom instance did not accept activation".into());
+    }
+    remove_owned_stale_socket(&socket_path)?;
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|_| "singleton activation endpoint could not be created".to_string())?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|_| "singleton activation endpoint could not be made private".to_string())?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| "singleton activation endpoint could not become non-blocking".to_string())?;
+    Ok(SingletonClaim::Primary(SingletonPrimary {
+        lock,
+        listener,
+        socket_path,
+    }))
+}
+
+#[cfg(unix)]
+fn start_singleton_listener(app: &AppHandle, listener: UnixListener) -> Result<(), String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(listener) = tokio::net::UnixListener::from_std(listener) else {
+            eprintln!("headroom-desktop: singleton activation listener could not start");
+            return;
+        };
+        while listener.accept().await.is_ok() {
+            let _ = show_desktop_window(&app, None);
+            request_scheduled_collection(&app, "activation");
+        }
+    });
+    Ok(())
+}
+
 #[derive(Clone)]
 struct DesktopEngine {
     session: Arc<Mutex<Option<BridgeSession>>>,
     recovery: Arc<Mutex<EngineRecoveryPolicy>>,
+    starting: Arc<AtomicBool>,
 }
 
 impl Default for DesktopEngine {
@@ -109,37 +245,84 @@ impl Default for DesktopEngine {
         Self {
             session: Arc::new(Mutex::new(None)),
             recovery: Arc::new(Mutex::new(EngineRecoveryPolicy::default())),
+            starting: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 #[derive(Default)]
 struct EngineRecoveryPolicy {
-    consecutive_failures: u32,
+    crash_times: VecDeque<Instant>,
     retry_at: Option<Instant>,
     degraded: bool,
+    running_since: Option<Instant>,
+    last_failure_code: Option<&'static str>,
 }
 
 impl EngineRecoveryPolicy {
-    fn record_failure(&mut self, now: Instant) {
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        if self.consecutive_failures >= ENGINE_RESTART_LIMIT {
+    fn prune_crashes(&mut self, now: Instant) {
+        while self
+            .crash_times
+            .front()
+            .is_some_and(|seen| now.duration_since(*seen) > ENGINE_CRASH_WINDOW)
+        {
+            self.crash_times.pop_front();
+        }
+    }
+
+    fn record_failure(&mut self, now: Instant, entropy: u64, code: &'static str) -> Duration {
+        self.prune_crashes(now);
+        self.crash_times.push_back(now);
+        self.running_since = None;
+        self.last_failure_code = Some(code);
+        if self.crash_times.len() as u32 >= ENGINE_RESTART_LIMIT {
             self.degraded = true;
             self.retry_at = Some(now + ENGINE_DEGRADED_COOLDOWN);
-            return;
+            return ENGINE_DEGRADED_COOLDOWN;
         }
-        let multiplier = 1u32 << self.consecutive_failures.saturating_sub(1).min(5);
-        self.retry_at = Some(now + (ENGINE_RESTART_BASE * multiplier).min(ENGINE_RESTART_CAP));
+        let exponent = (self.crash_times.len() as u32).saturating_sub(1).min(5);
+        let raw = (ENGINE_RESTART_BASE * (1u32 << exponent)).min(ENGINE_RESTART_CAP);
+        let spread = raw.as_millis() as u64 / 5;
+        let offset = if spread == 0 {
+            0
+        } else {
+            (entropy % (spread * 2 + 1)) as i64 - spread as i64
+        };
+        let millis = (raw.as_millis() as i64 + offset)
+            .clamp(1, ENGINE_RESTART_CAP.as_millis() as i64) as u64;
+        let delay = Duration::from_millis(millis);
+        self.retry_at = Some(now + delay);
+        delay
     }
 
     fn admits_restart(&self, now: Instant) -> bool {
         self.retry_at.is_none_or(|retry_at| now >= retry_at)
     }
 
-    fn record_success(&mut self) {
-        self.consecutive_failures = 0;
+    fn record_started(&mut self, now: Instant) {
+        self.running_since = Some(now);
         self.retry_at = None;
         self.degraded = false;
+    }
+
+    fn record_success(&mut self, now: Instant) {
+        self.retry_at = None;
+        if self
+            .running_since
+            .is_some_and(|started| now.duration_since(started) >= ENGINE_STABLE_RESET)
+        {
+            self.crash_times.clear();
+            self.last_failure_code = None;
+        }
+    }
+
+    fn allow_manual_retry(&mut self) -> bool {
+        if !self.degraded {
+            return false;
+        }
+        self.degraded = false;
+        self.retry_at = None;
+        true
     }
 }
 
@@ -1062,6 +1245,57 @@ fn validate_desktop_bootstrap(
     validate_desktop_view(view)
 }
 
+fn engine_failure_code(error: &str) -> &'static str {
+    match error {
+        "bundled desktop engine startup timed out" => "engine_startup_timeout",
+        "bundled desktop engine stopped during startup" => "engine_startup_exited",
+        "bundled desktop engine did not accept the handshake"
+        | "bundled desktop engine did not accept the discovery request" => {
+            "engine_startup_pipe_failed"
+        }
+        "desktop engine request timed out" => "engine_request_timeout",
+        "desktop engine stopped unexpectedly" => "engine_exited_mid_request",
+        "desktop engine communication failed" => "engine_communication_failed",
+        _ if error.contains("incompatible") || error.contains("required capability") => {
+            "engine_incompatible"
+        }
+        _ => "engine_start_failed",
+    }
+}
+
+fn desktop_startup_handshake() -> serde_json::Value {
+    serde_json::json!({
+        "product": "headroom",
+        "product_version": "starting",
+        "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
+        "architecture": std::env::consts::ARCH,
+        "runtime": "unavailable",
+    })
+}
+
+fn desktop_startup_view() -> serde_json::Value {
+    serde_json::json!({
+        "schema": DESKTOP_VIEW_SCHEMA,
+        "mode": "recovery",
+        "recovery_code": "engine_starting",
+        "accounts": [],
+        "candidates": [],
+        "freshness": {
+            "state": "held", "age_seconds": null,
+            "reason": "engine_starting",
+        },
+        "headline": {
+            "avg_5h_left_percent": null, "avg_7d_left_percent": null,
+            "current_accounts": 0, "total_accounts": 0,
+        },
+        "settings": {
+            "title": "Headroom", "theme": "terminal",
+            "redact_emails": true, "reserve_percent": 0,
+            "auto_handoff": true,
+        },
+    })
+}
+
 fn bootstrap_sidecar(
     app: &AppHandle,
 ) -> Result<(serde_json::Value, serde_json::Value, BridgeSession), String> {
@@ -1263,6 +1497,19 @@ fn push_snapshot_to_windows(app: &AppHandle, snapshot: &DesktopSnapshot) {
     update_desktop_tray_icon(app, &snapshot.view);
 }
 
+fn push_bridge_to_windows(app: &AppHandle, handshake: &serde_json::Value) {
+    let payload = serde_json::to_string(handshake).expect("sanitized bridge handshake serializes");
+    let payload_literal = serde_json::to_string(&payload).expect("bridge string serializes");
+    let script = format!(
+        "window.__headroomApplyBridge&&window.__headroomApplyBridge(JSON.parse({payload_literal}));"
+    );
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+}
+
 fn publish_desktop_view(
     app: &AppHandle,
     view: serde_json::Value,
@@ -1291,7 +1538,7 @@ fn publish_result_view(app: &AppHandle, value: &serde_json::Value) -> Result<(),
     Ok(())
 }
 
-fn ensure_desktop_engine(app: &AppHandle, engine: &DesktopEngine) -> Result<(), String> {
+fn bootstrap_desktop_engine(app: &AppHandle, engine: &DesktopEngine) -> Result<(), String> {
     let missing = engine
         .session
         .lock()
@@ -1314,7 +1561,7 @@ fn ensure_desktop_engine(app: &AppHandle, engine: &DesktopEngine) -> Result<(), 
         }
     }
     match bootstrap_sidecar(app) {
-        Ok((_handshake, view, session)) => {
+        Ok((handshake, view, session)) => {
             let mut guard = engine
                 .session
                 .lock()
@@ -1325,16 +1572,32 @@ fn ensure_desktop_engine(app: &AppHandle, engine: &DesktopEngine) -> Result<(), 
                 let _ = session.child.kill();
             }
             drop(guard);
-            publish_desktop_view(app, view)?;
-            Ok(())
+            if let Ok(mut recovery) = engine.recovery.lock() {
+                recovery.record_started(Instant::now());
+            }
+            push_bridge_to_windows(app, &handshake);
+            publish_desktop_view(app, view).map(|_| ())
         }
         Err(error) => {
             if let Ok(mut recovery) = engine.recovery.lock() {
-                recovery.record_failure(Instant::now());
+                recovery.record_failure(
+                    Instant::now(),
+                    collection_entropy(),
+                    engine_failure_code(&error),
+                );
             }
             Err(error)
         }
     }
+}
+
+fn ensure_desktop_engine(app: &AppHandle, engine: &DesktopEngine) -> Result<(), String> {
+    if engine.starting.swap(true, Ordering::SeqCst) {
+        return Err("desktop engine restart is already running".into());
+    }
+    let outcome = bootstrap_desktop_engine(app, engine);
+    engine.starting.store(false, Ordering::SeqCst);
+    outcome
 }
 
 fn request_desktop_engine(
@@ -1397,7 +1660,7 @@ fn request_desktop_engine(
     match outcome {
         Ok(value) => {
             if let Ok(mut recovery) = engine.recovery.lock() {
-                recovery.record_success();
+                recovery.record_success(Instant::now());
             }
             Ok(value)
         }
@@ -1411,7 +1674,11 @@ fn request_desktop_engine(
                     let _ = session.child.kill();
                 }
                 if let Ok(mut recovery) = engine.recovery.lock() {
-                    recovery.record_failure(Instant::now());
+                    recovery.record_failure(
+                        Instant::now(),
+                        collection_entropy(),
+                        engine_failure_code(&error),
+                    );
                 }
             }
             Err(error)
@@ -1420,13 +1687,45 @@ fn request_desktop_engine(
 }
 
 async fn engine_command(
+    app: AppHandle,
     engine: DesktopEngine,
     command: &'static str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || request_desktop_engine(&engine, command, args))
-        .await
-        .map_err(|_| "desktop engine task failed".to_string())?
+    let worker = engine.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        request_desktop_engine(&worker, command, args)
+    })
+    .await
+    .map_err(|_| "desktop engine task failed".to_string())?;
+    let missing = engine
+        .session
+        .lock()
+        .map(|session| session.is_none())
+        .unwrap_or(true);
+    if result.is_err() && missing && !engine.starting.load(Ordering::SeqCst) {
+        let (state, code, retry) = engine.recovery.lock().map_or(
+            ("degraded", Some("engine_state_unavailable"), None),
+            |policy| {
+                (
+                    if policy.degraded {
+                        "degraded"
+                    } else {
+                        "recovering"
+                    },
+                    policy.last_failure_code,
+                    policy
+                        .retry_at
+                        .and_then(|at| at.checked_duration_since(Instant::now())),
+                )
+            },
+        );
+        set_engine_state_windows(&app, state, code);
+        if state != "degraded" {
+            schedule_engine_restart(app, retry.unwrap_or(Duration::from_millis(100)));
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -1434,7 +1733,13 @@ async fn desktop_discover(
     app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
 ) -> Result<serde_json::Value, String> {
-    let value = engine_command(state.inner().clone(), "discover", serde_json::json!({})).await?;
+    let value = engine_command(
+        app.clone(),
+        state.inner().clone(),
+        "discover",
+        serde_json::json!({}),
+    )
+    .await?;
     publish_result_view(&app, &value)?;
     Ok(value)
 }
@@ -1446,6 +1751,7 @@ async fn desktop_onboarding(
     action: String,
 ) -> Result<serde_json::Value, String> {
     let value = engine_command(
+        app.clone(),
         state.inner().clone(),
         "onboarding",
         serde_json::json!({"action": action}),
@@ -1466,6 +1772,7 @@ async fn desktop_account_action(
     confirmation: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let value = engine_command(
+        app.clone(),
         state.inner().clone(),
         "account_action",
         serde_json::json!({
@@ -1489,6 +1796,7 @@ async fn desktop_adopt(
     name: String,
 ) -> Result<serde_json::Value, String> {
     let value = engine_command(
+        app.clone(),
         state.inner().clone(),
         "adopt",
         serde_json::json!({"candidate_id": candidate_id, "name": name}),
@@ -1506,11 +1814,13 @@ async fn desktop_refresh(app: AppHandle) -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 async fn desktop_start_claude_login(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     name: String,
     expected_email: Option<String>,
 ) -> Result<serde_json::Value, String> {
     engine_command(
+        app,
         state.inner().clone(),
         "start_claude_login",
         serde_json::json!({"name": name, "expected_email": expected_email}),
@@ -1520,11 +1830,13 @@ async fn desktop_start_claude_login(
 
 #[tauri::command]
 async fn desktop_start_codex_login(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     name: String,
     expected_email: Option<String>,
 ) -> Result<serde_json::Value, String> {
     engine_command(
+        app,
         state.inner().clone(),
         "start_codex_login",
         serde_json::json!({"name": name, "expected_email": expected_email}),
@@ -1534,10 +1846,12 @@ async fn desktop_start_codex_login(
 
 #[tauri::command]
 async fn desktop_start_reauthentication(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     name: String,
 ) -> Result<serde_json::Value, String> {
     engine_command(
+        app,
         state.inner().clone(),
         "start_reauthentication",
         serde_json::json!({"name": name}),
@@ -1577,6 +1891,7 @@ async fn desktop_login_status(
     job_id: String,
 ) -> Result<serde_json::Value, String> {
     let value = engine_command(
+        app.clone(),
         state.inner().clone(),
         "login_status",
         serde_json::json!({"job_id": job_id}),
@@ -1593,6 +1908,7 @@ async fn desktop_cancel_login(
     job_id: String,
 ) -> Result<serde_json::Value, String> {
     let value = engine_command(
+        app.clone(),
         state.inner().clone(),
         "cancel_login",
         serde_json::json!({"job_id": job_id}),
@@ -1616,6 +1932,25 @@ fn desktop_set_theme(
 #[tauri::command]
 fn desktop_snapshot(state: tauri::State<'_, DesktopStore>) -> Result<serde_json::Value, String> {
     Ok(snapshot_envelope(&state.snapshot()?))
+}
+
+#[tauri::command]
+fn desktop_retry_engine(app: AppHandle) -> Result<serde_json::Value, String> {
+    let engine = app.state::<DesktopEngine>().inner().clone();
+    let allowed = engine
+        .recovery
+        .lock()
+        .map_err(|_| "desktop engine recovery is unavailable".to_string())?
+        .allow_manual_retry();
+    if !allowed {
+        return Err("desktop engine manual retry is available only in degraded mode".into());
+    }
+    if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
+        policy.retry_at = None;
+    }
+    set_engine_state_windows(&app, "recovering", Some("engine_manual_retry"));
+    start_desktop_engine_async(&app);
+    Ok(snapshot_envelope(&app.state::<DesktopStore>().snapshot()?))
 }
 
 fn show_desktop_window(app: &AppHandle, panel: Option<&str>) -> Result<(), String> {
@@ -1672,21 +2007,26 @@ fn stop_desktop_engine(app: &AppHandle) {
         serde_json::json!({}),
     ));
     let deadline = Instant::now() + Duration::from_secs(6);
+    let mut terminated = false;
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         let next = tauri::async_runtime::block_on(async {
             tokio::time::timeout(remaining, session.events.recv()).await
         });
         match next {
             Ok(Some(CommandEvent::Stdout(frame))) => {
-                if parse_bridge_response(&frame, "desktop-shutdown").is_ok() {
-                    break;
-                }
+                let _ = parse_bridge_response(&frame, "desktop-shutdown");
             }
-            Ok(Some(CommandEvent::Terminated(_))) | Ok(None) | Err(_) => break,
+            Ok(Some(CommandEvent::Terminated(_))) | Ok(None) => {
+                terminated = true;
+                break;
+            }
+            Err(_) => break,
             Ok(Some(_)) => {}
         }
     }
-    let _ = session.child.kill();
+    if !terminated {
+        let _ = session.child.kill();
+    }
 }
 
 fn desktop_average_level(view: &serde_json::Value) -> Option<f32> {
@@ -1720,6 +2060,19 @@ fn set_refresh_state_windows(app: &AppHandle, state: &str) {
     let state = js_string_literal(state);
     let script =
         format!("window.__headroomSetRefreshState&&window.__headroomSetRefreshState({state});");
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+}
+
+fn set_engine_state_windows(app: &AppHandle, state: &str, code: Option<&str>) {
+    let state = js_string_literal(state);
+    let code = code.map(js_string_literal).unwrap_or_else(|| "null".into());
+    let script = format!(
+        "window.__headroomSetRefreshState&&window.__headroomSetRefreshState({state},{code});"
+    );
     for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
         if let Some(window) = app.get_webview_window(label) {
             let _ = window.eval(&script);
@@ -1791,6 +2144,162 @@ fn engine_recovery_state(engine: &DesktopEngine) -> &'static str {
         .unwrap_or("degraded")
 }
 
+fn engine_recovery_status(engine: &DesktopEngine) -> (&'static str, Option<&'static str>) {
+    engine
+        .recovery
+        .lock()
+        .map(|policy| {
+            (
+                if policy.degraded {
+                    "degraded"
+                } else {
+                    "recovering"
+                },
+                policy.last_failure_code,
+            )
+        })
+        .unwrap_or(("degraded", Some("engine_state_unavailable")))
+}
+
+#[cfg(unix)]
+fn sidecar_process_alive(session: &BridgeSession) -> bool {
+    let result = unsafe { libc::kill(session.child.pid() as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn sidecar_process_alive(_session: &BridgeSession) -> bool {
+    true
+}
+
+fn schedule_engine_restart(app: AppHandle, delay: Duration) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(delay).await;
+        start_desktop_engine_async(&app);
+    });
+}
+
+fn start_desktop_engine_async(app: &AppHandle) {
+    let engine = app.state::<DesktopEngine>().inner().clone();
+    let has_session = engine
+        .session
+        .lock()
+        .map(|session| session.is_some())
+        .unwrap_or(false);
+    if has_session
+        || engine
+            .starting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return;
+    }
+    let (_, code) = engine_recovery_status(&engine);
+    set_engine_state_windows(app, "recovering", code);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let bootstrap_app = app.clone();
+        let bootstrap_engine = engine.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            bootstrap_desktop_engine(&bootstrap_app, &bootstrap_engine)
+        })
+        .await
+        .map_err(|_| "desktop engine restart task failed".to_string())
+        .and_then(|result| result);
+        engine.starting.store(false, Ordering::SeqCst);
+        match outcome {
+            Ok(()) => {
+                let enabled = app
+                    .state::<CollectionScheduler>()
+                    .enabled
+                    .load(Ordering::SeqCst);
+                if enabled {
+                    request_scheduled_collection(&app, "engine_restart");
+                } else {
+                    set_refresh_state_windows(&app, "current");
+                }
+            }
+            Err(_) => {
+                let (state, code, retry) = engine.recovery.lock().map_or(
+                    ("degraded", Some("engine_state_unavailable"), None),
+                    |policy| {
+                        (
+                            if policy.degraded {
+                                "degraded"
+                            } else {
+                                "recovering"
+                            },
+                            policy.last_failure_code,
+                            policy.retry_at.and_then(|retry_at| {
+                                retry_at.checked_duration_since(Instant::now())
+                            }),
+                        )
+                    },
+                );
+                set_engine_state_windows(&app, state, code);
+                if state != "degraded" {
+                    schedule_engine_restart(app, retry.unwrap_or(Duration::from_millis(100)));
+                }
+            }
+        }
+    });
+}
+
+fn start_engine_watchdog(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(ENGINE_WATCHDOG_TICK);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let engine = app.state::<DesktopEngine>().inner().clone();
+            let dead = engine
+                .session
+                .lock()
+                .map(|session| {
+                    session
+                        .as_ref()
+                        .is_some_and(|session| !sidecar_process_alive(session))
+                })
+                .unwrap_or(false);
+            if !dead {
+                if let Ok(mut recovery) = engine.recovery.lock() {
+                    recovery.record_success(Instant::now());
+                }
+                continue;
+            }
+            let removed = engine
+                .session
+                .lock()
+                .ok()
+                .and_then(|mut session| session.take())
+                .is_some();
+            if !removed {
+                continue;
+            }
+            let (delay, degraded, code) = engine.recovery.lock().map_or(
+                (
+                    ENGINE_DEGRADED_COOLDOWN,
+                    true,
+                    Some("engine_state_unavailable"),
+                ),
+                |mut policy| {
+                    let delay = policy.record_failure(
+                        Instant::now(),
+                        collection_entropy(),
+                        "engine_unexpected_exit",
+                    );
+                    (delay, policy.degraded, policy.last_failure_code)
+                },
+            );
+            set_engine_state_windows(&app, if degraded { "degraded" } else { "recovering" }, code);
+            if !degraded {
+                schedule_engine_restart(app.clone(), delay);
+            }
+        }
+    });
+}
+
 fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
     let scheduler = app.state::<CollectionScheduler>();
     if !scheduler.enabled.load(Ordering::SeqCst) {
@@ -1809,14 +2318,26 @@ fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
     if trigger == "wake" && recently_current {
         return;
     }
-    if in_backoff && !matches!(trigger, "wake" | "connectivity") {
+    if in_backoff
+        && !matches!(
+            trigger,
+            "wake" | "connectivity" | "engine_restart" | "engine_retry"
+        )
+    {
         set_refresh_state_windows(app, "backoff");
         return;
     }
     if scheduler.running.swap(true, Ordering::SeqCst) {
         return;
     }
-    set_refresh_state_windows(app, "refreshing");
+    set_refresh_state_windows(
+        app,
+        if matches!(trigger, "engine_restart" | "engine_retry") {
+            "recovering"
+        } else {
+            "refreshing"
+        },
+    );
     let app = app.clone();
     let engine = app.state::<DesktopEngine>().inner().clone();
     tauri::async_runtime::spawn(async move {
@@ -1829,11 +2350,19 @@ fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
         .map_err(|_| "desktop engine restart task failed".to_string())
         .and_then(|result| result);
         let result = match ensured {
-            Ok(()) => engine_command(engine.clone(), "refresh", serde_json::json!({})).await,
+            Ok(()) => {
+                engine_command(
+                    app.clone(),
+                    engine.clone(),
+                    "refresh",
+                    serde_json::json!({}),
+                )
+                .await
+            }
             Err(error) => Err(error),
         };
         let now = Instant::now();
-        let settled = match result {
+        let (settled, diagnostic) = match result {
             Ok(view) => {
                 let published = publish_result_view(&app, &view).is_ok();
                 let current_view = view
@@ -1845,15 +2374,15 @@ fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
                     if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
                         policy.record_success(now);
                     }
-                    "current"
+                    ("current", None)
                 } else {
                     if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
                         policy.record_failure(now, collection_entropy());
                     }
                     if offline {
-                        "offline"
+                        ("offline", None)
                     } else {
-                        "backoff"
+                        ("backoff", None)
                     }
                 }
             }
@@ -1861,13 +2390,18 @@ fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
                 if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
                     policy.record_failure(now, collection_entropy());
                 }
-                engine_recovery_state(&engine)
+                let (state, code) = engine_recovery_status(&engine);
+                (state, code)
             }
         };
         app.state::<CollectionScheduler>()
             .running
             .store(false, Ordering::SeqCst);
-        set_refresh_state_windows(&app, settled);
+        if diagnostic.is_some() {
+            set_engine_state_windows(&app, settled, diagnostic);
+        } else {
+            set_refresh_state_windows(&app, settled);
+        }
     });
 }
 
@@ -2124,7 +2658,27 @@ fn restore_window_placement(window: &WebviewWindow) {
 }
 
 pub fn run() {
-    let app = tauri::Builder::default()
+    #[cfg(unix)]
+    let SingletonPrimary {
+        lock,
+        listener,
+        socket_path,
+    } = match claim_singleton() {
+        Ok(SingletonClaim::Primary(primary)) => primary,
+        Ok(SingletonClaim::Secondary) => return,
+        Err(error) => {
+            eprintln!("headroom-desktop: {error}");
+            return;
+        }
+    };
+    let builder = tauri::Builder::default();
+    #[cfg(unix)]
+    let builder = builder.manage(SingletonState {
+        _lock: lock,
+        socket_path,
+        listener: Mutex::new(Some(listener)),
+    });
+    let app = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_positioner::init())
         .manage(DesktopEngine::default())
@@ -2144,21 +2698,31 @@ pub fn run() {
             desktop_cancel_login,
             desktop_open_device_url,
             desktop_snapshot,
+            desktop_retry_engine,
             desktop_set_theme,
             desktop_show_dashboard,
             desktop_show_settings,
             desktop_quit
         ])
         .setup(|app| {
-            let (handshake, view, session) =
-                bootstrap_sidecar(app.handle()).map_err(std::io::Error::other)?;
-            *app.state::<DesktopEngine>()
-                .session
-                .lock()
-                .expect("desktop engine mutex poisoned") = Some(session);
+            #[cfg(unix)]
+            {
+                let listener = app
+                    .state::<SingletonState>()
+                    .listener
+                    .lock()
+                    .map_err(|_| std::io::Error::other("singleton listener is unavailable"))?
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("singleton listener already started"))?;
+                start_singleton_listener(app.handle(), listener).map_err(std::io::Error::other)?;
+            }
+            // Build a safe recovery shell immediately. The frozen handshake
+            // runs on the blocking pool and later replaces this projection;
+            // startup lifecycle work never stalls the main UI thread.
+            let handshake = desktop_startup_handshake();
             let snapshot = app
                 .state::<DesktopStore>()
-                .replace_view(view)
+                .replace_view(desktop_startup_view())
                 .map_err(std::io::Error::other)?;
             let main = build_desktop_window(app.handle(), &handshake, &snapshot)?;
             restore_window_placement(&main);
@@ -2168,6 +2732,8 @@ pub fn run() {
             build_desktop_tray(app.handle())?;
             update_desktop_tray_icon(app.handle(), &snapshot.view);
             start_collection_scheduler(app.handle(), &snapshot);
+            start_engine_watchdog(app.handle());
+            start_desktop_engine_async(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -2236,6 +2802,8 @@ pub fn run() {
         if matches!(&event, tauri::RunEvent::Exit) {
             let _ = save_window_placement(handle);
             stop_desktop_engine(handle);
+            #[cfg(unix)]
+            handle.state::<SingletonState>().cleanup_endpoint();
         }
     });
 }
@@ -2246,6 +2814,26 @@ mod tests {
 
     fn url(raw: &str) -> Url {
         Url::parse(raw).expect("test URL parses")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_singleton_endpoint_cleanup_is_idempotent() {
+        let path = std::env::temp_dir().join(format!(
+            "headroom-singleton-test-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        let _listener = UnixListener::bind(&path).expect("test socket binds");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("test socket permissions update");
+
+        remove_owned_stale_socket(&path).expect("owned test socket is removed");
+        remove_owned_stale_socket(&path).expect("missing test socket is already clean");
+        assert!(!path.exists());
     }
 
     #[test]
@@ -2496,17 +3084,52 @@ mod tests {
     fn repeated_engine_failures_enter_and_leave_bounded_degraded_state() {
         let started = Instant::now();
         let mut policy = EngineRecoveryPolicy::default();
-        policy.record_failure(started);
+        let first = policy.record_failure(started, 0, "engine_startup_exited");
+        assert!(first >= Duration::from_millis(1600));
+        assert!(first <= Duration::from_millis(2400));
         assert!(!policy.degraded);
         assert!(!policy.admits_restart(started));
-        policy.record_failure(started);
-        policy.record_failure(started);
+        policy.record_failure(started, 1, "engine_startup_timeout");
+        policy.record_failure(started, 2, "engine_unexpected_exit");
         assert!(policy.degraded);
+        assert_eq!(policy.last_failure_code, Some("engine_unexpected_exit"));
         assert!(!policy.admits_restart(started));
         assert!(policy.admits_restart(started + ENGINE_DEGRADED_COOLDOWN));
-        policy.record_success();
+        assert!(policy.allow_manual_retry());
+        policy.record_started(started + ENGINE_DEGRADED_COOLDOWN);
+        policy.record_success(started + ENGINE_DEGRADED_COOLDOWN);
         assert!(!policy.degraded);
         assert!(policy.admits_restart(started));
+        assert_eq!(policy.crash_times.len(), 3);
+        policy.record_success(started + ENGINE_DEGRADED_COOLDOWN + ENGINE_STABLE_RESET);
+        assert!(policy.crash_times.is_empty());
+        assert!(policy.last_failure_code.is_none());
+    }
+
+    #[test]
+    fn engine_failures_and_startup_shell_use_stable_fail_closed_contracts() {
+        assert_eq!(
+            engine_failure_code("bundled desktop engine startup timed out"),
+            "engine_startup_timeout"
+        );
+        assert_eq!(
+            engine_failure_code("bundled desktop engine stopped during startup"),
+            "engine_startup_exited"
+        );
+        assert_eq!(
+            engine_failure_code("desktop engine stopped unexpectedly"),
+            "engine_exited_mid_request"
+        );
+        assert_eq!(
+            engine_failure_code("desktop engine request timed out"),
+            "engine_request_timeout"
+        );
+        let view = desktop_startup_view();
+        assert!(validate_desktop_view(&view).is_ok());
+        assert_eq!(view["mode"], "recovery");
+        assert_eq!(view["recovery_code"], "engine_starting");
+        assert!(view["accounts"].as_array().unwrap().is_empty());
+        assert_eq!(desktop_startup_handshake()["runtime"], "unavailable");
     }
 
     #[test]

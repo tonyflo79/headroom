@@ -825,7 +825,9 @@ function demoPanel(invoke, update) {
   return panel;
 }
 
-export function refreshStatePresentation(state) {
+export function refreshStatePresentation(state, diagnosticCode = null) {
+  const code = typeof diagnosticCode === "string" &&
+    /^engine_[a-z0-9_]{1,56}$/.test(diagnosticCode) ? ` · ${diagnosticCode}` : "";
   if (state === "refreshing") return {
     label: "REFRESHING · verified readings remain visible while providers respond",
     busy: true,
@@ -839,18 +841,18 @@ export function refreshStatePresentation(state) {
     busy: false,
   };
   if (state === "recovering") return {
-    label: "RECOVERING · restarting the bundled engine within the bounded policy",
+    label: `RECOVERING · restarting the bundled engine within the bounded policy${code}`,
     busy: true,
   };
   if (state === "degraded") return {
-    label: "DEGRADED · repeated engine failures stopped the restart loop safely",
+    label: `DEGRADED · repeated engine failures stopped the restart loop safely${code}`,
     busy: false,
   };
   return { label: "", busy: false };
 }
 
-function applyRefreshState(state) {
-  const presentation = refreshStatePresentation(state);
+function applyRefreshState(state, diagnosticCode = null) {
+  const presentation = refreshStatePresentation(state, diagnosticCode);
   document.body.dataset.refreshState = state;
   const status = document.getElementById("surface-status");
   if (presentation.label) status.textContent = presentation.label;
@@ -862,9 +864,10 @@ function applyRefreshState(state) {
   }
   const refresh = document.getElementById("refresh");
   refresh.setAttribute("aria-busy", String(presentation.busy));
-  refresh.textContent = presentation.busy ? "Refreshing…" : "Refresh";
+  refresh.textContent = state === "degraded" ? "Retry engine" :
+    presentation.busy ? state === "recovering" ? "Recovering…" : "Refreshing…" : "Refresh";
   refresh.disabled = presentation.busy || !activeInvoke ||
-    activeBootstrap?.view.mode !== "ready";
+    (activeBootstrap?.view.mode !== "ready" && state !== "degraded");
 }
 
 function openAppearancePanel() {
@@ -991,8 +994,10 @@ export function renderBootstrap(raw, invoke = null) {
   const refresh = document.getElementById("refresh");
   refresh.disabled = !invoke || view.mode !== "ready";
   refresh.onclick = invoke ? async () => {
-    applyRefreshState("refreshing");
-    try { await invoke("desktop_refresh"); }
+    const retryEngine = document.body.dataset.refreshState === "degraded";
+    applyRefreshState(retryEngine ? "recovering" : "refreshing",
+      retryEngine ? "engine_manual_retry" : null);
+    try { await invoke(retryEngine ? "desktop_retry_engine" : "desktop_refresh"); }
     catch { applyRefreshState("offline"); }
   } : null;
   return value;
@@ -1007,6 +1012,16 @@ if (typeof document !== "undefined") {
       revision: snapshot.revision,
       theme: snapshot.theme,
       view: snapshot.view,
+    }, activeInvoke);
+  };
+  window.__headroomApplyBridge = (bridge) => {
+    if (!activeBootstrap || !bridge || typeof bridge !== "object") return;
+    renderBootstrap({
+      bridge,
+      surface: activeBootstrap.surface,
+      revision: activeRevision,
+      theme: activeBootstrap.theme,
+      view: activeBootstrap.view,
     }, activeInvoke);
   };
   window.__headroomSetRefreshState = applyRefreshState;
