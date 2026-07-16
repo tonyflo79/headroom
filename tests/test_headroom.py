@@ -2372,11 +2372,13 @@ class DashboardRemovalOrdering(unittest.TestCase):
 
 
 class ActionableClaudeRefresh(unittest.TestCase):
-    def test_expired_claude_token_recommends_manual_refresh(self):
+    def test_expired_keychain_token_never_recommends_refused_refresh(self):
         account = _account("a")
         identity = {"verified": True, "email": "a@example.test",
                     "account_fingerprint": "FP", "method": "local"}
-        with mock.patch.object(collect, "claude_identity", return_value=identity), \
+        with mock.patch.object(collect.sys, "platform", "darwin"), \
+                mock.patch.object(collect.os.path, "isfile", return_value=False), \
+                mock.patch.object(collect, "claude_identity", return_value=identity), \
                 mock.patch.object(collect, "credential_digest", return_value="digest"), \
                 mock.patch.object(collect, "claude_plan", return_value="Max"), \
                 mock.patch.object(collect, "claude_limits", side_effect=
@@ -2384,8 +2386,23 @@ class ActionableClaudeRefresh(unittest.TestCase):
                                       "claude_usage_token_expired")):
             row = collect.collect([account])["accounts"][0]
         self.assertEqual(row["error_code"], "claude_usage_token_expired")
-        self.assertIn("headroom auth refresh a", row["note"])
+        self.assertIn("Keychain-backed macOS login", row["note"])
+        self.assertNotIn("headroom auth refresh", row["note"])
         self.assertNotIn("headroom connect a", row["note"])
+
+    def test_expired_file_token_recommends_transactional_refresh(self):
+        account = _account("a")
+        identity = {"verified": True, "email": "a@example.test",
+                    "account_fingerprint": "FP", "method": "local"}
+        with mock.patch.object(collect.sys, "platform", "linux"), \
+                mock.patch.object(collect, "claude_identity", return_value=identity), \
+                mock.patch.object(collect, "credential_digest", return_value="digest"), \
+                mock.patch.object(collect, "claude_plan", return_value="Max"), \
+                mock.patch.object(collect, "claude_limits", side_effect=
+                                  collect.IdentityBindingError(
+                                      "claude_usage_token_expired")):
+            row = collect.collect([account])["accounts"][0]
+        self.assertIn("headroom auth refresh a", row["note"])
 
 
 if __name__ == "__main__":

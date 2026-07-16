@@ -1317,12 +1317,24 @@ def _collect_accounts_sequential(accounts, backoff=None,
                 what = ("has expired" if error.code.endswith("expired")
                         else "was rejected by the usage API (expired or "
                              "revoked)")
-                result["note"] = (
-                    f"cached Claude token {what} — headroom never refreshes "
-                    "credentials itself. Run one Claude Code turn on this "
-                    "account (the CLI refreshes its token) or `headroom auth "
-                    f"refresh {account['name']}` to re-login; readings held "
-                    "until then.")
+                keychain_backed = (
+                    sys.platform == "darwin"
+                    and not os.path.isfile(os.path.join(
+                        account["home"], ".credentials.json")))
+                if keychain_backed:
+                    result["note"] = (
+                        f"cached Claude token {what} — Headroom never refreshes "
+                        "credentials itself. This is a Keychain-backed macOS login, "
+                        "so Headroom cannot safely roll back an automated re-login. "
+                        "Re-authenticate this slot directly in Claude Code, then "
+                        "refresh Headroom; readings held until then.")
+                else:
+                    result["note"] = (
+                        f"cached Claude token {what} — headroom never refreshes "
+                        "credentials itself. Run one Claude Code turn on this "
+                        "account (the CLI refreshes its token) or `headroom auth "
+                        f"refresh {account['name']}` to re-login; readings held "
+                        "until then.")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
