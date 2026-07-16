@@ -43,11 +43,22 @@ credentials for destructive-path validation.
 
 ## Evidence record
 
-Status: automated contract tests complete; packaged-app run pending
+Status: automated contract tests and isolated packaged-app run complete
 
 | UTC time | Build commit | Scenario | State preserved | Provider home preserved | Result |
 |---|---|---|---|---|---|
-| pending | pending | reserve/reorder/concurrent CLI | pending | yes | pending |
-| pending | pending | rename/recovery/active protections | pending | pending | pending |
-| pending | pending | Claude/Codex re-authentication | pending | pending | pending |
-| pending | pending | confirmed/final-account removal | pending | pending | pending |
+| 2026-07-16 11:29:05Z | `6cad5b0` | reserve/reorder/concurrent CLI | yes | yes | pass |
+| 2026-07-16 11:29:05Z | `6cad5b0` | rename/recovery/active protections | yes | yes | pass |
+| 2026-07-16 11:29:05Z | `6cad5b0` | Claude/Codex re-authentication | yes | yes | pass |
+| 2026-07-16 11:29:05Z | `6cad5b0` | confirmed/final-account removal | yes | yes | pass |
+
+The exact implementation commit was rebuilt as `Headroom.app`, locally sealed
+with an ad-hoc signature, and passed strict deep code-signature verification.
+Production Developer ID signing, notarization, and Gatekeeper verification stay
+owned by desktop issue #19. The packaged run used two isolated fixture homes and
+confirmed terminal-green lifecycle controls through the native Tauri commands,
+restart persistence, zero TCP listeners, exact-confirmation removal, and live
+Claude and Codex fixture re-authentication with quarantine clearing. Automated
+failure-path tests cover wrong or duplicate identity, cancellation, provider
+rejection, exact credential rollback, crash recovery, live lease refusal, and
+incomplete handoff refusal.
