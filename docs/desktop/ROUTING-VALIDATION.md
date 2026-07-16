@@ -88,13 +88,28 @@ Record the implementation commit, exact app and engine hashes, architecture,
 macOS version, test totals, scenario results, installed-terminal coverage,
 absence of TCP listeners, and cleanup state.
 
-Status: implementation complete; exact-package evidence pending.
+Status: complete for implementation commit
+`c80aac96477a589dd840c546642397ed4ad8a6da`.
 
 | UTC time | Build commit | Scenario | Result | Status |
 |---|---|---|---|---|
-| pending | pending | automated routing contracts | pending | pending |
-| pending | pending | exact frozen package | pending | pending |
-| pending | pending | packaged routing preview | pending | pending |
-| pending | pending | quoted copy and controlled launch | pending | pending |
-| pending | pending | stale decision and lease-race refusal | pending | pending |
-| pending | pending | TCP/process/script cleanup | pending | pending |
+| 2026-07-16T15:19:00Z | `c80aac9` | automated routing contracts | 100 focused Python, 21 frontend, and 24 Rust tests passed | pass |
+| 2026-07-16T15:19:00Z | `c80aac9` | exact frozen arm64 package | `routing_launch` advertised; ad-hoc bundle passed strict deep signature verification on macOS 26.5.2 | pass |
+| 2026-07-16T15:19:00Z | `c80aac9` | packaged Midnight routing preview | black/phosphor-green/glow console selected `ready-slot` and explained `reserved-slot` with the frozen engine's bounded semantics | pass |
+| 2026-07-16T15:19:00Z | `c80aac9` | quoted copy and Apple Terminal launch | clipboard matched the engine intent; the controlled provider received zero arguments, the selected home, and leasing enabled; private script self-deleted | pass |
+| 2026-07-16T15:19:00Z | `c80aac9` | stale decision and lease-race refusal | a foreign live lease after preview made Copy refuse with `close_other_session`; clipboard sentinel remained unchanged; frozen launcher exited 2 | pass |
+| 2026-07-16T15:19:00Z | `c80aac9` | TCP/process/script cleanup | app and engine had zero TCP listeners; normal quit left no Headroom process or launch-intent script | pass |
+
+The exact artifact was
+`integrations/menubar/src-tauri/target/release/bundle/macos/Headroom.app`.
+After the local QA signature, the app executable SHA-256 was
+`1f02dadd6c4d822f2935e98e977de344cfce42fb374e215d989fbee75407e88e`
+and the frozen engine SHA-256 was
+`60037737620f00cc487f5e5e368d5b6b9ae8e6be4a8e76558bd2583e33504d55`.
+The signature is ad hoc with no Team ID; Developer ID signing and notarization
+remain release work.
+
+Apple Terminal was installed and passed the full native Open action. iTerm and
+Warp were not installed on this QA Mac, so their exact-package application-open
+branches were not exercised; the shared allowlist and command contract are
+covered by Rust tests.
