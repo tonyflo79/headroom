@@ -299,6 +299,23 @@ export function externalReauthenticationPresentation(account) {
   };
 }
 
+export function externalReauthenticationConfirmation(account, armed = false) {
+  const recovery = externalReauthenticationPresentation(account);
+  if (!recovery) return null;
+  if (!armed) {
+    return {
+      shouldLaunch: false,
+      label: `Confirm ${recovery.label.replace(/^Open /, "")}`,
+      message: `Click again to open ${account.provider} sign-in for ${account.name}.`,
+    };
+  }
+  return {
+    shouldLaunch: true,
+    label: `Opening ${recovery.label.replace(/^Open /, "")}…`,
+    message: `Re-proving ${account.name} before opening provider sign-in…`,
+  };
+}
+
 export function formatAge(seconds) {
   const value = Math.max(0, Math.floor(Number(seconds)));
   if (!Number.isFinite(value)) return "age unknown";
@@ -621,33 +638,40 @@ function renderHandoffHealth(handoff, mode) {
   panel.dataset.level = String(levels[handoff.state] ?? 0);
 }
 
+export function compactAccountWindows(windows) {
+  const source = windows && typeof windows === "object" ? windows : {};
+  const fableKey = Object.keys(source).find(
+    (key) => key.toLowerCase() === "scoped:fable",
+  );
+  return [
+    { label: "5h", value: source["5h"] || null },
+    { label: "week", value: source["7d"] || null },
+    { label: "Fable", value: fableKey ? source[fableKey] : null },
+  ];
+}
+
 function windowRow(label, value) {
   const row = document.createElement("div");
-  row.className = `window-row window-${VALID_STATES.has(value?.state) ? value.state : "held"}`;
-  if (label.startsWith("scoped:")) row.classList.add("model-scoped");
+  row.className = `window-row window-${VALID_STATES.has(value?.state) ? value.state : "empty"}`;
   const line = document.createElement("div");
   line.className = "window-line";
   const name = document.createElement("span");
-  name.textContent = `> ${label.replace("scoped:", "")}`;
+  name.textContent = label;
   const reading = document.createElement("strong");
   const left = percentLeft(value);
+  const capacity = left === null ? "—" : formatPercent(left);
+  reading.textContent = capacity;
   const reset = formatReset(value?.resets_at);
-  const last = Number(value?.last_observed_left_percent);
-  const capacity = left === null
-    ? Number.isFinite(last) ? `${value?.state || "held"} · last ${formatPercent(last)} left`
-      : value?.state || "held"
-    : `${formatPercent(left)} left`;
-  reading.textContent = `${capacity} · ${reset.label}`;
-  if (reset.exact) reading.title = `Exact local reset: ${reset.exact}`;
+  if (reset.exact) reading.title = `${label} reset: ${reset.exact}`;
   line.append(name, reading);
   const meter = document.createElement("div");
   meter.className = "meter";
   meter.setAttribute("role", "meter");
-  meter.setAttribute("aria-label", `${label} capacity`);
+  meter.setAttribute("aria-label", `${label} capacity left`);
   meter.setAttribute("aria-valuemin", "0");
   meter.setAttribute("aria-valuemax", "100");
   if (left !== null) meter.setAttribute("aria-valuenow", String(left));
-  meter.setAttribute("aria-valuetext", capacity);
+  meter.setAttribute("aria-valuetext", left === null ? "not available" : `${capacity} left`);
   const fill = document.createElement("i");
   fill.style.width = `${left ?? 0}%`;
   meter.append(fill);
@@ -665,8 +689,7 @@ function accountCard(account, lifecycle = null, surface = "main") {
   const name = document.createElement("h3");
   name.textContent = account.name;
   const detail = document.createElement("p");
-  detail.textContent = [account.provider, account.identity, account.plan,
-    account.reserved ? "reserved" : null].filter(Boolean).join(" · ");
+  detail.textContent = [account.provider, account.identity].filter(Boolean).join(" · ");
   identity.append(name, detail);
   const state = document.createElement("span");
   state.className = "state";
@@ -674,97 +697,23 @@ function accountCard(account, lifecycle = null, surface = "main") {
   state.textContent = presentation.label;
   state.setAttribute("aria-label", `${presentation.label}: ${presentation.action}`);
   header.append(identity, state);
-  const semantics = document.createElement("p");
-  semantics.className = "account-semantics";
-  semantics.textContent = [
-    presentation.action,
-    account.trust_state ? `trust ${account.trust_state.replaceAll("_", " ")}` : "trust unverified",
-    account.diagnostic_code ? `code ${account.diagnostic_code}` : null,
-  ].filter(Boolean).join(" · ");
   const windows = document.createElement("div");
   windows.className = "windows";
-  for (const [key, value] of Object.entries(account.windows)) {
-    windows.append(windowRow(key, value));
+  for (const item of compactAccountWindows(account.windows)) {
+    windows.append(windowRow(item.label, item.value));
   }
-  article.append(header, semantics, windows);
-  if (account.note) {
-    const note = document.createElement("p");
-    note.className = "note";
-    note.textContent = account.note;
-    article.append(note);
-  }
+  article.append(header, windows);
   if (surface === "main" && lifecycle && account.policy) {
     article.append(accountLifecyclePanel(account, lifecycle));
   }
   return article;
 }
 
-function accountLifecyclePanel(account, { invoke, update, existingNames }) {
+function accountLifecyclePanel(account, { invoke, update }) {
   const details = document.createElement("details");
   details.className = "account-lifecycle";
   const summary = document.createElement("summary");
   summary.textContent = "> manage account";
-  const ownership = document.createElement("p");
-  ownership.className = "ownership-note";
-  ownership.textContent = account.policy.home_kind === "headroom"
-    ? "Headroom-managed home · rename keeps its credential path · removal unregisters only"
-    : "Provider-managed adopted home · Headroom never changes or deletes its credentials";
-  const controls = document.createElement("div");
-  controls.className = "lifecycle-controls";
-  const diagnostic = document.createElement("p");
-  diagnostic.className = "diagnostic lifecycle-diagnostic";
-  diagnostic.setAttribute("aria-live", "polite");
-  const mutate = async (payload) => {
-    diagnostic.textContent = "Applying locked account change…";
-    try {
-      update(await invoke("desktop_account_action", {
-        name: account.name, ...payload,
-      }));
-    } catch {
-      diagnostic.textContent = "Account change was refused or rolled back safely";
-    }
-  };
-
-  controls.append(actionButton(
-    account.reserved ? "Unreserve" : "Reserve",
-    () => mutate({
-      action: account.reserved ? "unreserve" : "reserve",
-      reserved: !account.reserved,
-    }),
-  ));
-  const up = actionButton("Move up", () => mutate({ action: "move_up" }));
-  up.disabled = !account.policy.can_move_up;
-  const down = actionButton("Move down", () => mutate({ action: "move_down" }));
-  down.disabled = !account.policy.can_move_down;
-  controls.append(up, down);
-
-  const rename = document.createElement("form");
-  rename.className = "lifecycle-form";
-  const renameInput = document.createElement("input");
-  renameInput.value = account.name;
-  renameInput.setAttribute("aria-label", `New slot name for ${account.name}`);
-  const renameButton = document.createElement("button");
-  renameButton.type = "submit";
-  renameButton.textContent = "Rename";
-  const validateRename = () => {
-    const names = existingNames.filter((name) => name !== account.name);
-    const error = renameInput.value === account.name
-      ? "Choose a different slot name" : accountNameError(renameInput.value, names);
-    renameInput.setCustomValidity(error || "");
-    renameButton.disabled = Boolean(error);
-    diagnostic.textContent = error || "";
-    return !error;
-  };
-  renameInput.addEventListener("input", validateRename);
-  rename.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    if (validateRename()) {
-      await mutate({ action: "rename", newName: renameInput.value });
-    }
-  });
-  rename.append(renameInput, renameButton);
-  validateRename();
-
   const reauthentication = document.createElement("div");
   reauthentication.className = "reauthentication";
   const reauthDiagnostic = document.createElement("p");
@@ -802,15 +751,23 @@ function accountLifecyclePanel(account, { invoke, update, existingNames }) {
     reauthentication.append(reauth, cancel, device, reauthDiagnostic);
   } else {
     const recovery = externalReauthenticationPresentation(account);
-    reauthDiagnostic.textContent = recovery?.warning ||
-      (account.policy.reauthentication === "keychain_manual"
-        ? "Keychain-backed Claude login is healthy or needs no provider sign-in"
-        : "Provider-managed login is healthy or needs no provider sign-in");
+    reauthDiagnostic.textContent = recovery ? "Login required" : "Login healthy";
     if (recovery) {
+      let confirmationArmed = false;
       const openLogin = actionButton(recovery.label, async () => {
-        if (!window.confirm(recovery.confirmation)) return;
+        const confirmation = externalReauthenticationConfirmation(
+          account, confirmationArmed,
+        );
+        if (!confirmation?.shouldLaunch) {
+          confirmationArmed = true;
+          openLogin.textContent = confirmation?.label || recovery.label;
+          reauthDiagnostic.textContent = confirmation?.message || recovery.warning;
+          return;
+        }
+        confirmationArmed = false;
         openLogin.disabled = true;
-        reauthDiagnostic.textContent = `Re-proving ${account.name} before opening provider sign-in…`;
+        openLogin.textContent = confirmation.label;
+        reauthDiagnostic.textContent = confirmation.message;
         try {
           const outcome = await invoke("desktop_open_external_reauthentication", {
             accountName: account.name,
@@ -821,6 +778,7 @@ function accountLifecyclePanel(account, { invoke, update, existingNames }) {
           reauthDiagnostic.textContent =
             "Provider sign-in was refused because the account no longer requires it or is in use";
         } finally {
+          openLogin.textContent = recovery.label;
           openLogin.disabled = false;
         }
       }, "primary");
@@ -828,37 +786,7 @@ function accountLifecyclePanel(account, { invoke, update, existingNames }) {
     }
     reauthentication.append(reauthDiagnostic);
   }
-
-  const removal = document.createElement("form");
-  removal.className = "lifecycle-form removal-form";
-  const confirmation = document.createElement("input");
-  confirmation.placeholder = `type ${account.name} to confirm`;
-  confirmation.setAttribute("aria-label", `Type ${account.name} to confirm removal`);
-  const remove = document.createElement("button");
-  remove.type = "submit";
-  remove.textContent = "Remove";
-  remove.className = "danger";
-  const validateRemoval = () => {
-    remove.disabled = !account.policy.can_remove || confirmation.value !== account.name;
-  };
-  confirmation.addEventListener("input", validateRemoval);
-  removal.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    validateRemoval();
-    if (!remove.disabled) {
-      await mutate({ action: "remove", confirmation: confirmation.value });
-    }
-  });
-  removal.append(confirmation, remove);
-  validateRemoval();
-  const removalCopy = document.createElement("p");
-  removalCopy.className = "ownership-note";
-  removalCopy.textContent = account.policy.can_remove
-    ? "Removal keeps the provider home and credentials on disk."
-    : "The final connected account cannot be removed.";
-
-  details.append(summary, ownership, controls, rename, reauthentication,
-    removal, removalCopy, diagnostic);
+  details.append(summary, reauthentication);
   return details;
 }
 
@@ -1560,6 +1488,11 @@ export function renderBootstrap(raw, invoke = null) {
     ];
   }
   actions.replaceChildren(...actionCards);
+  const addAccount = document.getElementById("add-account");
+  addAccount.hidden = actionCards.length === 0;
+  addAccount.open = view.mode === "onboarding";
+  addAccount.querySelector("summary").textContent = view.mode === "onboarding"
+    ? "+ finish account setup" : "+ add account";
   configureSurfaceActions(value.surface, invoke);
   configureSettings(value, invoke);
   configureRouting(value, invoke);

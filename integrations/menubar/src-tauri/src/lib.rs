@@ -92,6 +92,12 @@ const DESKTOP_VIEW_SCHEMA: &str = "headroom_desktop_view@1";
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_BRIDGE_FRAME_BYTES: usize = 1024 * 1024;
+const DESKTOP_WINDOW_WIDTH: f64 = 1100.0;
+const DESKTOP_WINDOW_HEIGHT: f64 = 420.0;
+const DESKTOP_WINDOW_MIN_WIDTH: f64 = 760.0;
+const DESKTOP_WINDOW_MIN_HEIGHT: f64 = 360.0;
+const DESKTOP_WINDOW_MAX_WIDTH: f64 = 1200.0;
+const DESKTOP_WINDOW_MAX_HEIGHT: f64 = 440.0;
 const DESKTOP_POPOVER_WIDTH: f64 = 420.0;
 const DESKTOP_POPOVER_HEIGHT: f64 = 680.0;
 const WINDOW_STATE_SCHEMA: &str = "headroom_desktop_window@1";
@@ -2105,8 +2111,9 @@ fn build_desktop_window(
         WebviewUrl::App("index.html".into()),
     )
     .title("Headroom")
-    .inner_size(900.0, 650.0)
-    .min_inner_size(680.0, 480.0)
+    .inner_size(DESKTOP_WINDOW_WIDTH, DESKTOP_WINDOW_HEIGHT)
+    .min_inner_size(DESKTOP_WINDOW_MIN_WIDTH, DESKTOP_WINDOW_MIN_HEIGHT)
+    .max_inner_size(DESKTOP_WINDOW_MAX_WIDTH, DESKTOP_WINDOW_MAX_HEIGHT)
     .resizable(true)
     .visible(visible)
     .initialization_script(&script)
@@ -3619,7 +3626,7 @@ fn valid_window_placement(value: &serde_json::Value) -> Option<WindowPlacement> 
         height: u32::try_from(number("height")?).ok()?,
     };
     ((640..=6000).contains(&placement.width)
-        && (440..=4000).contains(&placement.height)
+        && (320..=4000).contains(&placement.height)
         && (-50_000..=50_000).contains(&placement.x)
         && (-50_000..=50_000).contains(&placement.y))
     .then_some(placement)
@@ -3712,7 +3719,14 @@ fn restore_window_placement(window: &WebviewWindow) {
             })
             .unwrap_or(false)
     });
-    if let Some(placement) = restored {
+    if let Some(mut placement) = restored {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let minimum_width = (DESKTOP_WINDOW_MIN_WIDTH * scale).round() as u32;
+        let maximum_width = (DESKTOP_WINDOW_MAX_WIDTH * scale).round() as u32;
+        let minimum_height = (DESKTOP_WINDOW_MIN_HEIGHT * scale).round() as u32;
+        let maximum_height = (DESKTOP_WINDOW_MAX_HEIGHT * scale).round() as u32;
+        placement.width = placement.width.clamp(minimum_width, maximum_width);
+        placement.height = placement.height.clamp(minimum_height, maximum_height);
         let _ = window.set_size(PhysicalSize::new(placement.width, placement.height));
         let _ = window.set_position(PhysicalPosition::new(placement.x, placement.y));
     }
@@ -3841,8 +3855,8 @@ pub fn run() {
                             let current = placement.get_or_insert(WindowPlacement {
                                 x: position.x,
                                 y: position.y,
-                                width: 900,
-                                height: 650,
+                                width: DESKTOP_WINDOW_WIDTH as u32,
+                                height: DESKTOP_WINDOW_HEIGHT as u32,
                             });
                             current.x = position.x;
                             current.y = position.y;
