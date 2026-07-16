@@ -1,4 +1,5 @@
 const VALID_STATES = new Set(["current", "limited", "held", "stale"]);
+const VALID_MODES = new Set(["ready", "empty", "recovery"]);
 
 export function percentLeft(windowValue) {
   if (!windowValue || windowValue.state !== "current") {
@@ -8,39 +9,65 @@ export function percentLeft(windowValue) {
   return Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
 }
 
+export function refreshPresentation(busy) {
+  return { label: busy ? "Refreshing…" : "Refresh", busy: busy === true };
+}
+
 export function normalizeBootstrap(raw) {
-  if (!raw || typeof raw !== "object") throw new Error("missing desktop bootstrap");
-  if (raw.bridge?.bridge_schema !== "headroom_desktop_bridge@1") {
+  if (!raw || raw.bridge?.bridge_schema !== "headroom_desktop_bridge@1") {
     throw new Error("incompatible desktop engine");
   }
-  const snapshot = raw.snapshot;
-  if (!snapshot || snapshot.schema !== "headroom_widget@1") {
-    throw new Error("invalid sanitized snapshot");
+  const view = raw.view;
+  if (!view || view.schema !== "headroom_desktop_view@1") {
+    throw new Error("invalid sanitized desktop view");
   }
-  const accounts = Array.isArray(snapshot.accounts)
-    ? snapshot.accounts.map((account) => ({
-        name: typeof account.name === "string" ? account.name : "unknown",
-        provider: account.provider === "claude" || account.provider === "codex"
-          ? account.provider
-          : "unknown",
-        state: VALID_STATES.has(account.state) ? account.state : "held",
-        windows: account.windows && typeof account.windows === "object"
-          ? account.windows
-          : {},
-      }))
-    : [];
-  return { bridge: raw.bridge, snapshot: { ...snapshot, accounts } };
+  const accounts = Array.isArray(view.accounts) ? view.accounts.map((account) => ({
+    name: typeof account?.name === "string" ? account.name : "unknown",
+    provider: account?.provider === "claude" || account?.provider === "codex"
+      ? account.provider : "unknown",
+    identity: typeof account?.identity === "string" ? account.identity : null,
+    plan: typeof account?.plan === "string" ? account.plan : "Unknown",
+    note: typeof account?.note === "string" ? account.note : null,
+    reserved: account?.reserved === true,
+    state: VALID_STATES.has(account?.state) ? account.state : "held",
+    windows: account?.windows && typeof account.windows === "object"
+      ? account.windows : {},
+  })) : [];
+  const candidates = Array.isArray(view.candidates) ? view.candidates.filter((row) =>
+    typeof row?.id === "string" && typeof row?.identity === "string" &&
+    (row.provider === "claude" || row.provider === "codex")) : [];
+  return {
+    bridge: raw.bridge,
+    view: { ...view, mode: VALID_MODES.has(view.mode) ? view.mode : "recovery",
+      accounts, candidates },
+  };
 }
 
 function windowRow(label, value) {
   const row = document.createElement("div");
-  row.className = "window-row";
+  row.className = `window-row window-${VALID_STATES.has(value?.state) ? value.state : "held"}`;
+  const line = document.createElement("div");
+  line.className = "window-line";
   const name = document.createElement("span");
-  name.textContent = label;
+  name.textContent = `> ${label.replace("scoped:", "")}`;
   const reading = document.createElement("strong");
   const left = percentLeft(value);
-  reading.textContent = left === null ? value?.state || "held" : `${Math.round(left)}% left`;
-  row.append(name, reading);
+  const reset = Number(value?.resets_at);
+  const resetText = Number.isFinite(reset)
+    ? ` · resets ${new Date(reset * 1000).toLocaleString()}` : "";
+  reading.textContent = `${left === null ? value?.state || "held" : `${Math.round(left)}% left`}${resetText}`;
+  line.append(name, reading);
+  const meter = document.createElement("div");
+  meter.className = "meter";
+  meter.setAttribute("role", "meter");
+  meter.setAttribute("aria-label", `${label} capacity`);
+  meter.setAttribute("aria-valuemin", "0");
+  meter.setAttribute("aria-valuemax", "100");
+  if (left !== null) meter.setAttribute("aria-valuenow", String(left));
+  const fill = document.createElement("i");
+  fill.style.width = `${left ?? 0}%`;
+  meter.append(fill);
+  row.append(line, meter);
   return row;
 }
 
@@ -51,9 +78,10 @@ function accountCard(account) {
   const identity = document.createElement("div");
   const name = document.createElement("h3");
   name.textContent = account.name;
-  const provider = document.createElement("p");
-  provider.textContent = account.provider;
-  identity.append(name, provider);
+  const detail = document.createElement("p");
+  detail.textContent = [account.provider, account.identity, account.plan,
+    account.reserved ? "reserved" : null].filter(Boolean).join(" · ");
+  identity.append(name, detail);
   const state = document.createElement("span");
   state.className = "state";
   state.textContent = account.state;
@@ -61,33 +89,93 @@ function accountCard(account) {
   const windows = document.createElement("div");
   windows.className = "windows";
   for (const [key, value] of Object.entries(account.windows)) {
-    windows.append(windowRow(key.replace("scoped:", ""), value));
+    windows.append(windowRow(key, value));
   }
   article.append(header, windows);
+  if (account.note) {
+    const note = document.createElement("p");
+    note.className = "note";
+    note.textContent = account.note;
+    article.append(note);
+  }
   return article;
 }
 
-export function renderBootstrap(raw) {
+function candidateCard(candidate, invoke, update) {
+  const form = document.createElement("form");
+  form.className = "candidate";
+  const text = document.createElement("span");
+  text.textContent = `${candidate.provider} · ${candidate.identity}`;
+  const input = document.createElement("input");
+  input.required = true;
+  input.pattern = "[a-z0-9][a-z0-9_-]{0,31}";
+  input.value = `${candidate.provider}-1`;
+  input.setAttribute("aria-label", `Slot name for ${candidate.provider}`);
+  const button = document.createElement("button");
+  button.type = "submit";
+  button.textContent = "Adopt";
+  form.append(text, input, button);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    button.disabled = true;
+    button.textContent = "Adopting…";
+    try {
+      update(await invoke("desktop_adopt", {
+        candidateId: candidate.id, name: input.value,
+      }));
+    } catch (error) {
+      button.textContent = String(error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return form;
+}
+
+export function renderBootstrap(raw, invoke = null) {
   const value = normalizeBootstrap(raw);
+  const { view } = value;
   document.getElementById("engine-badge").textContent = value.bridge.runtime;
+  document.body.dataset.savedTheme = view.settings?.theme || "midnight";
+  document.getElementById("page-title").textContent = view.settings?.title || "Headroom";
   document.getElementById("summary").textContent =
     `Engine ${value.bridge.product_version} · ${value.bridge.architecture}`;
-  const average = Number(value.snapshot.headline?.avg_5h_left_percent);
-  document.getElementById("headline").textContent = Number.isFinite(average)
-    ? `${Math.round(average)}% average five-hour headroom`
-    : "No current five-hour reading";
-  const target = document.getElementById("accounts");
-  target.replaceChildren(...value.snapshot.accounts.map(accountCard));
+  const average = typeof view.headline?.avg_5h_left_percent === "number"
+    ? view.headline.avg_5h_left_percent : Number.NaN;
+  document.getElementById("headline").textContent = view.mode === "recovery"
+    ? `Safe recovery required (${view.recovery_code || "unknown"}); no files were changed`
+    : Number.isFinite(average) ? `${Math.round(average)}% average five-hour headroom`
+      : view.mode === "empty" ? "Adopt an existing login to begin" : "No current five-hour reading";
+  document.getElementById("accounts").replaceChildren(...view.accounts.map(accountCard));
+  const actions = document.getElementById("actions");
+  const update = (nextView) => renderBootstrap({ bridge: value.bridge, view: nextView }, invoke);
+  actions.replaceChildren(...(invoke ? view.candidates.map((row) =>
+    candidateCard(row, invoke, update)) : []));
+  const refresh = document.getElementById("refresh");
+  refresh.disabled = !invoke || view.mode !== "ready";
+  refresh.onclick = invoke ? async () => {
+    const pending = refreshPresentation(true);
+    refresh.disabled = pending.busy;
+    refresh.setAttribute("aria-busy", String(pending.busy));
+    refresh.textContent = pending.label;
+    try { update(await invoke("desktop_refresh")); }
+    catch (error) { document.getElementById("headline").textContent = String(error); }
+    finally {
+      const settled = refreshPresentation(false);
+      refresh.textContent = settled.label;
+      refresh.setAttribute("aria-busy", String(settled.busy));
+      refresh.disabled = false;
+    }
+  } : null;
   return value;
 }
 
 if (typeof document !== "undefined") {
   try {
-    renderBootstrap(window.__HEADROOM_BOOTSTRAP__);
+    renderBootstrap(window.__HEADROOM_BOOTSTRAP__, window.__TAURI__?.core?.invoke || null);
   } catch (error) {
     document.getElementById("engine-badge").textContent = "unavailable";
     document.getElementById("summary").textContent = error.message;
-    document.getElementById("headline").textContent =
-      "The desktop engine did not start safely.";
+    document.getElementById("headline").textContent = "The desktop engine did not start safely.";
   }
 }

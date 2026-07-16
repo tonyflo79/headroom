@@ -14,12 +14,185 @@ import platform
 import sys
 import time
 
-from . import __version__, widget
+from . import __version__, collect as collector, connect, paths, registry, widget
 
 
 SCHEMA = "headroom_desktop_bridge@1"
+VIEW_SCHEMA = "headroom_desktop_view@1"
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_REQUEST_ID = 128
+
+
+def _settings(config=None):
+    dashboard = (registry.dashboard_settings(config) if config is not None
+                 else dict(registry.DEFAULT_DASHBOARD))
+    return {
+        "title": dashboard.get("title", "AI Fleet"),
+        "theme": dashboard.get("theme", "midnight"),
+        "redact_emails": dashboard.get("redact_emails", True) is not False,
+        "reserve_percent": (registry.reserve_percent(config)
+                            if config is not None else 0.0),
+        "auto_handoff": (registry.auto_handoff(config)
+                         if config is not None else True),
+    }
+
+
+def _registry_discovery():
+    """Read registry state without creating, repairing, or collecting."""
+    config_path = paths.config_path()
+    if not os.path.exists(config_path):
+        return "missing", None, None
+    raw = paths.load_json(config_path)
+    if raw is None:
+        return "recovery", None, "registry_unreadable"
+    try:
+        return "compatible", registry.validate(raw), None
+    except registry.RegistryError:
+        return "recovery", None, "registry_incompatible"
+
+
+def _candidate_projection(rows, config=None):
+    registered_homes = {
+        registry.expand(row.get("home"))
+        for row in (config or {}).get("accounts", [])
+        if isinstance(row, dict) and isinstance(row.get("home"), str)
+    }
+    result = []
+    for row in rows:
+        provider = row.get("provider") if isinstance(row, dict) else None
+        email = row.get("email") if isinstance(row, dict) else None
+        if provider not in registry.PROVIDERS or not isinstance(email, str):
+            continue
+        if isinstance(row.get("home"), str) \
+                and registry.expand(row["home"]) in registered_homes:
+            continue
+        result.append({
+            "id": "existing-" + provider,
+            "provider": provider,
+            "identity": collector.redact_email(email),
+        })
+    return result
+
+
+def _redacted_identity(value):
+    return collector.redact_email(value) if isinstance(value, str) else None
+
+
+def _held_account(row):
+    """Project a configured slot safely when no public observation exists."""
+    return {
+        "name": row["name"],
+        "provider": row["provider"],
+        "identity": _redacted_identity(row.get("expected_email")),
+        "plan": "Unknown",
+        "note": "No collected reading yet",
+        "trust_state": None,
+        "reserved": row.get("reserved") is True,
+        "state": "held",
+        "windows": {},
+    }
+
+
+def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
+          recovery_code=None, now=None):
+    now = time.time() if now is None else float(now)
+    projected = widget.project(public_snapshot or {}, evaluated_at=now)
+    public_rows = {
+        row.get("name"): row for row in (public_snapshot or {}).get("accounts", [])
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    }
+    configured = {
+        row.get("name"): row for row in (config or {}).get("accounts", [])
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    }
+    accounts = []
+    for row in projected["accounts"]:
+        if config is not None and row["name"] not in configured:
+            continue
+        details = public_rows.get(row["name"], {})
+        entry = dict(row)
+        entry.update({
+            # The desktop boundary always redacts identity, even when the
+            # legacy browser dashboard was configured to publish full email.
+            "identity": _redacted_identity(details.get("email")),
+            "plan": details.get("plan") or "Unknown",
+            "note": details.get("note"),
+            "trust_state": details.get("trust_state"),
+            "reserved": configured.get(row["name"], {}).get("reserved") is True,
+        })
+        accounts.append(entry)
+    projected_names = {row["name"] for row in accounts}
+    for row in configured.values():
+        if row["name"] not in projected_names:
+            accounts.append(_held_account(row))
+    return {
+        "schema": VIEW_SCHEMA,
+        "mode": mode,
+        "settings": _settings(config),
+        "candidates": list(candidates or []),
+        "recovery_code": recovery_code,
+        "freshness": projected["freshness"],
+        "headline": projected["headline"],
+        "accounts": accounts,
+    }
+
+
+def discover_desktop(now=None):
+    state, config, recovery_code = _registry_discovery()
+    if state == "recovery":
+        return _view(None, mode="recovery", recovery_code=recovery_code, now=now)
+    candidates = _candidate_projection(connect.detect_existing(), config)
+    public = paths.load_json(paths.public_snapshot_path()) if config else None
+    mode = "ready" if config else "empty"
+    return _view(config, public, mode=mode, candidates=candidates, now=now)
+
+
+def refresh_desktop(now=None):
+    state, config, recovery_code = _registry_discovery()
+    if state == "recovery":
+        raise BridgeError("recovery_required", recovery_code)
+    if config is None:
+        raise BridgeError("no_accounts", "adopt an account before refreshing")
+    snapshot = collector.run_collect(quiet=True)
+    if not isinstance(snapshot, dict):
+        raise BridgeError("collection_busy", "another collection is running")
+    # Collection can update registry metadata under its own lock. Re-read the
+    # latest compatible state so the view never rolls settings back in memory.
+    config = registry.load()
+    public = collector.public_snapshot(snapshot, redact_emails=True)
+    return _view(config, public, now=now)
+
+
+def adopt_desktop(candidate_id, name, now=None):
+    if candidate_id not in {"existing-claude", "existing-codex"}:
+        raise BridgeError("invalid_candidate", "existing account is invalid")
+    if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
+        raise BridgeError("invalid_account_name", "account name is invalid")
+    state, config, recovery_code = _registry_discovery()
+    if state == "recovery":
+        raise BridgeError("recovery_required", recovery_code)
+    config = config or {
+        "schema_version": 1,
+        "dashboard": dict(registry.DEFAULT_DASHBOARD),
+        "accounts": [],
+    }
+    if any(row.get("name") == name for row in config["accounts"]):
+        raise BridgeError("duplicate_account_name", "account name is already in use")
+    provider = candidate_id.removeprefix("existing-")
+    candidate = next((row for row in connect.detect_existing()
+                      if row.get("provider") == provider), None)
+    if candidate is None:
+        raise BridgeError("candidate_missing", "existing account is no longer available")
+    entry = connect.connect_adopt(
+        config, name, provider, candidate["home"], quiet=True)
+    if entry is None:
+        raise BridgeError("adoption_refused", "existing account could not be adopted")
+    saved = registry.load()
+    adopted = next((row for row in saved["accounts"] if row["name"] == name), None)
+    if adopted is None or adopted["provider"] != provider \
+            or registry.expand(adopted["home"]) != registry.expand(candidate["home"]):
+        raise BridgeError("adoption_conflict", "account registry changed during adoption")
+    return refresh_desktop(now=now)
 
 
 class BridgeError(ValueError):
@@ -105,12 +278,28 @@ def _handle(command, args):
             "bridge_schema": SCHEMA, "bridge_schema_range": [1, 1],
             "state_schema_range": [1, 1], "platform": sys.platform,
             "architecture": platform.machine(),
-            "capabilities": ["fixture_snapshot", "shutdown"],
+            "capabilities": [
+                "fixture_snapshot", "discover", "adopt", "refresh", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
     if command == "fixture_snapshot":
+        if set(args) - {"now"}:
+            raise BridgeError("invalid_args", "fixture arguments are invalid")
         return fixture_snapshot(args.get("now")), False
+    if command == "discover":
+        if set(args) - {"now"}:
+            raise BridgeError("invalid_args", "discover arguments are invalid")
+        return discover_desktop(args.get("now")), False
+    if command == "adopt":
+        if set(args) - {"candidate_id", "name", "now"}:
+            raise BridgeError("invalid_args", "adopt arguments are invalid")
+        return adopt_desktop(args.get("candidate_id"), args.get("name"),
+                             args.get("now")), False
+    if command == "refresh":
+        if set(args) - {"now"}:
+            raise BridgeError("invalid_args", "refresh arguments are invalid")
+        return refresh_desktop(args.get("now")), False
     if command == "shutdown":
         if args:
             raise BridgeError("invalid_args", "shutdown accepts no arguments")

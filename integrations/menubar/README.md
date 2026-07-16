@@ -1,13 +1,18 @@
 # Headroom desktop application
 
 This directory contains Headroom's self-contained Tauri desktop application.
-The first desktop tracer is intentionally narrow: an unsigned macOS app starts
-an architecture-specific bundled engine and renders a deterministic, sanitized
-two-account snapshot in a normal native window. It does not require
-`headroom serve`, a browser, a localhost URL, or a system Python installation.
+The current implementation starts an architecture-specific bundled engine,
+discovers existing Headroom and provider logins without changing them, renders
+sanitized live account state, and can adopt one verified existing login into a
+named slot. It does not require `headroom serve`, a browser, a localhost URL,
+or a system Python installation.
 
-This is an implementation tracer, not a production release. Account setup,
-live collection, menu-bar behavior, signing, notarization, updates, and release
+The dashboard's deliberate visual language is a black terminal canvas with
+phosphor-green monospace text and glowing capacity bars. Limited and uncertain
+states retain distinct red and amber treatments for accessibility.
+
+This is still an implementation build, not a production release. Fresh-login
+setup, complete account management, signing, notarization, updates, and release
 distribution are delivered by the follow-on desktop issues linked from
 [the desktop PRD](https://github.com/tonyflo79/headroom/issues/1).
 
@@ -26,10 +31,16 @@ Headroom.app
   `headroom_desktop_bridge@1` schema, frozen runtime, and required capability.
 - Engine stdout is protocol-only. Imported or child-process output is diverted
   to stderr and Rust never logs its contents.
-- Only the existing sanitized `headroom_widget@1` projection crosses the
-  bridge. Raw credentials and provider payloads do not.
+- The bridge exposes only narrow discover, adopt, and refresh commands. Calls
+  are serialized, bounded, and a timed-out or malformed session is retired so
+  a late frame cannot be mistaken for a later response.
+- Only `headroom_desktop_view@1`, derived from the existing fail-closed widget
+  projection, crosses the bridge. Identity is always email-redacted; credential
+  paths, fingerprints, raw credentials, and provider payloads never cross it.
 - The webview can navigate only to its embedded app document or `about:blank`.
-- The tracer opens no HTTP listener and grants the page no Tauri command API.
+- The page receives only the three desktop commands registered by Rust. It has
+  no shell capability, arbitrary sidecar access, or filesystem capability.
+- The app opens no HTTP listener.
 
 ## Supported development target
 
@@ -53,12 +64,9 @@ From the repository root:
 # Build and smoke-test the architecture-specific frozen engine.
 scripts/build-desktop-sidecar.sh
 
-# Install the pinned packager once if needed.
-cargo install tauri-cli --version 2.11.4 --locked
-
 # Build an unsigned development app.
 cd integrations/menubar
-cargo tauri build --bundles app
+npx --yes @tauri-apps/cli@2.11.4 build --bundles app
 
 # Launch it.
 open src-tauri/target/release/bundle/macos/Headroom.app
@@ -72,7 +80,7 @@ For a faster edit-run loop, build the sidecar first and run:
 
 ```sh
 cd integrations/menubar
-cargo tauri dev
+npx --yes @tauri-apps/cli@2.11.4 dev
 ```
 
 ## Verification
@@ -99,9 +107,11 @@ system `python` process. Quitting Headroom must remove both processes.
 
 ## Current limitations
 
-- The dashboard uses deterministic fixture accounts, not installed accounts.
 - The app is macOS-only and is built for the runner's native architecture.
-- There is no menu-bar popover, account management, launch-at-login, updater,
-  recovery UI, diagnostics export, signing, or notarization yet.
+- It adopts already-authenticated provider homes; creating a new isolated login
+  is a later slice.
+- Recovery is currently a safe read-only state, not a repair workflow.
+- There is no complete account-management UI, launch-at-login, updater,
+  diagnostics export, signing, or notarization yet.
 - The old loopback popover helpers remain in Rust for their security tests but
   are not called by the desktop tracer.

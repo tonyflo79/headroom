@@ -11,22 +11,26 @@
     <main class="shell" aria-labelledby="page-title">
       <header class="masthead">
         <div>
-          <p class="eyebrow">Desktop tracer</p>
+          <p class="eyebrow">HEADROOM // DESKTOP</p>
           <h1 id="page-title">Headroom</h1>
           <p id="summary" class="summary" aria-live="polite">Starting the bundled engine…</p>
         </div>
-        <span id="engine-badge" class="badge">connecting</span>
+        <div class="toolbar">
+          <button id="refresh" type="button" disabled>Refresh</button>
+          <span id="engine-badge" class="badge">connecting</span>
+        </div>
       </header>
 
       <section class="fleet" aria-labelledby="fleet-title">
         <div class="section-heading">
-          <h2 id="fleet-title">AI fleet</h2>
+          <h2 id="fleet-title">$ headroom status</h2>
           <p id="headline">Waiting for a sanitized snapshot</p>
         </div>
+        <div id="actions" class="actions" aria-live="polite"></div>
         <div id="accounts" class="accounts" aria-live="polite"></div>
       </section>
 
-      <footer>Bundled engine · private bridge · no localhost server</footer>
+      <footer>[bundled engine] [private bridge] [no localhost server]</footer>
     </main>
     <script type="module" src="main.js"></script>
   </body>
