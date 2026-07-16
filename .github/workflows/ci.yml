@@ -18,6 +18,7 @@ jobs:
         with:
           version: "0.11.29"
           python-version: "3.13.12"
+          enable-cache: false
       - name: Compile Python sources
         run: uv run --python 3.13.12 python -m compileall -q headroom
       - name: Run the complete engine suite
@@ -34,6 +35,7 @@ jobs:
         with:
           version: "0.11.29"
           python-version: "3.13.12"
+          enable-cache: false
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
@@ -60,7 +62,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent
           integrations/menubar/src-tauri/target/release/bundle/macos/Headroom.app
           Headroom-unsigned-tracer.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Headroom-unsigned-tracer
           path: Headroom-unsigned-tracer.zip
