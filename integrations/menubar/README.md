@@ -30,6 +30,18 @@ account. Rename/removal carry snapshots, cooldowns, and quarantine state
 through a private recoverable intent journal; active leases or incomplete
 handoffs refuse the mutation.
 
+When a held adopted or macOS Keychain-backed slot requires provider
+authentication, its account details expose an explicit provider-login action.
+The webview sends only the account name after a foreground confirmation. The
+engine verifies that the slot is still held for authentication, checks that no
+live lease owns it, and generates a one-use launcher for the configured
+terminal. A fresh frozen engine re-proves those conditions before executing
+the provider's own login command with the registered account home. Provider
+homes, executable paths, credentials, and shell text never cross the webview;
+Keychain-backed sign-in is clearly labeled as provider-managed and not
+rollback-safe. Healthy, offline, leased, or rollback-safe managed slots do not
+offer this external action.
+
 The dashboard's deliberate visual language is a black terminal canvas with
 phosphor-green monospace text and glowing capacity bars. Limited and uncertain
 states retain distinct red and amber treatments for accessibility. Appearance
@@ -146,6 +158,11 @@ Headroom.app
   or path. Rust accepts only the frozen engine's exact launcher schema and one
   of Terminal, iTerm, or Warp; copied commands are recomputed from the same
   validated intent.
+- External provider recovery may send only an engine-authorized account name.
+  Rust accepts an exact three-argument frozen-engine launcher and a single
+  `HEADROOM_DIR` value; provider homes, executables, arbitrary arguments, and
+  extra environment variables are rejected. The recovery launcher never
+  acquires a routing lease and refuses while an existing lease is active.
 - Automatic-handoff health is projected from the same CLI capability contract
   and supervisor notification transitions used by terminal launches. The
   webview receives only the exact `headroom_handoff_health@1` schema and has no

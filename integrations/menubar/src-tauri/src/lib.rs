@@ -101,6 +101,7 @@ const COLLECTION_INTERVAL_MIN_SECONDS: u64 = 60;
 const COLLECTION_INTERVAL_MAX_SECONDS: u64 = 3600;
 const ROUTING_SCHEMA: &str = "headroom_desktop_routing@1";
 const LAUNCH_INTENT_SCHEMA: &str = "headroom_provider_launch_intent@1";
+const REAUTH_LAUNCH_INTENT_SCHEMA: &str = "headroom_provider_reauthentication_intent@1";
 const HANDOFF_HEALTH_SCHEMA: &str = "headroom_handoff_health@1";
 const ROUTING_FAMILIES: &[&str] = &["claude", "opus", "sonnet", "haiku", "fable", "codex"];
 const ROUTING_CODES: &[&str] = &[
@@ -1268,6 +1269,16 @@ struct ValidatedLaunchIntent {
     copy_command: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ValidatedReauthenticationIntent {
+    provider: String,
+    account_name: String,
+    recovery_kind: String,
+    preferred_terminal: String,
+    launcher: Vec<String>,
+    headroom_dir: String,
+}
+
 fn valid_account_name(value: &str) -> bool {
     let bytes = value.as_bytes();
     (1..=32).contains(&bytes.len())
@@ -1293,6 +1304,12 @@ fn launch_command(environment_dir: &str, launcher: &[String]) -> String {
         format!("HEADROOM_DIR={}", shell_quote(environment_dir)),
         "HEADROOM_SLOT_LEASE=1".to_string(),
     ];
+    parts.extend(launcher.iter().map(|value| shell_quote(value)));
+    parts.join(" ")
+}
+
+fn reauthentication_command(environment_dir: &str, launcher: &[String]) -> String {
+    let mut parts = vec![format!("HEADROOM_DIR={}", shell_quote(environment_dir))];
     parts.extend(launcher.iter().map(|value| shell_quote(value)));
     parts.join(" ")
 }
@@ -1742,6 +1759,98 @@ fn validate_launch_intent(value: &serde_json::Value) -> Result<ValidatedLaunchIn
     })
 }
 
+fn validate_reauthentication_intent(
+    value: &serde_json::Value,
+) -> Result<ValidatedReauthenticationIntent, String> {
+    if !object_has_only(
+        value,
+        &[
+            "schema",
+            "provider",
+            "account_name",
+            "recovery_kind",
+            "preferred_terminal",
+            "launcher",
+            "environment",
+        ],
+    ) {
+        return Err("provider reauthentication intent contains unknown fields".into());
+    }
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(REAUTH_LAUNCH_INTENT_SCHEMA)
+    {
+        return Err("desktop engine returned an invalid reauthentication intent".into());
+    }
+    let provider = value
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .filter(|provider| matches!(*provider, "claude" | "codex"))
+        .ok_or_else(|| "reauthentication provider is invalid".to_string())?;
+    let account_name = value
+        .get("account_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| valid_account_name(name))
+        .ok_or_else(|| "reauthentication account is invalid".to_string())?;
+    let recovery_kind = value
+        .get("recovery_kind")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| matches!(*kind, "keychain_manual" | "provider_managed"))
+        .ok_or_else(|| "reauthentication recovery kind is invalid".to_string())?;
+    if recovery_kind == "keychain_manual" && provider != "claude" {
+        return Err("reauthentication recovery kind and provider disagree".into());
+    }
+    let preferred_terminal = value
+        .get("preferred_terminal")
+        .and_then(serde_json::Value::as_str)
+        .filter(|terminal| matches!(*terminal, "terminal" | "iterm" | "warp"))
+        .ok_or_else(|| "preferred terminal is invalid".to_string())?;
+    let launcher = value
+        .get("launcher")
+        .and_then(serde_json::Value::as_array)
+        .filter(|argv| argv.len() == 3)
+        .ok_or_else(|| "reauthentication launcher is invalid".to_string())?
+        .iter()
+        .map(|part| {
+            part.as_str()
+                .filter(|part| !part.is_empty() && part.len() <= 4096 && !part.contains('\0'))
+                .map(str::to_string)
+                .ok_or_else(|| "reauthentication launcher argument is invalid".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let launcher_path = std::path::Path::new(&launcher[0]);
+    let launcher_name = launcher_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !launcher_path.is_absolute()
+        || !launcher_name.starts_with("headroom-engine")
+        || !executable_file(launcher_path)
+        || launcher[1] != "--launch-reauthentication"
+        || launcher[2] != account_name
+    {
+        return Err("reauthentication launcher is not the bundled engine".into());
+    }
+    let environment = value
+        .get("environment")
+        .and_then(serde_json::Value::as_object)
+        .filter(|environment| environment.len() == 1)
+        .ok_or_else(|| "reauthentication environment is invalid".to_string())?;
+    let headroom_dir = environment
+        .get("HEADROOM_DIR")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| {
+            std::path::Path::new(path).is_absolute() && path.len() <= 4096 && !path.contains('\0')
+        })
+        .ok_or_else(|| "reauthentication state root is invalid".to_string())?;
+    Ok(ValidatedReauthenticationIntent {
+        provider: provider.to_string(),
+        account_name: account_name.to_string(),
+        recovery_kind: recovery_kind.to_string(),
+        preferred_terminal: preferred_terminal.to_string(),
+        launcher,
+        headroom_dir: headroom_dir.to_string(),
+    })
+}
+
 fn validate_desktop_view(view: &serde_json::Value) -> Result<(), String> {
     if view.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_VIEW_SCHEMA)
         || !view
@@ -1792,6 +1901,7 @@ fn validate_desktop_bootstrap(
                 "resilient_collection",
                 "validated_settings",
                 "routing_launch",
+                "provider_reauthentication_launch",
                 "handoff_health",
             ]
             .iter()
@@ -2630,6 +2740,24 @@ async fn routing_launch_intent(
     validate_launch_intent(&value)
 }
 
+async fn external_reauthentication_intent(
+    app: AppHandle,
+    engine: DesktopEngine,
+    account_name: String,
+) -> Result<ValidatedReauthenticationIntent, String> {
+    if !valid_account_name(&account_name) {
+        return Err("reauthentication request is invalid".into());
+    }
+    let value = engine_command(
+        app,
+        engine,
+        "external_reauthentication_intent",
+        serde_json::json!({"account_name": account_name}),
+    )
+    .await?;
+    validate_reauthentication_intent(&value)
+}
+
 #[tauri::command]
 async fn desktop_routing_preview(
     app: AppHandle,
@@ -2722,6 +2850,40 @@ fn write_terminal_launch_script(
     Ok(path)
 }
 
+fn write_reauthentication_launch_script(
+    app: &AppHandle,
+    intent: &ValidatedReauthenticationIntent,
+) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|_| "provider login cache is unavailable".to_string())?
+        .join("launch-intents");
+    fs::create_dir_all(&directory)
+        .map_err(|_| "provider login cache could not be prepared".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "provider login cache permissions could not be set".to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = directory.join(format!("login-{}-{nonce}.command", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o700);
+    let mut file = options
+        .open(&path)
+        .map_err(|_| "provider login script could not be created".to_string())?;
+    let command = reauthentication_command(&intent.headroom_dir, &intent.launcher);
+    writeln!(file, "#!/bin/zsh\nrm -f -- \"$0\"\n{command}")
+        .map_err(|_| "provider login script could not be written".to_string())?;
+    file.sync_all()
+        .map_err(|_| "provider login script could not be committed".to_string())?;
+    Ok(path)
+}
+
 fn open_launch_script(path: &std::path::Path, terminal: &str) -> Result<(), String> {
     let application = match terminal {
         "terminal" => "Terminal",
@@ -2762,6 +2924,28 @@ async fn desktop_open_routing_launch(
         "status": "opened",
         "account_name": intent.account_name,
         "provider": intent.provider,
+        "terminal": intent.preferred_terminal,
+    }))
+}
+
+#[tauri::command]
+async fn desktop_open_external_reauthentication(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+    account_name: String,
+) -> Result<serde_json::Value, String> {
+    let intent =
+        external_reauthentication_intent(app.clone(), state.inner().clone(), account_name).await?;
+    let script = write_reauthentication_launch_script(&app, &intent)?;
+    if let Err(error) = open_launch_script(&script, &intent.preferred_terminal) {
+        let _ = fs::remove_file(script);
+        return Err(error);
+    }
+    Ok(serde_json::json!({
+        "status": "opened",
+        "account_name": intent.account_name,
+        "provider": intent.provider,
+        "recovery_kind": intent.recovery_kind,
         "terminal": intent.preferred_terminal,
     }))
 }
@@ -3607,6 +3791,7 @@ pub fn run() {
             desktop_routing_preview,
             desktop_copy_routing_command,
             desktop_open_routing_launch,
+            desktop_open_external_reauthentication,
             desktop_launch_at_login_status,
             desktop_set_launch_at_login,
             desktop_show_dashboard,
@@ -3916,6 +4101,7 @@ mod tests {
             "resilient_collection",
             "validated_settings",
             "routing_launch",
+            "provider_reauthentication_launch",
             "handoff_health",
         ];
         let compatible = serde_json::json!({
@@ -4275,6 +4461,62 @@ mod tests {
         let mut wrong_copy = intent;
         wrong_copy["copy_command"] = serde_json::json!("echo unsafe");
         assert!(validate_launch_intent(&wrong_copy).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reauthentication_intent_exposes_no_home_or_arbitrary_command() {
+        let directory = std::env::temp_dir().join(format!(
+            "headroom-reauth-intent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("test directory exists");
+        let launcher_path = directory.join("headroom-engine-test");
+        fs::write(&launcher_path, b"#!/bin/sh\nexit 0\n").expect("test executable writes");
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o700))
+            .expect("test executable permissions update");
+        let launcher = vec![
+            launcher_path.to_string_lossy().into_owned(),
+            "--launch-reauthentication".into(),
+            "claude-held".into(),
+        ];
+        let intent = serde_json::json!({
+            "schema": REAUTH_LAUNCH_INTENT_SCHEMA,
+            "provider": "claude",
+            "account_name": "claude-held",
+            "recovery_kind": "keychain_manual",
+            "preferred_terminal": "terminal",
+            "launcher": launcher,
+            "environment": {"HEADROOM_DIR": directory},
+        });
+        let validated = validate_reauthentication_intent(&intent).expect("intent is valid");
+        assert_eq!(validated.account_name, "claude-held");
+        assert_eq!(validated.recovery_kind, "keychain_manual");
+        assert!(
+            !reauthentication_command(&validated.headroom_dir, &validated.launcher)
+                .contains("HEADROOM_SLOT_LEASE")
+        );
+
+        let mut arbitrary = intent.clone();
+        arbitrary["command"] = serde_json::json!("touch /tmp/owned");
+        assert!(validate_reauthentication_intent(&arbitrary).is_err());
+        let mut home = intent.clone();
+        home["home"] = serde_json::json!("/private/provider/home");
+        assert!(validate_reauthentication_intent(&home).is_err());
+        let mut wrong_launcher = intent.clone();
+        wrong_launcher["launcher"][1] = serde_json::json!("--launch-provider");
+        assert!(validate_reauthentication_intent(&wrong_launcher).is_err());
+        let mut extra_environment = intent.clone();
+        extra_environment["environment"]["HEADROOM_SLOT_LEASE"] = serde_json::json!("1");
+        assert!(validate_reauthentication_intent(&extra_environment).is_err());
+        let mut invalid_kind = intent;
+        invalid_kind["provider"] = serde_json::json!("codex");
+        assert!(validate_reauthentication_intent(&invalid_kind).is_err());
         let _ = fs::remove_dir_all(directory);
     }
 

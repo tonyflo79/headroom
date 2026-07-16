@@ -31,6 +31,7 @@ ONBOARDING_SCHEMA = "headroom_desktop_onboarding@1"
 ONBOARDING_STEPS = {"welcome", "providers", "accounts", "demo", "complete"}
 ROUTING_SCHEMA = "headroom_desktop_routing@1"
 LAUNCH_INTENT_SCHEMA = "headroom_provider_launch_intent@1"
+REAUTH_LAUNCH_INTENT_SCHEMA = "headroom_provider_reauthentication_intent@1"
 HANDOFF_HEALTH_SCHEMA = "headroom_handoff_health@1"
 DESKTOP_FAMILIES = ("claude", "opus", "sonnet", "haiku", "fable", "codex")
 MAX_FRAME_BYTES = 1024 * 1024
@@ -317,6 +318,7 @@ def _held_account(row, policy=None):
         "trust_state": None,
         "reserved": row.get("reserved") is True,
         "policy": policy,
+        "recovery_action": None,
         "state": "held",
         "windows": {},
     }
@@ -359,6 +361,16 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
             "reserved": configured.get(row["name"], {}).get("reserved") is True,
             "policy": policies.get(row["name"]),
         })
+        policy = entry["policy"] or {}
+        reason_action = (_routing_reason_projection(entry["note"])[2]
+                         if entry["note"] else None)
+        entry["recovery_action"] = (
+            "external_reauthentication"
+            if entry.get("state") == "held"
+            and policy.get("reauthentication") in {
+                "keychain_manual", "provider_managed"}
+            and reason_action == "reauthenticate_account"
+            else None)
         projected_accounts[row["name"]] = entry
     # A snapshot records observation order, not routing preference. Always
     # render configured slots in registry order so a move is reflected in the
@@ -845,6 +857,110 @@ def launch_selected_provider(family, account_name):
         [intent["provider_executable"]], launch_note="desktop launch intent")
 
 
+def _external_reauthentication_target(account_name):
+    if not isinstance(account_name, str) \
+            or not registry.NAME_RE.fullmatch(account_name):
+        raise BridgeError("invalid_account_name", "account name is invalid")
+    state, config, recovery_code = _registry_discovery()
+    if state == "recovery":
+        raise BridgeError("recovery_required", recovery_code)
+    accounts = (config or {}).get("accounts", [])
+    match = next(((index, row) for index, row in enumerate(accounts)
+                  if row.get("name") == account_name), None)
+    if match is None:
+        raise BridgeError("account_missing", "account no longer exists")
+    index, account = match
+    policy = account_lifecycle.account_policy(account, index, len(accounts))
+    recovery_kind = policy["reauthentication"]
+    if recovery_kind == "available":
+        raise BridgeError(
+            "managed_reauthentication_available",
+            "this account has a rollback-safe in-app reauthentication flow")
+    if recovery_kind not in {"keychain_manual", "provider_managed"}:
+        raise BridgeError(
+            "external_reauthentication_unavailable",
+            "this account cannot be reauthenticated externally")
+    view = discover_desktop()
+    projected = next((row for row in view.get("accounts", [])
+                      if row.get("name") == account_name), None)
+    if projected is None or projected.get("state") != "held" \
+            or projected.get("recovery_action") != "external_reauthentication":
+        raise BridgeError(
+            "reauthentication_not_required",
+            "this account does not currently require provider authentication")
+    try:
+        leased = route.slot_lease_active(account_name)
+    except Exception as error:  # noqa: BLE001 - protective state fails closed
+        raise BridgeError(
+            "routing_infrastructure_unavailable",
+            "account lease state could not be verified") from error
+    if leased:
+        raise BridgeError(
+            "account_in_use",
+            "close the live provider session before reauthenticating this account")
+    executable = connect.provider_binary(account["provider"])
+    if executable is None:
+        raise BridgeError("provider_cli_missing", "provider CLI is unavailable")
+    executable = os.path.realpath(executable)
+    if not os.path.isabs(executable) or not os.path.isfile(executable) \
+            or not os.access(executable, os.X_OK):
+        raise BridgeError("provider_cli_missing", "provider CLI is unavailable")
+    return account, recovery_kind, executable
+
+
+def external_reauthentication_intent_desktop(account_name):
+    """Return a bounded provider-login intent for a held external slot.
+
+    The webview receives neither the provider home nor executable. A fresh
+    frozen engine process re-proves the account and execs the provider-owned
+    login command after the user explicitly opens it in a terminal.
+    """
+    account, recovery_kind, _executable = _external_reauthentication_target(
+        account_name)
+    if getattr(sys, "frozen", False):
+        launcher = [os.path.realpath(sys.executable),
+                    "--launch-reauthentication", account_name]
+    else:
+        launcher = [os.path.realpath(sys.executable), "-m",
+                    "headroom.desktop_bridge", "--launch-reauthentication",
+                    account_name]
+    return {
+        "schema": REAUTH_LAUNCH_INTENT_SCHEMA,
+        "provider": account["provider"],
+        "account_name": account_name,
+        "recovery_kind": recovery_kind,
+        "preferred_terminal": registry.desktop_settings()["preferred_terminal"],
+        "launcher": launcher,
+        "environment": {"HEADROOM_DIR": paths.base_dir()},
+    }
+
+
+def launch_external_reauthentication(account_name):
+    """Frozen terminal entry: re-prove and exec one provider login command."""
+    intent = external_reauthentication_intent_desktop(account_name)
+    config = registry.load()
+    account = next((row for row in config["accounts"]
+                    if row.get("name") == account_name), None)
+    if account is None or account.get("provider") != intent["provider"]:
+        raise BridgeError("account_missing", "account no longer exists")
+    executable = connect.provider_binary(account["provider"])
+    if executable is None:
+        raise BridgeError("provider_cli_missing", "provider CLI is unavailable")
+    executable = os.path.realpath(executable)
+    if not os.path.isabs(executable) or not os.path.isfile(executable) \
+            or not os.access(executable, os.X_OK):
+        raise BridgeError("provider_cli_missing", "provider CLI is unavailable")
+    environment = collector.scrubbed_env()
+    environment["HEADROOM_DIR"] = paths.base_dir()
+    environment.pop("HEADROOM_SLOT_LEASE", None)
+    home_key = "CLAUDE_CONFIG_DIR" if account["provider"] == "claude" \
+        else "CODEX_HOME"
+    environment[home_key] = registry.expand(account["home"])
+    argv = connect.login_argv(account["provider"], executable)
+    os.execve(executable, argv, environment)
+    return 2
+
+
 def account_action_desktop(action, name, *, new_name=None,
                            reserved=None, confirmation=None, now=None):
     if action not in {
@@ -1167,7 +1283,8 @@ def _handle(command, args):
                 "claude_login", "codex_device_login", "onboarding",
                 "account_lifecycle", "reauthentication",
                 "resilient_collection", "validated_settings",
-                "routing_launch", "handoff_health", "shutdown"],
+                "routing_launch", "provider_reauthentication_launch",
+                "handoff_health", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
@@ -1214,6 +1331,12 @@ def _handle(command, args):
             raise BridgeError("invalid_args", "launch intent arguments are invalid")
         return routing_launch_intent_desktop(
             args.get("family"), args.get("account_name")), False
+    if command == "external_reauthentication_intent":
+        if set(args) != {"account_name"}:
+            raise BridgeError(
+                "invalid_args", "reauthentication intent arguments are invalid")
+        return external_reauthentication_intent_desktop(
+            args.get("account_name")), False
     if command == "start_claude_login":
         if set(args) - {"name", "expected_email"}:
             raise BridgeError("invalid_args", "login arguments are invalid")
@@ -1304,6 +1427,16 @@ def cli_main(argv=None):
                 return 2
             except Exception:  # noqa: BLE001 - terminal sees stable diagnostics only
                 print("headroom: provider launch failed safely", file=sys.stderr)
+                return 2
+        if len(argv) == 2 and argv[0] == "--launch-reauthentication":
+            try:
+                return launch_external_reauthentication(argv[1])
+            except BridgeError as error:
+                print(f"headroom: reauthentication refused ({error.code})",
+                      file=sys.stderr)
+                return 2
+            except Exception:  # noqa: BLE001 - stable terminal diagnostic only
+                print("headroom: reauthentication failed safely", file=sys.stderr)
                 return 2
         print("headroom: unsupported desktop engine arguments", file=sys.stderr)
         return 2

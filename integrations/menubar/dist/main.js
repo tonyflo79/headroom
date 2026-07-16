@@ -5,6 +5,7 @@ const ONBOARDING_STEPS = new Set(["welcome", "providers", "accounts", "demo", "c
 const PROVIDER_STATES = new Set(["unchecked", "ready", "missing", "upgrade_required"]);
 const HOME_KINDS = new Set(["headroom", "adopted"]);
 const REAUTH_STATES = new Set(["available", "provider_managed", "keychain_manual"]);
+const RECOVERY_ACTIONS = new Set(["external_reauthentication"]);
 const VALID_THEMES = new Set(["midnight", "minimal", "chrome", "paper", "terminal"]);
 const VALID_TERMINALS = new Set(["terminal", "iterm", "warp"]);
 const VALID_SURFACES = new Set(["main", "popover"]);
@@ -282,6 +283,22 @@ export function accountStatePresentation(account) {
   };
 }
 
+export function externalReauthenticationPresentation(account) {
+  if (account?.recovery_action !== "external_reauthentication" ||
+      account?.state !== "held" || !account?.policy ||
+      !["keychain_manual", "provider_managed"].includes(
+        account.policy.reauthentication)) return null;
+  const provider = account.provider === "codex" ? "Codex" : "Claude";
+  const keychain = account.policy.reauthentication === "keychain_manual";
+  return {
+    label: `Open ${provider} login`,
+    warning: keychain
+      ? "Keychain-backed macOS login · provider sign-in cannot be rolled back by Headroom"
+      : "Provider-managed login · Headroom will not modify or copy its credentials",
+    confirmation: `Open ${provider} sign-in for ${account.name}? Complete only the provider-owned login, then return to Headroom and refresh.`,
+  };
+}
+
 export function formatAge(seconds) {
   const value = Math.max(0, Math.floor(Number(seconds)));
   if (!Number.isFinite(value)) return "age unknown";
@@ -463,6 +480,8 @@ export function normalizeBootstrap(raw) {
       trust_state: TRUST_STATES.has(account?.trust_state) ? account.trust_state : null,
       reserved: account?.reserved === true,
       policy,
+      recovery_action: RECOVERY_ACTIONS.has(account?.recovery_action)
+        ? account.recovery_action : null,
       state: VALID_STATES.has(account?.state) ? account.state : "held",
       windows,
     };
@@ -782,9 +801,31 @@ function accountLifecyclePanel(account, { invoke, update, existingNames }) {
     cancel.hidden = true;
     reauthentication.append(reauth, cancel, device, reauthDiagnostic);
   } else {
-    reauthDiagnostic.textContent = account.policy.reauthentication === "keychain_manual"
-      ? "Keychain-backed Claude login: re-authenticate in Claude, then refresh here"
-      : "Adopted home: re-authenticate in the provider that owns this login";
+    const recovery = externalReauthenticationPresentation(account);
+    reauthDiagnostic.textContent = recovery?.warning ||
+      (account.policy.reauthentication === "keychain_manual"
+        ? "Keychain-backed Claude login is healthy or needs no provider sign-in"
+        : "Provider-managed login is healthy or needs no provider sign-in");
+    if (recovery) {
+      const openLogin = actionButton(recovery.label, async () => {
+        if (!window.confirm(recovery.confirmation)) return;
+        openLogin.disabled = true;
+        reauthDiagnostic.textContent = `Re-proving ${account.name} before opening provider sign-in…`;
+        try {
+          const outcome = await invoke("desktop_open_external_reauthentication", {
+            accountName: account.name,
+          });
+          reauthDiagnostic.textContent =
+            `${outcome.terminal} opened for ${outcome.provider} sign-in on ${outcome.account_name}. Complete sign-in, then Refresh.`;
+        } catch {
+          reauthDiagnostic.textContent =
+            "Provider sign-in was refused because the account no longer requires it or is in use";
+        } finally {
+          openLogin.disabled = false;
+        }
+      }, "primary");
+      reauthentication.append(openLogin);
+    }
     reauthentication.append(reauthDiagnostic);
   }
 
