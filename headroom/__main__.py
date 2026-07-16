@@ -259,6 +259,17 @@ def _dispatch_launch(command, args, fam, fallback, use_supervisor,
     return route.cmd_exec(fam, [command] + args, launch_note=launch_note)
 
 
+def capability_contract():
+    """Command-scoped engine capabilities shared by CLI and desktop.
+
+    Keep this probe fail-safe and side-effect free: launchers and the desktop
+    bridge use it to avoid claiming supervision support from configuration or
+    presentation code alone.
+    """
+    from . import capabilities
+    return capabilities.contract()
+
+
 def _dispatch(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
@@ -287,29 +298,7 @@ def _dispatch(argv):
         # reason we still emit the declared capabilities of this build. (P2-6)
         import json
 
-        has_marker = has_fallback = has_lease = has_notify = True
-        try:
-            from . import notify, route
-            has_marker = callable(getattr(route, "write_launch_marker", None))
-            has_fallback = callable(getattr(route, "bare_fallback_exec", None))
-            has_lease = callable(getattr(route, "acquire_slot_lease", None))
-            has_notify = callable(getattr(notify, "emit", None))
-        except Exception:  # noqa: BLE001 — caps must never fail to emit
-            pass
-        capabilities = {
-            "schema": 2,
-            "launch_marker": {"claude": has_marker, "codex": has_marker},
-            "launch_fallback": {"claude": has_fallback,
-                                "codex": has_fallback, "run": False},
-            "notify_cmd": has_notify,
-            "slot_lease": {"claude": has_lease, "codex": has_lease,
-                           "run": False,
-                           # fail-closed acquisition (P1-9): with
-                           # HEADROOM_SLOT_LEASE=1 headroom refuses rather than
-                           # silently launching unleased
-                           "fail_closed": has_lease},
-        }
-        print(json.dumps(capabilities, sort_keys=True))
+        print(json.dumps(capability_contract(), sort_keys=True))
         return 0
     if command == "setup":
         from . import wizard

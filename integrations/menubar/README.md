@@ -87,6 +87,14 @@ re-proves it a final time, acquires the account lease, and refuses instead of
 silently switching slots if anything changed. The terminal-style black,
 phosphor-green, and glowing-bar treatment remains the default Midnight theme.
 
+The dashboard and menu-bar popover also show an engine-authoritative
+automatic-handoff health console. It distinguishes configured, unavailable,
+downgraded, armed, supervision-lost, and loop-guard states using bounded
+sanitized supervisor events; process identifiers, supervisor identifiers,
+paths, raw reasons, and provider output never cross the bridge. The setting is
+explicitly next-launch-only. Saving it cannot signal, kill, recover, or alter
+an already running provider child.
+
 This is still an implementation build, not a production release. Complete
 account management, signing, notarization, updates, and release
 distribution are delivered by the follow-on desktop issues linked from
@@ -118,7 +126,8 @@ Headroom.app
   theme. Both webviews receive the same immutable snapshot envelope; stale or
   duplicate revisions and stale command responses are ignored.
 - The bridge exposes only narrow onboarding, account, refresh, login-job,
-  validated-settings, routing-preview, and app-owned launch-intent commands.
+  validated-settings, routing-preview, app-owned launch-intent, and passive
+  automatic-handoff health projections.
   Calls are serialized, bounded, and a timed-out or malformed session is
   retired so a late frame cannot be mistaken for a later response.
 - Bootstrap requires the `resilient_collection` capability. Rust owns one
@@ -137,6 +146,10 @@ Headroom.app
   or path. Rust accepts only the frozen engine's exact launcher schema and one
   of Terminal, iTerm, or Warp; copied commands are recomputed from the same
   validated intent.
+- Automatic-handoff health is projected from the same CLI capability contract
+  and supervisor notification transitions used by terminal launches. The
+  webview receives only the exact `headroom_handoff_health@1` schema and has no
+  process, transcript, hook, lease, ledger, or recovery command.
 - The app opens no HTTP listener.
 
 ## Supported development target
@@ -224,6 +237,10 @@ locale formatting, and reversible launch-at-login acceptance, see
 For engine/CLI routing parity, safely quoted copy output, allowlisted terminal
 launch, final selection re-proof, and lease-race acceptance, see
 `docs/desktop/ROUTING-VALIDATION.md`.
+
+For engine-authoritative automatic-handoff states, next-launch preference
+behavior, strict sanitization, and packaged active-child acceptance, see
+`docs/desktop/HANDOFF-HEALTH-VALIDATION.md`.
 
 ## Current limitations
 

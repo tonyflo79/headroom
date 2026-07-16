@@ -24,6 +24,23 @@
 
       <p id="surface-status" class="surface-status" role="status" aria-live="polite"></p>
 
+      <section id="handoff-health" class="handoff-health" aria-labelledby="handoff-title" hidden>
+        <div class="handoff-copy">
+          <p class="eyebrow">HEADROOM // AUTO-HANDOFF</p>
+          <h2 id="handoff-title">$ headroom handoff --health</h2>
+          <p id="handoff-explanation">Waiting for the bundled engine.</p>
+          <p id="handoff-context" class="handoff-context">next compatible Claude launch</p>
+        </div>
+        <div class="handoff-signal" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i>
+        </div>
+        <div class="handoff-status" role="status" aria-live="polite">
+          <span id="handoff-state">unavailable</span>
+          <small id="handoff-code">engine starting</small>
+          <small id="handoff-action">No action required</small>
+        </div>
+      </section>
+
       <section id="settings" class="settings-panel" aria-labelledby="settings-title" hidden>
         <div class="settings-heading">
           <div>
@@ -71,7 +88,7 @@
                 <small>60–3600 seconds; applies to the native scheduler.</small>
               </label>
               <label class="settings-check"><input id="settings-redact" name="redact_emails" type="checkbox" /> <span>Redact account emails</span></label>
-              <label class="settings-check"><input id="settings-auto-handoff" name="auto_handoff" type="checkbox" /> <span>Allow automatic account handoff</span></label>
+              <label class="settings-check"><input id="settings-auto-handoff" name="auto_handoff" type="checkbox" /> <span>Allow automatic account handoff on the next Claude launch</span></label>
             </div>
           </fieldset>
 

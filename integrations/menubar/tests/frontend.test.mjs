@@ -4,7 +4,8 @@ import test from "node:test";
 
 import {
   accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset, loginMessage,
-  normalizeBootstrap, normalizeDeviceInstructions, normalizeRoutingPreview,
+  normalizeBootstrap, normalizeDeviceInstructions, normalizeHandoffHealth,
+  normalizeRoutingPreview,
   onboardingPresentation, percentLeft,
   refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
   shouldApplySnapshot, settingsPatch, suggestedAccountName, validateSettingsDraft,
@@ -21,6 +22,13 @@ const bootstrap = {
     schema: "headroom_desktop_view@1",
     mode: "ready",
     settings: { title: "AI Fleet" },
+    handoff: {
+      schema: "headroom_handoff_health@1", configured: true, supported: true,
+      state: "configured", code: "handoff_configured",
+      explanation: "Automatic handoff is ready for the next Claude launch.",
+      action: "none", active_session: false, account: null, model: null,
+      observed_at: null, preference_effect: "next_launch_only",
+    },
     candidates: [],
     accounts: [{
       name: "personal",
@@ -35,6 +43,39 @@ test("normalizes a compatible sanitized bootstrap", () => {
   const value = normalizeBootstrap(bootstrap);
   assert.equal(value.view.accounts[0].name, "personal");
   assert.equal(value.view.accounts[0].provider, "claude");
+});
+
+test("normalizes only the bounded engine handoff contract", () => {
+  const raw = structuredClone(bootstrap.view.handoff);
+  raw.state = "armed";
+  raw.code = "supervision_armed";
+  raw.active_session = true;
+  raw.account = "claude-a";
+  raw.model = "sonnet";
+  raw.observed_at = 1_800_000_000;
+  assert.deepEqual(normalizeHandoffHealth(raw), raw);
+  assert.throws(() => normalizeHandoffHealth({ ...raw, pid: 1234 }),
+    /handoff health/);
+  assert.throws(() => normalizeHandoffHealth({ ...raw, explanation: "x".repeat(257) }),
+    /handoff health/);
+  assert.throws(() => normalizeHandoffHealth({ ...raw, state: "pretend_healthy" }),
+    /handoff health/);
+  assert.doesNotThrow(() => normalizeHandoffHealth({
+    ...bootstrap.view.handoff, state: "configured", code: "awaiting_session_start",
+    action: "wait_for_session", active_session: true,
+  }));
+});
+
+test("renders the terminal handoff health console and next-launch disclosure", () => {
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
+  for (const id of ["handoff-health", "handoff-state", "handoff-code",
+    "handoff-action", "handoff-explanation", "handoff-context"]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(html, /next Claude launch/);
+  assert.match(css, /\.handoff-signal/);
+  assert.match(css, /box-shadow: var\(--glow\)/);
 });
 
 test("rejects an incompatible bridge", () => {
