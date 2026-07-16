@@ -16,7 +16,10 @@ import sys
 import threading
 import time
 
-from . import __version__, collect as collector, connect, paths, registry, widget
+from . import (
+    __version__, account_lifecycle, collect as collector, connect, paths,
+    registry, widget,
+)
 
 
 SCHEMA = "headroom_desktop_bridge@1"
@@ -44,6 +47,10 @@ def _settings(config=None):
 
 def _registry_discovery():
     """Read registry state without creating, repairing, or collecting."""
+    try:
+        account_lifecycle.recover()
+    except (account_lifecycle.LifecycleError, registry.RegistryError):
+        return "recovery", None, "account_lifecycle_recovery_required"
     config_path = paths.config_path()
     if not os.path.exists(config_path):
         return "missing", None, None
@@ -167,7 +174,7 @@ def _onboarding_projection(step, *, candidates=None, config=None,
     }
 
 
-def _held_account(row):
+def _held_account(row, policy=None):
     """Project a configured slot safely when no public observation exists."""
     return {
         "name": row["name"],
@@ -177,6 +184,7 @@ def _held_account(row):
         "note": "No collected reading yet",
         "trust_state": None,
         "reserved": row.get("reserved") is True,
+        "policy": policy,
         "state": "held",
         "windows": {},
     }
@@ -194,7 +202,13 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
         row.get("name"): row for row in (config or {}).get("accounts", [])
         if isinstance(row, dict) and isinstance(row.get("name"), str)
     }
-    accounts = []
+    policies = {
+        row["name"]: account_lifecycle.account_policy(
+            row, index, len((config or {}).get("accounts", [])))
+        for index, row in enumerate((config or {}).get("accounts", []))
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    }
+    projected_accounts = {}
     for row in projected["accounts"]:
         if config is not None and row["name"] not in configured:
             continue
@@ -208,12 +222,19 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
             "note": details.get("note"),
             "trust_state": details.get("trust_state"),
             "reserved": configured.get(row["name"], {}).get("reserved") is True,
+            "policy": policies.get(row["name"]),
         })
-        accounts.append(entry)
-    projected_names = {row["name"] for row in accounts}
-    for row in configured.values():
-        if row["name"] not in projected_names:
-            accounts.append(_held_account(row))
+        projected_accounts[row["name"]] = entry
+    # A snapshot records observation order, not routing preference. Always
+    # render configured slots in registry order so a move is reflected in the
+    # dashboard immediately, even before the next collection rewrites usage.
+    accounts = []
+    for row in (config or {}).get("accounts", []):
+        account = projected_accounts.get(row["name"])
+        accounts.append(account if account is not None else _held_account(
+            row, policies.get(row["name"])))
+    if config is None:
+        accounts.extend(projected_accounts.values())
     if onboarding is None:
         step = "complete" if configured else "welcome"
         onboarding = _onboarding_projection(
@@ -340,6 +361,40 @@ def refresh_desktop(now=None):
     return _view(config, public, now=now)
 
 
+def account_action_desktop(action, name, *, new_name=None,
+                           reserved=None, confirmation=None, now=None):
+    if action not in {
+            "reserve", "unreserve", "move_up", "move_down", "rename", "remove"}:
+        raise BridgeError("invalid_account_action", "account action is invalid")
+    if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
+        raise BridgeError("invalid_account_name", "account name is invalid")
+    state, config, recovery_code = _registry_discovery()
+    if state == "recovery":
+        raise BridgeError("recovery_required", recovery_code)
+    if config is None:
+        raise BridgeError("no_accounts", "no connected accounts are available")
+    try:
+        if action in {"reserve", "unreserve"}:
+            expected = action == "reserve"
+            if reserved is not None and reserved is not expected:
+                raise BridgeError("invalid_reserved_state",
+                                  "reserved action does not match its value")
+            account_lifecycle.set_reserved(name, expected)
+        elif action in {"move_up", "move_down"}:
+            account_lifecycle.move_account(
+                name, "up" if action == "move_up" else "down")
+        elif action == "rename":
+            account_lifecycle.rename_account(name, new_name)
+        else:
+            if confirmation != name:
+                raise BridgeError("removal_confirmation_required",
+                                  "type the account name to confirm removal")
+            account_lifecycle.remove_account(name)
+    except account_lifecycle.LifecycleError as error:
+        raise BridgeError(error.code, str(error)) from error
+    return discover_desktop(now=now)
+
+
 def adopt_desktop(candidate_id, name, now=None):
     if candidate_id not in {"existing-claude", "existing-codex"}:
         raise BridgeError("invalid_candidate", "existing account is invalid")
@@ -388,6 +443,7 @@ class DesktopLoginManager:
             "schema": LOGIN_SCHEMA,
             "job_id": job["job_id"],
             "provider": job["provider"],
+            "mode": job.get("mode", "connect"),
             "name": job["name"],
             "state": job["state"],
             "progress_code": job["progress_code"],
@@ -402,7 +458,27 @@ class DesktopLoginManager:
     def start_codex(self, name, expected_email=None):
         return self._start("codex", name, expected_email)
 
-    def _start(self, provider, name, expected_email=None):
+    def start_reauthentication(self, name):
+        if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
+            raise BridgeError("invalid_account_name", "account name is invalid")
+        state, config, recovery_code = _registry_discovery()
+        if state == "recovery":
+            raise BridgeError("recovery_required", recovery_code)
+        account = next((row for row in (config or {}).get("accounts", [])
+                        if row.get("name") == name), None)
+        if account is None:
+            raise BridgeError("account_missing", "account no longer exists")
+        policy = account_lifecycle.account_policy(
+            account, 0, len(config["accounts"]))
+        if policy["reauthentication"] != "available":
+            raise BridgeError(
+                "reauthentication_" + policy["reauthentication"],
+                "this account must be reauthenticated in its provider")
+        return self._start(
+            account["provider"], name, account.get("expected_email"),
+            reauthenticate=True)
+
+    def _start(self, provider, name, expected_email=None, reauthenticate=False):
         if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
             raise BridgeError("invalid_account_name", "account name is invalid")
         if expected_email is not None and (
@@ -418,13 +494,15 @@ class DesktopLoginManager:
             "dashboard": dict(registry.DEFAULT_DASHBOARD),
             "accounts": [],
         }
-        if any(row.get("name") == name for row in config["accounts"]):
+        if not reauthenticate and any(
+                row.get("name") == name for row in config["accounts"]):
             raise BridgeError("duplicate_account_name", "account name is already in use")
         with self._lock:
             if self._job and self._job["state"] in {"running", "cancelling"}:
                 raise BridgeError("login_in_progress", "another login is in progress")
             job = {
                 "job_id": secrets.token_hex(12), "provider": provider,
+                "mode": "reauthenticate" if reauthenticate else "connect",
                 "name": name, "state": "running", "progress_code": "queued",
                 "cancel": threading.Event(),
             }
@@ -446,11 +524,13 @@ class DesktopLoginManager:
             if job["provider"] == "claude":
                 outcome = connect.desktop_connect_fresh(
                     config, job["name"], "claude", expected_email=expected_email,
-                    cancel_event=job["cancel"], progress=progress)
+                    cancel_event=job["cancel"], progress=progress,
+                    reauthenticate=job.get("mode") == "reauthenticate")
             else:
                 outcome = connect.desktop_connect_codex_device(
                     config, job["name"], expected_email=expected_email,
-                    cancel_event=job["cancel"], progress=progress)
+                    cancel_event=job["cancel"], progress=progress,
+                    reauthenticate=job.get("mode") == "reauthenticate")
             if outcome.get("ok"):
                 progress("publishing")
                 _complete_onboarding()
@@ -600,7 +680,8 @@ def _handle(command, args):
             "architecture": platform.machine(),
             "capabilities": [
                 "fixture_snapshot", "discover", "adopt", "refresh",
-                "claude_login", "codex_device_login", "onboarding", "shutdown"],
+                "claude_login", "codex_device_login", "onboarding",
+                "account_lifecycle", "reauthentication", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
@@ -616,6 +697,14 @@ def _handle(command, args):
         if set(args) - {"action", "now"}:
             raise BridgeError("invalid_args", "onboarding arguments are invalid")
         return onboarding_desktop(args.get("action"), args.get("now")), False
+    if command == "account_action":
+        if set(args) - {
+                "action", "name", "new_name", "reserved", "confirmation", "now"}:
+            raise BridgeError("invalid_args", "account action arguments are invalid")
+        return account_action_desktop(
+            args.get("action"), args.get("name"),
+            new_name=args.get("new_name"), reserved=args.get("reserved"),
+            confirmation=args.get("confirmation"), now=args.get("now")), False
     if command == "adopt":
         if set(args) - {"candidate_id", "name", "now"}:
             raise BridgeError("invalid_args", "adopt arguments are invalid")
@@ -635,6 +724,10 @@ def _handle(command, args):
             raise BridgeError("invalid_args", "login arguments are invalid")
         return LOGIN_MANAGER.start_codex(
             args.get("name"), args.get("expected_email")), False
+    if command == "start_reauthentication":
+        if set(args) != {"name"}:
+            raise BridgeError("invalid_args", "reauthentication arguments are invalid")
+        return LOGIN_MANAGER.start_reauthentication(args.get("name")), False
     if command == "login_status":
         if set(args) != {"job_id"}:
             raise BridgeError("invalid_args", "login status arguments are invalid")

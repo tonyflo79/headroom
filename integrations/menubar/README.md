@@ -22,6 +22,14 @@ device-auth app-server protocol and is not published until a live,
 identity-bound subscription-capacity read succeeds. Provider output never
 crosses the desktop bridge.
 
+Connected accounts expose transactional reserve, reorder, rename,
+re-authenticate, and removal controls. The app labels Headroom-managed versus
+adopted provider homes, keeps every provider home and credential on rename or
+removal, requires typed confirmation before removal, and refuses the final
+account. Rename/removal carry snapshots, cooldowns, and quarantine state
+through a private recoverable intent journal; active leases or incomplete
+handoffs refuse the mutation.
+
 The dashboard's deliberate visual language is a black terminal canvas with
 phosphor-green monospace text and glowing capacity bars. Limited and uncertain
 states retain distinct red and amber treatments for accessibility.
@@ -108,6 +116,7 @@ From the repository root:
 uv run --python 3.13.12 python -m unittest tests.test_desktop_bridge
 uv run --python 3.13.12 python -m unittest tests.test_desktop_login
 uv run --python 3.13.12 python -m unittest tests.test_codex_desktop_login
+uv run --python 3.13.12 python -m unittest tests.test_account_lifecycle
 npm --prefix integrations/menubar test
 cargo fmt --check --manifest-path integrations/menubar/src-tauri/Cargo.toml
 cargo test --locked --manifest-path integrations/menubar/src-tauri/Cargo.toml
@@ -131,7 +140,7 @@ system `python` process. Quitting Headroom must remove both processes.
   `docs/desktop/CLAUDE-LOGIN-VALIDATION.md` and
   `docs/desktop/CODEX-LOGIN-VALIDATION.md` before those slices can ship.
 - Recovery is currently a safe read-only state, not a repair workflow.
-- There is no complete account-management UI, launch-at-login, updater,
-  diagnostics export, signing, or notarization yet.
+- There is no launch-at-login, updater, diagnostics export, signing, or
+  notarization yet.
 - The old loopback popover helpers remain in Rust for their security tests but
   are not called by the desktop tracer.

@@ -163,7 +163,8 @@ def _device_instructions(value):
 def desktop_connect_codex_device(config, name, *, expected_email=None,
                                  cancel_event=None, progress=None,
                                  timeout=DESKTOP_LOGIN_TIMEOUT, popen=None,
-                                 prerequisite=None, live_reader=None):
+                                 prerequisite=None, live_reader=None,
+                                 reauthenticate=False):
     """Complete Codex device auth through structured app-server JSON-RPC."""
     progress = (lambda _code, _details=None: None) if progress is None else progress
     cancel_event = cancel_event or type("NeverCancel", (), {
@@ -174,12 +175,23 @@ def desktop_connect_codex_device(config, name, *, expected_email=None,
     live_reader = collector.codex_live if live_reader is None else live_reader
     if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
         return {"ok": False, "code": "invalid_account_name"}
-    if any(row.get("name") == name for row in config.get("accounts", [])):
-        return {"ok": False, "code": "duplicate_account_name"}
-    home = os.path.join(paths.homes_dir(), name)
-    if os.path.realpath(home) != os.path.realpath(
-            os.path.join(paths.homes_dir(), os.path.basename(name))):
-        return {"ok": False, "code": "invalid_account_home"}
+    existing = next((row for row in config.get("accounts", [])
+                     if row.get("name") == name), None)
+    if reauthenticate:
+        if existing is None or existing.get("provider") != "codex":
+            return {"ok": False, "code": "reauthentication_unavailable"}
+        from . import account_lifecycle
+        if account_lifecycle.home_kind(existing) != "headroom":
+            return {"ok": False, "code": "reauthentication_provider_managed"}
+        home = registry.expand(existing["home"])
+        expected_email = expected_email or existing.get("expected_email")
+    else:
+        if existing is not None:
+            return {"ok": False, "code": "duplicate_account_name"}
+        home = os.path.join(paths.homes_dir(), name)
+        if os.path.realpath(home) != os.path.realpath(
+                os.path.join(paths.homes_dir(), os.path.basename(name))):
+            return {"ok": False, "code": "invalid_account_home"}
     progress("preflight")
     binary = provider_binary("codex")
     if binary is None:
@@ -191,7 +203,8 @@ def desktop_connect_codex_device(config, name, *, expected_email=None,
 
     os.makedirs(home, mode=0o700, exist_ok=True)
     backup_dir, saved = backup_credentials(home, "codex")
-    duplicates = existing_fingerprints(config, "codex")
+    duplicates = existing_fingerprints(
+        config, "codex", exclude_name=name if reauthenticate else None)
     completed = False
 
     def rollback():
@@ -339,15 +352,23 @@ def desktop_connect_codex_device(config, name, *, expected_email=None,
             return {"ok": False, "code": "identity_malformed"}
         if fingerprint in duplicates:
             return {"ok": False, "code": "duplicate_identity"}
-        entry = add_account(config, name, "codex", home, identity["email"])
+        if reauthenticate:
+            entry = dict(existing)
+        else:
+            entry = add_account(config, name, "codex", home, identity["email"])
         saved_config = registry.load()
         actual = next((row for row in saved_config["accounts"]
                        if row["name"] == name), None)
         if actual is None or actual["provider"] != "codex" \
                 or registry.expand(actual["home"]) != registry.expand(home):
             return {"ok": False, "code": "registry_conflict"}
+        if reauthenticate:
+            from . import route
+            route.quarantine_clear(name)
         completed = True
-        return {"ok": True, "code": "connected", "entry": entry,
+        return {"ok": True,
+                "code": "reauthenticated" if reauthenticate else "connected",
+                "entry": entry,
                 "observation": {"email": identity["email"], "plan": plan,
                                 "windows": windows}}
     finally:
@@ -398,7 +419,7 @@ def _close_login_streams(process):
 def desktop_connect_fresh(config, name, provider, *, expected_email=None,
                           cancel_event=None, progress=None,
                           timeout=DESKTOP_LOGIN_TIMEOUT, popen=None,
-                          prerequisite=None):
+                          prerequisite=None, reauthenticate=False):
     """Run a fresh provider login without a terminal and return stable codes.
 
     Provider stdout/stderr are discarded, never returned to the GUI. Every
@@ -414,12 +435,26 @@ def desktop_connect_fresh(config, name, provider, *, expected_email=None,
         return {"ok": False, "code": "invalid_provider"}
     if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
         return {"ok": False, "code": "invalid_account_name"}
-    if any(row.get("name") == name for row in config.get("accounts", [])):
-        return {"ok": False, "code": "duplicate_account_name"}
-    home = os.path.join(paths.homes_dir(), name)
-    expected_home = os.path.join(paths.homes_dir(), os.path.basename(name))
-    if os.path.realpath(home) != os.path.realpath(expected_home):
-        return {"ok": False, "code": "invalid_account_home"}
+    existing = next((row for row in config.get("accounts", [])
+                     if row.get("name") == name), None)
+    if reauthenticate:
+        if existing is None or existing.get("provider") != provider:
+            return {"ok": False, "code": "reauthentication_unavailable"}
+        from . import account_lifecycle
+        if account_lifecycle.home_kind(existing) != "headroom":
+            return {"ok": False, "code": "reauthentication_provider_managed"}
+        home = registry.expand(existing["home"])
+        expected_email = expected_email or existing.get("expected_email")
+        if provider == "claude" and sys.platform == "darwin" \
+                and not os.path.isfile(os.path.join(home, ".credentials.json")):
+            return {"ok": False, "code": "reauthentication_keychain_manual"}
+    else:
+        if existing is not None:
+            return {"ok": False, "code": "duplicate_account_name"}
+        home = os.path.join(paths.homes_dir(), name)
+        expected_home = os.path.join(paths.homes_dir(), os.path.basename(name))
+        if os.path.realpath(home) != os.path.realpath(expected_home):
+            return {"ok": False, "code": "invalid_account_home"}
 
     progress("preflight")
     binary = provider_binary(provider)
@@ -434,13 +469,14 @@ def desktop_connect_fresh(config, name, provider, *, expected_email=None,
 
     keychain_existed = (provider == "claude" and sys.platform == "darwin"
                         and collector.claude_keychain_item_exists(home))
-    if keychain_existed:
+    if keychain_existed and not reauthenticate:
         # A leftover item may contain a credential Headroom cannot export and
         # restore byte-for-byte. Refuse before the provider can overwrite it.
         return {"ok": False, "code": "claude_slot_keychain_occupied"}
     os.makedirs(home, mode=0o700, exist_ok=True)
     backup_dir, saved = backup_credentials(home, provider)
-    duplicates = existing_fingerprints(config, provider)
+    duplicates = existing_fingerprints(
+        config, provider, exclude_name=name if reauthenticate else None)
     completed = False
 
     def rollback():
@@ -492,15 +528,21 @@ def desktop_connect_fresh(config, name, provider, *, expected_email=None,
         fingerprint = identity.get("account_fingerprint")
         if fingerprint and fingerprint in duplicates:
             return {"ok": False, "code": "duplicate_identity"}
-        entry = add_account(config, name, provider, home, identity["email"])
+        entry = (dict(existing) if reauthenticate else
+                 add_account(config, name, provider, home, identity["email"]))
         saved_config = registry.load()
         actual = next((row for row in saved_config["accounts"]
                        if row["name"] == name), None)
         if actual is None or actual["provider"] != provider \
                 or registry.expand(actual["home"]) != registry.expand(home):
             return {"ok": False, "code": "registry_conflict"}
+        if reauthenticate:
+            from . import route
+            route.quarantine_clear(name)
         completed = True
-        return {"ok": True, "code": "connected", "entry": entry}
+        return {"ok": True,
+                "code": "reauthenticated" if reauthenticate else "connected",
+                "entry": entry}
     finally:
         if not completed:
             rollback()
@@ -785,11 +827,11 @@ def cmd_refresh(args):
         print(f"headroom: slot {name!r} is {account['provider']}; "
               "only owned Claude slots can be refreshed", file=sys.stderr)
         return 2
-    # Resolve the homes root, but do not resolve the slot component again:
-    # a symlink at homes/<slot> pointing outside must remain an external home,
-    # not become eligible merely because both paths resolve to the same target.
-    owned_home = os.path.join(registry.expand(paths.homes_dir()), name)
-    if account["home"] != owned_home:
+    # A lifecycle rename deliberately keeps the credential home path stable,
+    # so ownership cannot depend on the home basename continuing to equal the
+    # slot label. The shared helper still rejects symlinks and external homes.
+    from . import account_lifecycle
+    if account_lifecycle.home_kind(account) != "headroom":
         print(f"headroom: slot {name!r} uses an adopted or external home; "
               "refusing to re-login outside Headroom-owned homes", file=sys.stderr)
         return 2

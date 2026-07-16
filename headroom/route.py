@@ -177,6 +177,20 @@ def quarantine_mark(name, reason):
     return ledger[name]
 
 
+def quarantine_clear(name):
+    """Clear one slot quarantine after a verified re-authentication."""
+    with _quarantine_lock():
+        ledger = _read_quarantine()
+        if ledger is None:
+            raise RuntimeError(
+                "quarantine ledger unreadable — inspect state/quarantine.json")
+        if name not in ledger:
+            return False
+        ledger.pop(name)
+        paths.write_json_atomic(paths.quarantine_path(), ledger)
+        return True
+
+
 def preflight_remove_slot_state():
     """Fail before a registry removal when protective state is unreadable."""
     with _cooldown_lock():
@@ -295,6 +309,39 @@ def _account_leased_by_other(name):
         except OSError as error:
             return error.errno in _LEASE_CONTENDED
         # nobody holds it — release the probe lock immediately
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def slot_lease_active(name):
+    """True when any live process currently holds this slot's lease.
+
+    Account lifecycle mutations use this independently of the caller's
+    ``HEADROOM_SLOT_LEASE`` setting: a compatible CLI may have leasing enabled
+    even when the desktop process does not. Probe errors fail closed so a
+    rename or removal can never strand a live launch behind a new slot name.
+    """
+    if not isinstance(name, str) or not registry.NAME_RE.fullmatch(name):
+        raise LeaseError("account has no valid name to inspect")
+    if name in _HELD_LEASES:
+        return True
+    try:
+        fd = os.open(_lease_path(name), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise LeaseError(
+            f"cannot inspect slot lease for {name}: {error}") from error
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in _LEASE_CONTENDED:
+                return True
+            raise LeaseError(
+                f"cannot inspect slot lease for {name}: {error}") from error
         fcntl.flock(fd, fcntl.LOCK_UN)
         return False
     finally:
