@@ -930,8 +930,9 @@ class DesktopBridgeUnit(unittest.TestCase):
                 mock.patch.object(desktop_bridge.os, "execve") as execute:
             desktop_bridge.launch_external_reauthentication("claude-held")
         argv, environment = execute.call_args.args[1:]
-        self.assertEqual(execute.call_args.args[0], "/bin/echo")
-        self.assertEqual(argv, ["/bin/echo", "auth", "login"])
+        resolved_executable = os.path.realpath("/bin/echo")
+        self.assertEqual(execute.call_args.args[0], resolved_executable)
+        self.assertEqual(argv, [resolved_executable, "auth", "login"])
         self.assertEqual(environment["CLAUDE_CONFIG_DIR"], account["home"])
         self.assertNotIn("CODEX_HOME", environment)
 
