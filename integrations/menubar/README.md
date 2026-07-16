@@ -33,8 +33,18 @@ handoffs refuse the mutation.
 The dashboard's deliberate visual language is a black terminal canvas with
 phosphor-green monospace text and glowing capacity bars. Limited and uncertain
 states retain distinct red and amber treatments for accessibility. Appearance
-also offers Minimal, Chrome, Paper, and Terminal previews; all five themes use
-the same semantic state model and never rely on color alone.
+also offers Minimal, Chrome, Paper, and Terminal live previews; all five themes
+use the same semantic state model and never rely on color alone. Midnight is
+the default terminal treatment.
+
+The native Settings console owns title, redaction, routing reserve, automatic
+handoff, collection interval, provider executable overrides, preferred
+terminal, window memory, and opt-in notification preferences. The frozen
+engine validates every partial update under the registry lock and commits it
+atomically; the webview has no file access. Provider overrides must resolve to
+executable absolute paths. Settings use local number/date formatting and the
+standard macOS `Command-,`, `Command-R`, `Command-W`, and `Command-Q`
+shortcuts.
 
 The resizable dashboard and the 420-by-680 menu-bar popover are projections of
 one revisioned snapshot owned by Rust. They keep account order, capacity,
@@ -43,6 +53,10 @@ another. The popover scrolls for large fleets and provides Refresh, Dashboard,
 Settings, and Quit actions. Closing the dashboard keeps the tray and bundled
 engine running; Quit ends both. A private, schema-validated window record
 restores the dashboard only when its size and position remain safely visible.
+Window memory can be disabled, which deletes the saved record and centers the
+window. Launch at login is off by default and uses a reversible macOS
+LaunchAgent; login launches remain in the menu bar unless onboarding or safe
+recovery requires operator attention.
 
 One Rust-owned, single-flight schedule now serves stale activation, manual,
 wake, and bounded background refreshes. Provider accounts collect concurrently
@@ -93,9 +107,10 @@ Headroom.app
 - Rust owns the current sanitized view, a monotonic revision, and the live
   theme. Both webviews receive the same immutable snapshot envelope; stale or
   duplicate revisions and stale command responses are ignored.
-- The bridge exposes only narrow onboarding, account, refresh, and login-job
-  commands. Calls are serialized, bounded, and a timed-out or malformed session
-  is retired so a late frame cannot be mistaken for a later response.
+- The bridge exposes only narrow onboarding, account, refresh, login-job, and
+  validated-settings commands. Calls are serialized, bounded, and a timed-out
+  or malformed session is retired so a late frame cannot be mistaken for a
+  later response.
 - Bootstrap requires the `resilient_collection` capability. Rust owns one
   refresh flight, a five-minute healthy interval, capped jittered retry, wake
   recovery, and the bounded sidecar-restart/degraded policy.
@@ -187,6 +202,10 @@ For singleton activation, startup, watchdog, crash-loop, manual retry,
 force-quit recovery, and orphan cleanup acceptance, see
 `docs/desktop/LIFECYCLE-VALIDATION.md`.
 
+For validated preferences, live theme propagation, window state, shortcuts,
+locale formatting, and reversible launch-at-login acceptance, see
+`docs/desktop/SETTINGS-VALIDATION.md`.
+
 ## Current limitations
 
 - The app is macOS-only and is built for the runner's native architecture.
@@ -194,9 +213,8 @@ force-quit recovery, and orphan cleanup acceptance, see
   `docs/desktop/CLAUDE-LOGIN-VALIDATION.md` and
   `docs/desktop/CODEX-LOGIN-VALIDATION.md` before those slices can ship.
 - Recovery is currently a safe read-only state, not a repair workflow.
-- There is no launch-at-login, updater, diagnostics export, signing, or
-  notarization yet.
-- Theme choice is live for the current application session; durable desktop
-  preferences are owned by the follow-on settings slice.
+- There is no updater, diagnostics export, signing, or notarization yet.
+- Notification preferences are durable and off by default, but native alert
+  delivery and the macOS permission prompt belong to the notification slice.
 - The old loopback viewer helpers remain in Rust for their security tests but
   are not called by the desktop application path.

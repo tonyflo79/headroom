@@ -6,7 +6,10 @@ const PROVIDER_STATES = new Set(["unchecked", "ready", "missing", "upgrade_requi
 const HOME_KINDS = new Set(["headroom", "adopted"]);
 const REAUTH_STATES = new Set(["available", "provider_managed", "keychain_manual"]);
 const VALID_THEMES = new Set(["midnight", "minimal", "chrome", "paper", "terminal"]);
+const VALID_TERMINALS = new Set(["terminal", "iterm", "warp"]);
 const VALID_SURFACES = new Set(["main", "popover"]);
+const REFRESH_INTERVAL_MIN = 60;
+const REFRESH_INTERVAL_MAX = 3600;
 const TRUST_STATES = new Set([
   "verified", "verified_local", "verified_remote", "duplicate_identity", "held",
 ]);
@@ -34,17 +37,100 @@ export function formatReset(epoch, now = Date.now()) {
   if (!Number.isFinite(value)) return { label: "reset unknown", exact: null };
   const target = value * 1000;
   const difference = target - now;
-  const exact = new Date(target).toLocaleString();
+  const exact = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium", timeStyle: "medium",
+  }).format(new Date(target));
   if (difference <= 0) return { label: "reset due", exact };
   const minutes = Math.max(1, Math.round(difference / 60_000));
-  const days = Math.floor(minutes / 1440);
-  const hours = Math.floor((minutes % 1440) / 60);
-  const remaining = minutes % 60;
-  const parts = [];
-  if (days) parts.push(`${days}d`);
-  if (hours) parts.push(`${hours}h`);
-  if (!days && remaining) parts.push(`${remaining}m`);
-  return { label: `resets in ${parts.join(" ")}`, exact };
+  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "always" });
+  if (minutes >= 1440) {
+    return { label: `resets ${formatter.format(Math.round(minutes / 1440), "day")}`, exact };
+  }
+  if (minutes >= 60) {
+    return { label: `resets ${formatter.format(Math.round(minutes / 60), "hour")}`, exact };
+  }
+  return { label: `resets ${formatter.format(minutes, "minute")}`, exact };
+}
+
+export function formatPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  return new Intl.NumberFormat(undefined, {
+    style: "percent", maximumFractionDigits: 0,
+  }).format(number / 100);
+}
+
+function validLocalPath(value) {
+  return typeof value === "string" && value.length <= 4096 && !value.includes("\0") &&
+    (value === "" || value.startsWith("/"));
+}
+
+export function validateSettingsDraft(draft) {
+  const errors = {};
+  const title = typeof draft?.title === "string" ? draft.title : "";
+  if (title !== title.trim() || title.length < 1 || title.length > 80 ||
+      [...title].some((character) => character.charCodeAt(0) < 32 ||
+        character.charCodeAt(0) === 127)) {
+    errors.title = "Title must be 1–80 trimmed printable characters";
+  }
+  if (!VALID_THEMES.has(draft?.theme)) errors.theme = "Choose a supported theme";
+  for (const key of ["redact_emails", "auto_handoff", "remember_window",
+    "notifications_enabled", "reset_notifications"]) {
+    if (typeof draft?.[key] !== "boolean") errors[key] = "Choose on or off";
+  }
+  const reserve = Number(draft?.reserve_percent);
+  if (!Number.isFinite(reserve) || reserve < 0 || reserve > 99) {
+    errors.reserve_percent = "Reserve must be between 0 and 99";
+  }
+  const refresh = Number(draft?.refresh_interval_seconds);
+  if (!Number.isInteger(refresh) || refresh < REFRESH_INTERVAL_MIN ||
+      refresh > REFRESH_INTERVAL_MAX) {
+    errors.refresh_interval_seconds = "Refresh must be a whole number from 60 to 3600";
+  }
+  if (!VALID_TERMINALS.has(draft?.preferred_terminal)) {
+    errors.preferred_terminal = "Choose Terminal, iTerm, or Warp";
+  }
+  for (const provider of ["claude", "codex"]) {
+    const key = `${provider}_path`;
+    if (!validLocalPath(draft?.[key])) errors[key] = "Use a blank or absolute local path";
+  }
+  for (const key of ["notification_threshold", "claude_notification_threshold",
+    "codex_notification_threshold"]) {
+    if (key !== "notification_threshold" && draft?.[key] === "") continue;
+    const threshold = Number(draft?.[key]);
+    if (!Number.isInteger(threshold) || threshold < 1 || threshold > 99) {
+      errors[key] = "Threshold must be a whole number from 1 to 99";
+    }
+  }
+  return errors;
+}
+
+export function settingsPatch(draft) {
+  return {
+    theme: draft.theme,
+    title: draft.title,
+    redact_emails: draft.redact_emails,
+    reserve_percent: Number(draft.reserve_percent),
+    auto_handoff: draft.auto_handoff,
+    refresh_interval_seconds: Number(draft.refresh_interval_seconds),
+    provider_paths: {
+      claude: draft.claude_path || null,
+      codex: draft.codex_path || null,
+    },
+    preferred_terminal: draft.preferred_terminal,
+    remember_window: draft.remember_window,
+    notifications: {
+      enabled: draft.notifications_enabled,
+      reset_enabled: draft.reset_notifications,
+      global_threshold_percent: Number(draft.notification_threshold),
+      provider_threshold_percent: {
+        claude: draft.claude_notification_threshold === "" ? null
+          : Number(draft.claude_notification_threshold),
+        codex: draft.codex_notification_threshold === "" ? null
+          : Number(draft.codex_notification_threshold),
+      },
+    },
+  };
 }
 
 export function accountStatePresentation(account) {
@@ -276,6 +362,24 @@ export function normalizeBootstrap(raw) {
       })) : [];
   const rawSettings = view.settings && typeof view.settings === "object" ? view.settings : {};
   const settingsTheme = VALID_THEMES.has(rawSettings.theme) ? rawSettings.theme : "terminal";
+  const rawProviderPaths = rawSettings.provider_paths &&
+    typeof rawSettings.provider_paths === "object" ? rawSettings.provider_paths : {};
+  const providerPaths = {};
+  for (const provider of ["claude", "codex"]) {
+    if (validLocalPath(rawProviderPaths[provider]) && rawProviderPaths[provider]) {
+      providerPaths[provider] = rawProviderPaths[provider];
+    }
+  }
+  const rawNotifications = rawSettings.notifications &&
+    typeof rawSettings.notifications === "object" ? rawSettings.notifications : {};
+  const rawProviderThresholds = rawNotifications.provider_threshold_percent &&
+    typeof rawNotifications.provider_threshold_percent === "object"
+    ? rawNotifications.provider_threshold_percent : {};
+  const integerInRange = (value, minimum, maximum, fallback) => {
+    const number = Number(value);
+    return Number.isInteger(number) && number >= minimum && number <= maximum
+      ? number : fallback;
+  };
   const rawFreshness = view.freshness && typeof view.freshness === "object"
     ? view.freshness : {};
   const freshness = {
@@ -307,6 +411,24 @@ export function normalizeBootstrap(raw) {
         redact_emails: rawSettings.redact_emails !== false,
         reserve_percent: numberOrNull(rawSettings.reserve_percent) ?? 0,
         auto_handoff: rawSettings.auto_handoff !== false,
+        refresh_interval_seconds: integerInRange(rawSettings.refresh_interval_seconds,
+          REFRESH_INTERVAL_MIN, REFRESH_INTERVAL_MAX, 300),
+        provider_paths: providerPaths,
+        preferred_terminal: VALID_TERMINALS.has(rawSettings.preferred_terminal)
+          ? rawSettings.preferred_terminal : "terminal",
+        remember_window: rawSettings.remember_window !== false,
+        notifications: {
+          enabled: rawNotifications.enabled === true,
+          reset_enabled: rawNotifications.reset_enabled === true,
+          global_threshold_percent: integerInRange(
+            rawNotifications.global_threshold_percent, 1, 99, 20),
+          provider_threshold_percent: Object.fromEntries(
+            ["claude", "codex"].flatMap((provider) => {
+              const value = integerInRange(rawProviderThresholds[provider], 1, 99, null);
+              return value === null ? [] : [[provider, value]];
+            }),
+          ),
+        },
       },
       freshness,
       headline: {
@@ -339,9 +461,9 @@ function windowRow(label, value) {
   const reset = formatReset(value?.resets_at);
   const last = Number(value?.last_observed_left_percent);
   const capacity = left === null
-    ? Number.isFinite(last) ? `${value?.state || "held"} · last ${Math.round(last)}% left`
+    ? Number.isFinite(last) ? `${value?.state || "held"} · last ${formatPercent(last)} left`
       : value?.state || "held"
-    : `${Math.round(left)}% left`;
+    : `${formatPercent(left)} left`;
   reading.textContent = `${capacity} · ${reset.label}`;
   if (reset.exact) reading.title = `Exact local reset: ${reset.exact}`;
   line.append(name, reading);
@@ -870,12 +992,96 @@ function applyRefreshState(state, diagnosticCode = null) {
     (activeBootstrap?.view.mode !== "ready" && state !== "degraded");
 }
 
-function openAppearancePanel() {
+function settingsDraftFromForm(form) {
+  return {
+    theme: form.elements.theme.value,
+    title: form.elements.title.value,
+    redact_emails: form.elements.redact_emails.checked,
+    reserve_percent: form.elements.reserve_percent.value,
+    auto_handoff: form.elements.auto_handoff.checked,
+    refresh_interval_seconds: form.elements.refresh_interval_seconds.value,
+    claude_path: form.elements.claude_path.value,
+    codex_path: form.elements.codex_path.value,
+    preferred_terminal: form.elements.preferred_terminal.value,
+    remember_window: form.elements.remember_window.checked,
+    notifications_enabled: form.elements.notifications_enabled.checked,
+    reset_notifications: form.elements.reset_notifications.checked,
+    notification_threshold: form.elements.notification_threshold.value,
+    claude_notification_threshold: form.elements.claude_notification_threshold.value,
+    codex_notification_threshold: form.elements.codex_notification_threshold.value,
+  };
+}
+
+function populateSettingsForm(settings) {
+  const form = document.getElementById("settings-form");
+  const notifications = settings.notifications || {};
+  const paths = settings.provider_paths || {};
+  form.elements.theme.value = settings.theme;
+  form.elements.title.value = settings.title;
+  form.elements.redact_emails.checked = settings.redact_emails;
+  form.elements.reserve_percent.value = String(settings.reserve_percent);
+  form.elements.auto_handoff.checked = settings.auto_handoff;
+  form.elements.refresh_interval_seconds.value = String(settings.refresh_interval_seconds);
+  form.elements.claude_path.value = paths.claude || "";
+  form.elements.codex_path.value = paths.codex || "";
+  form.elements.preferred_terminal.value = settings.preferred_terminal;
+  form.elements.remember_window.checked = settings.remember_window;
+  form.elements.notifications_enabled.checked = notifications.enabled === true;
+  form.elements.reset_notifications.checked = notifications.reset_enabled === true;
+  form.elements.notification_threshold.value = String(
+    notifications.global_threshold_percent ?? 20);
+  form.elements.claude_notification_threshold.value =
+    notifications.provider_threshold_percent?.claude ?? "";
+  form.elements.codex_notification_threshold.value =
+    notifications.provider_threshold_percent?.codex ?? "";
+  form.dataset.dirty = "false";
+}
+
+function applySettingsValidation(form) {
+  const errors = validateSettingsDraft(settingsDraftFromForm(form));
+  const ids = {
+    theme: "settings-theme", title: "settings-title-input",
+    reserve_percent: "settings-reserve",
+    refresh_interval_seconds: "settings-refresh",
+    preferred_terminal: "settings-terminal", claude_path: "settings-claude-path",
+    codex_path: "settings-codex-path", notification_threshold: "settings-threshold",
+    claude_notification_threshold: "settings-claude-threshold",
+    codex_notification_threshold: "settings-codex-threshold",
+  };
+  for (const [key, id] of Object.entries(ids)) {
+    document.getElementById(id).setCustomValidity(errors[key] || "");
+  }
+  const messages = [...new Set(Object.values(errors))];
+  document.getElementById("settings-errors").textContent = messages.join(" · ");
+  document.getElementById("settings-save").disabled = messages.length > 0;
+  return messages.length === 0;
+}
+
+async function openSettingsPanel() {
   if (document.body.dataset.surface !== "main") return;
-  const panel = document.getElementById("appearance");
+  const panel = document.getElementById("settings");
+  if (activeBootstrap) populateSettingsForm(activeBootstrap.view.settings);
   panel.hidden = false;
   panel.scrollIntoView({ block: "start", behavior: "smooth" });
-  document.getElementById("theme-picker").focus();
+  applySettingsValidation(document.getElementById("settings-form"));
+  document.getElementById("settings-title-input").focus();
+  const status = document.getElementById("settings-login-status");
+  const checkbox = document.getElementById("settings-launch-at-login");
+  checkbox.disabled = !activeInvoke;
+  if (!activeInvoke) {
+    status.textContent = "Launch at login is unavailable outside the desktop app.";
+    return;
+  }
+  status.textContent = "Checking the macOS login item…";
+  try {
+    checkbox.checked = await activeInvoke("desktop_launch_at_login_status");
+    status.textContent = checkbox.checked
+      ? "Enabled · login launches Headroom quietly in the menu bar."
+      : "Disabled · Headroom opens only when you launch it.";
+  } catch {
+    checkbox.disabled = true;
+    status.textContent = "The macOS login item status is unavailable.";
+  }
 }
 
 function configureSurfaceActions(surface, invoke) {
@@ -892,22 +1098,77 @@ function configureSurfaceActions(surface, invoke) {
       actionButton("Quit", () => invoke("desktop_quit"), "danger"),
     );
   } else {
-    controls.push(actionButton("Appearance", openAppearancePanel));
+    controls.push(actionButton("Settings", openSettingsPanel));
   }
   actions.replaceChildren(...controls);
 }
 
-function configureAppearance(value, invoke) {
-  const picker = document.getElementById("theme-picker");
-  picker.value = value.theme;
-  picker.oninput = invoke ? async () => {
-    if (!VALID_THEMES.has(picker.value)) return;
-    document.body.dataset.theme = picker.value;
-    try { await invoke("desktop_set_theme", { theme: picker.value }); }
-    catch { picker.value = activeBootstrap?.theme || "terminal"; }
+function configureSettings(value, invoke) {
+  const panel = document.getElementById("settings");
+  const form = document.getElementById("settings-form");
+  if (panel.hidden || form.dataset.dirty !== "true") {
+    populateSettingsForm(value.view.settings);
+  }
+  form.oninput = () => {
+    form.dataset.dirty = "true";
+    applySettingsValidation(form);
+  };
+  form.elements.theme.onchange = invoke ? async () => {
+    const theme = form.elements.theme.value;
+    if (!VALID_THEMES.has(theme)) return;
+    document.body.dataset.theme = theme;
+    try {
+      await invoke("desktop_set_theme", { theme });
+      document.getElementById("settings-errors").textContent =
+        `Theme preview applied: ${theme}`;
+    } catch {
+      form.elements.theme.value = activeBootstrap?.theme || "terminal";
+      document.body.dataset.theme = activeBootstrap?.theme || "terminal";
+      document.getElementById("settings-errors").textContent =
+        "Theme could not be saved safely.";
+    }
   } : null;
-  document.getElementById("close-appearance").onclick = () => {
-    document.getElementById("appearance").hidden = true;
+  form.onsubmit = invoke ? async (event) => {
+    event.preventDefault();
+    if (!applySettingsValidation(form)) return;
+    const save = document.getElementById("settings-save");
+    const diagnostic = document.getElementById("settings-errors");
+    save.disabled = true;
+    diagnostic.textContent = "Validating and committing settings…";
+    try {
+      await invoke("desktop_update_settings", {
+        patch: settingsPatch(settingsDraftFromForm(form)),
+      });
+      form.dataset.dirty = "false";
+      diagnostic.textContent = "Settings saved atomically.";
+    } catch {
+      diagnostic.textContent =
+        "Settings were not changed. Custom provider paths must name executable files.";
+    } finally {
+      save.disabled = false;
+    }
+  } : null;
+  const login = document.getElementById("settings-launch-at-login");
+  login.onchange = invoke ? async () => {
+    const requested = login.checked;
+    const status = document.getElementById("settings-login-status");
+    login.disabled = true;
+    status.textContent = requested ? "Enabling the macOS login item…" :
+      "Removing the macOS login item…";
+    try {
+      login.checked = await invoke("desktop_set_launch_at_login", { enabled: requested });
+      status.textContent = login.checked
+        ? "Enabled · login launches Headroom quietly in the menu bar."
+        : "Disabled · the login item was removed.";
+    } catch {
+      login.checked = !requested;
+      status.textContent = "The macOS login item could not be changed.";
+    } finally {
+      login.disabled = false;
+    }
+  } : null;
+  document.getElementById("close-settings").onclick = () => {
+    panel.hidden = true;
   };
 }
 
@@ -934,7 +1195,7 @@ export function renderBootstrap(raw, invoke = null) {
   document.getElementById("headline").textContent = view.mode === "recovery"
     ? `Safe recovery required (${view.recovery_code || "unknown"}); no files were changed`
     : view.mode === "onboarding" || view.mode === "demo" ? presentation.headline
-      : Number.isFinite(average) ? `${Math.round(average)}% average five-hour headroom`
+      : Number.isFinite(average) ? `${formatPercent(average)} average five-hour headroom`
         : "No current five-hour reading";
   const update = (nextView) => {
     // Native commands publish a newer, revisioned snapshot to both surfaces
@@ -986,7 +1247,7 @@ export function renderBootstrap(raw, invoke = null) {
   }
   actions.replaceChildren(...actionCards);
   configureSurfaceActions(value.surface, invoke);
-  configureAppearance(value, invoke);
+  configureSettings(value, invoke);
   const freshnessAge = view.freshness.age_seconds === null
     ? "age unknown" : `${view.freshness.age_seconds}s old`;
   document.getElementById("surface-status").textContent =
@@ -1026,8 +1287,29 @@ if (typeof document !== "undefined") {
   };
   window.__headroomSetRefreshState = applyRefreshState;
   window.__headroomOpenPanel = (panel) => {
-    if (panel === "appearance") openAppearancePanel();
+    if (panel === "settings" || panel === "appearance") openSettingsPanel();
   };
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.getElementById("settings").hidden) {
+      document.getElementById("settings").hidden = true;
+      return;
+    }
+    if (!event.metaKey || event.ctrlKey || event.altKey) return;
+    const key = event.key.toLowerCase();
+    if (key === ",") {
+      event.preventDefault();
+      openSettingsPanel();
+    } else if (key === "r") {
+      event.preventDefault();
+      document.getElementById("refresh").click();
+    } else if (key === "w" && activeInvoke) {
+      event.preventDefault();
+      activeInvoke("desktop_hide_dashboard").catch(() => {});
+    } else if (key === "q" && activeInvoke) {
+      event.preventDefault();
+      activeInvoke("desktop_quit").catch(() => {});
+    }
+  });
   try {
     const invoke = window.__TAURI__?.core?.invoke || null;
     renderBootstrap(window.__HEADROOM_BOOTSTRAP__, invoke);

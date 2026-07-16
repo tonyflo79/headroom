@@ -39,6 +39,13 @@ DESKTOP_LOGIN_TIMEOUT = 10 * 60
 
 def provider_binary(provider):
     name = "claude" if provider == "claude" else "codex"
+    try:
+        configured = registry.desktop_settings()["provider_paths"].get(provider)
+    except registry.RegistryError:
+        configured = None
+    if configured:
+        return configured if os.path.isfile(configured) \
+            and os.access(configured, os.X_OK) else None
     found = shutil.which(name)
     if found:
         return found

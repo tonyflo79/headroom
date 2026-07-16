@@ -3,10 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
-  accountNameError, accountStatePresentation, formatAge, formatReset, loginMessage,
+  accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset, loginMessage,
   normalizeBootstrap, normalizeDeviceInstructions, onboardingPresentation, percentLeft,
   refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
-  shouldApplySnapshot, suggestedAccountName,
+  shouldApplySnapshot, settingsPatch, suggestedAccountName, validateSettingsDraft,
 } from "../dist/main.js";
 
 const bootstrap = {
@@ -207,7 +207,7 @@ test("revisioned snapshots preserve account order and sanitize surface metadata"
 
 test("reset and account state copy remain actionable without color", () => {
   assert.equal(formatReset(1_800_003_600, 1_800_000_000_000).label,
-    "resets in 1h");
+    "resets in 1 hour");
   assert.equal(formatReset(1_799_999_999, 1_800_000_000_000).label, "reset due");
   assert.match(accountStatePresentation({ state: "stale" }).action, /refresh/);
   assert.match(accountStatePresentation({
@@ -228,6 +228,74 @@ test("reset and account state copy remain actionable without color", () => {
     /restart loop.*engine_unexpected_exit/);
   assert.doesNotMatch(refreshStatePresentation("degraded", "raw private detail").label,
     /private/);
+});
+
+test("normalizes desktop settings with safe local defaults", () => {
+  const raw = structuredClone(bootstrap);
+  raw.view.settings = {
+    title: "Terminal Fleet", theme: "midnight", redact_emails: false,
+    reserve_percent: 12.5, auto_handoff: false, refresh_interval_seconds: 600,
+    provider_paths: { claude: "/opt/homebrew/bin/claude", codex: "relative/codex" },
+    preferred_terminal: "warp", remember_window: false,
+    notifications: {
+      enabled: true, reset_enabled: true, global_threshold_percent: 15,
+      provider_threshold_percent: { claude: 12, codex: 100 },
+    },
+  };
+  const settings = normalizeBootstrap(raw).view.settings;
+  assert.equal(settings.theme, "midnight");
+  assert.equal(settings.refresh_interval_seconds, 600);
+  assert.deepEqual(settings.provider_paths, { claude: "/opt/homebrew/bin/claude" });
+  assert.equal(settings.preferred_terminal, "warp");
+  assert.equal(settings.remember_window, false);
+  assert.deepEqual(settings.notifications.provider_threshold_percent, { claude: 12 });
+
+  raw.view.settings = { title: "Headroom" };
+  const defaults = normalizeBootstrap(raw).view.settings;
+  assert.equal(defaults.refresh_interval_seconds, 300);
+  assert.equal(defaults.notifications.enabled, false);
+  assert.equal(defaults.notifications.reset_enabled, false);
+});
+
+test("validates and projects the complete settings contract", () => {
+  const draft = {
+    theme: "terminal", title: "Headroom", redact_emails: true,
+    reserve_percent: "10.5", auto_handoff: true,
+    refresh_interval_seconds: "300", claude_path: "", codex_path: "/usr/bin/true",
+    preferred_terminal: "terminal", remember_window: true,
+    notifications_enabled: false, reset_notifications: false,
+    notification_threshold: "20", claude_notification_threshold: "",
+    codex_notification_threshold: "15",
+  };
+  assert.deepEqual(validateSettingsDraft(draft), {});
+  assert.deepEqual(settingsPatch(draft), {
+    theme: "terminal", title: "Headroom", redact_emails: true,
+    reserve_percent: 10.5, auto_handoff: true, refresh_interval_seconds: 300,
+    provider_paths: { claude: null, codex: "/usr/bin/true" },
+    preferred_terminal: "terminal", remember_window: true,
+    notifications: {
+      enabled: false, reset_enabled: false, global_threshold_percent: 20,
+      provider_threshold_percent: { claude: null, codex: 15 },
+    },
+  });
+  assert.equal(validateSettingsDraft({ ...draft, title: " Headroom" }).title !== undefined,
+    true);
+  assert.equal(validateSettingsDraft({ ...draft, refresh_interval_seconds: "30" })
+    .refresh_interval_seconds !== undefined, true);
+  assert.equal(validateSettingsDraft({ ...draft, codex_path: "relative/codex" })
+    .codex_path !== undefined, true);
+  assert.equal(validateSettingsDraft({ ...draft, notification_threshold: "100" })
+    .notification_threshold !== undefined, true);
+});
+
+test("uses locale formatters for percentages and exposes the settings console", () => {
+  assert.match(formatPercent(72), /72/);
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  for (const id of ["settings-theme", "settings-refresh", "settings-terminal",
+    "settings-launch-at-login", "settings-notifications", "settings-save"]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(html, /⌘, settings · ⌘R refresh · ⌘W close · ⌘Q quit/);
 });
 
 test("all five themes define the same semantic token contract", () => {

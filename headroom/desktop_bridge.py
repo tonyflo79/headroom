@@ -35,6 +35,12 @@ MAX_REQUEST_ID = 128
 def _settings(config=None):
     dashboard = (registry.dashboard_settings(config) if config is not None
                  else dict(registry.DEFAULT_DASHBOARD))
+    desktop = (registry.desktop_settings(config) if config is not None
+               else registry.desktop_settings({
+                   "schema_version": 1,
+                   "accounts": [{"name": "defaults", "provider": "claude",
+                                 "home": "/defaults"}],
+               }))
     return {
         "title": dashboard.get("title", "AI Fleet"),
         "theme": dashboard.get("theme", "midnight"),
@@ -43,6 +49,7 @@ def _settings(config=None):
                             if config is not None else 0.0),
         "auto_handoff": (registry.auto_handoff(config)
                          if config is not None else True),
+        **desktop,
     }
 
 
@@ -378,6 +385,148 @@ def refresh_desktop(now=None):
     return _view(config, public, now=now)
 
 
+def _validated_settings_patch(patch):
+    if not isinstance(patch, dict):
+        raise BridgeError("invalid_settings", "settings update must be an object")
+    allowed = {
+        "theme", "title", "redact_emails", "reserve_percent",
+        "auto_handoff", "refresh_interval_seconds", "provider_paths",
+        "preferred_terminal", "remember_window", "notifications",
+    }
+    if set(patch) - allowed:
+        raise BridgeError("invalid_settings", "settings update contains unknown fields")
+    normalized = dict(patch)
+    if "theme" in patch and patch["theme"] not in registry.THEMES:
+        raise BridgeError("invalid_setting_theme", "theme is invalid")
+    if "title" in patch and not registry._valid_title(patch["title"]):
+        raise BridgeError(
+            "invalid_setting_title", "title must be 1-80 printable characters")
+    for key in ("redact_emails", "auto_handoff", "remember_window"):
+        if key in patch and not isinstance(patch[key], bool):
+            raise BridgeError(
+                "invalid_setting_" + key, f"{key} must be true or false")
+    if "reserve_percent" in patch and not registry._valid_number(
+            patch["reserve_percent"], 0, 99):
+        raise BridgeError(
+            "invalid_setting_reserve_percent", "reserve must be 0-99 percent")
+    interval = patch.get("refresh_interval_seconds")
+    if interval is not None and (
+            not isinstance(interval, int) or isinstance(interval, bool)
+            or not registry.REFRESH_INTERVAL_MIN <= interval
+            <= registry.REFRESH_INTERVAL_MAX):
+        raise BridgeError(
+            "invalid_setting_refresh_interval",
+            f"refresh interval must be {registry.REFRESH_INTERVAL_MIN}-"
+            f"{registry.REFRESH_INTERVAL_MAX} seconds")
+    if "preferred_terminal" in patch \
+            and patch["preferred_terminal"] not in registry.PREFERRED_TERMINALS:
+        raise BridgeError(
+            "invalid_setting_preferred_terminal", "preferred terminal is invalid")
+    if "provider_paths" in patch:
+        paths_value = patch["provider_paths"]
+        if not isinstance(paths_value, dict) \
+                or set(paths_value) - set(registry.PROVIDERS):
+            raise BridgeError("invalid_setting_provider_paths",
+                              "provider paths are invalid")
+        normalized_paths = {}
+        for provider, value in paths_value.items():
+            if value in (None, ""):
+                normalized_paths[provider] = None
+                continue
+            if not registry._valid_provider_path(value) \
+                    or not os.path.isfile(value) or not os.access(value, os.X_OK):
+                raise BridgeError(
+                    f"invalid_setting_{provider}_path",
+                    f"{provider} path must name an executable file")
+            normalized_paths[provider] = os.path.realpath(value)
+        normalized["provider_paths"] = normalized_paths
+    if "notifications" in patch:
+        value = patch["notifications"]
+        allowed_notifications = {
+            "enabled", "reset_enabled", "global_threshold_percent",
+            "provider_threshold_percent",
+        }
+        if not isinstance(value, dict) or set(value) - allowed_notifications:
+            raise BridgeError("invalid_setting_notifications",
+                              "notification settings are invalid")
+        value = dict(value)
+        for key in ("enabled", "reset_enabled"):
+            if key in value and not isinstance(value[key], bool):
+                raise BridgeError(
+                    "invalid_setting_notifications", f"{key} must be true or false")
+        threshold = value.get("global_threshold_percent")
+        if threshold is not None and (
+                not isinstance(threshold, int) or isinstance(threshold, bool)
+                or not 1 <= threshold <= 99):
+            raise BridgeError("invalid_setting_notification_threshold",
+                              "notification threshold must be 1-99 percent")
+        provider_thresholds = value.get("provider_threshold_percent")
+        if provider_thresholds is not None:
+            if not isinstance(provider_thresholds, dict) \
+                    or set(provider_thresholds) - set(registry.PROVIDERS):
+                raise BridgeError("invalid_setting_notification_threshold",
+                                  "provider notification thresholds are invalid")
+            for provider, threshold in provider_thresholds.items():
+                if threshold is not None and (
+                        not isinstance(threshold, int) or isinstance(threshold, bool)
+                        or not 1 <= threshold <= 99):
+                    raise BridgeError(
+                        "invalid_setting_notification_threshold",
+                        f"{provider} notification threshold must be 1-99 percent")
+        normalized["notifications"] = value
+    return normalized
+
+
+def update_settings_desktop(patch, now=None):
+    normalized = _validated_settings_patch(patch)
+    state, config, recovery_code = _registry_discovery()
+    if state == "recovery":
+        raise BridgeError("recovery_required", recovery_code)
+    if config is None:
+        raise BridgeError("no_accounts", "connect an account before saving settings")
+
+    def apply(value):
+        dashboard = value.setdefault("dashboard", {})
+        routing = value.setdefault("routing", {})
+        desktop = value.setdefault("desktop", {})
+        for key in ("theme", "title", "redact_emails"):
+            if key in normalized:
+                dashboard[key] = normalized[key]
+        for key in ("reserve_percent", "auto_handoff"):
+            if key in normalized:
+                routing[key] = normalized[key]
+        for key in ("refresh_interval_seconds", "preferred_terminal",
+                    "remember_window"):
+            if key in normalized:
+                desktop[key] = normalized[key]
+        if "provider_paths" in normalized:
+            provider_paths = desktop.setdefault("provider_paths", {})
+            for provider, path in normalized["provider_paths"].items():
+                if path is None:
+                    provider_paths.pop(provider, None)
+                else:
+                    provider_paths[provider] = path
+        if "notifications" in normalized:
+            notifications = desktop.setdefault("notifications", {})
+            for key, value in normalized["notifications"].items():
+                if key != "provider_threshold_percent":
+                    notifications[key] = value
+                    continue
+                provider_thresholds = notifications.setdefault(
+                    "provider_threshold_percent", {})
+                for provider, threshold in value.items():
+                    if threshold is None:
+                        provider_thresholds.pop(provider, None)
+                    else:
+                        provider_thresholds[provider] = threshold
+
+    try:
+        registry.mutate(apply)
+    except registry.RegistryError as error:
+        raise BridgeError("settings_conflict", "settings could not be committed") from error
+    return discover_desktop(now=now)
+
+
 def account_action_desktop(action, name, *, new_name=None,
                            reserved=None, confirmation=None, now=None):
     if action not in {
@@ -699,7 +848,7 @@ def _handle(command, args):
                 "fixture_snapshot", "discover", "adopt", "refresh",
                 "claude_login", "codex_device_login", "onboarding",
                 "account_lifecycle", "reauthentication",
-                "resilient_collection", "shutdown"],
+                "resilient_collection", "validated_settings", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
@@ -732,6 +881,11 @@ def _handle(command, args):
         if set(args) - {"now"}:
             raise BridgeError("invalid_args", "refresh arguments are invalid")
         return refresh_desktop(args.get("now")), False
+    if command == "update_settings":
+        if set(args) - {"patch", "now"}:
+            raise BridgeError("invalid_args", "settings arguments are invalid")
+        return update_settings_desktop(
+            args.get("patch"), now=args.get("now")), False
     if command == "start_claude_login":
         if set(args) - {"name", "expected_email"}:
             raise BridgeError("invalid_args", "login arguments are invalid")

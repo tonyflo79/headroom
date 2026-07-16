@@ -371,7 +371,7 @@ class DesktopBridgeUnit(unittest.TestCase):
     def test_adopt_preserves_settings_and_returns_redacted_live_view(self):
         existing = {
             "schema_version": 1,
-            "dashboard": {"title": "Keep Me", "theme": "light",
+            "dashboard": {"title": "Keep Me", "theme": "paper",
                           "redact_emails": True, "port": 9000},
             "routing": {"reserve_percent": 12, "auto_handoff": False},
             "accounts": [{"name": "old", "provider": "claude",
@@ -412,13 +412,106 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(saved["dashboard"], existing["dashboard"])
         self.assertEqual(saved["routing"], existing["routing"])
         self.assertEqual(value["settings"]["title"], "Keep Me")
-        self.assertEqual(value["settings"]["theme"], "light")
+        self.assertEqual(value["settings"]["theme"], "paper")
         self.assertEqual(value["settings"]["reserve_percent"], 12)
         self.assertFalse(value["settings"]["auto_handoff"])
         account = next(row for row in value["accounts"]
                        if row["name"] == "codex-main")
         self.assertEqual(account["identity"], "p***@example.com")
         self.assertEqual(account["plan"], "ChatGPT Plus")
+
+    def test_settings_commit_atomically_and_drive_provider_discovery(self):
+        binary = os.path.join(self.temp.name, "custom-claude")
+        with open(binary, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(binary, 0o700)
+        registry.save({
+            "schema_version": 1,
+            "accounts": [{"name": "main", "provider": "claude",
+                          "home": "/main"}],
+        })
+
+        with mock.patch.object(desktop_bridge.connect, "detect_existing",
+                               return_value=[]):
+            value = desktop_bridge.update_settings_desktop({
+                "theme": "terminal",
+                "title": "Headroom // Operator",
+                "redact_emails": False,
+                "reserve_percent": 17.5,
+                "auto_handoff": False,
+                "refresh_interval_seconds": 420,
+                "provider_paths": {"claude": binary, "codex": None},
+                "preferred_terminal": "iterm",
+                "remember_window": False,
+                "notifications": {
+                    "enabled": False,
+                    "reset_enabled": True,
+                    "global_threshold_percent": 15,
+                    "provider_threshold_percent": {"claude": 10},
+                },
+            }, now=1_800_000_000)
+
+        saved = registry.load()
+        self.assertEqual(saved["dashboard"], {
+            "theme": "terminal", "title": "Headroom // Operator",
+            "redact_emails": False,
+        })
+        self.assertEqual(saved["routing"], {
+            "reserve_percent": 17.5, "auto_handoff": False,
+        })
+        self.assertEqual(saved["desktop"]["refresh_interval_seconds"], 420)
+        self.assertEqual(saved["desktop"]["preferred_terminal"], "iterm")
+        self.assertFalse(saved["desktop"]["remember_window"])
+        self.assertEqual(saved["desktop"]["provider_paths"], {
+            "claude": os.path.realpath(binary),
+        })
+        self.assertFalse(saved["desktop"]["notifications"]["enabled"])
+        self.assertEqual(value["settings"]["notifications"]
+                         ["provider_threshold_percent"], {"claude": 10})
+        self.assertEqual(desktop_bridge.connect.provider_binary("claude"),
+                         os.path.realpath(binary))
+        self.assertEqual(os.stat(paths.config_path()).st_mode & 0o777, 0o600)
+
+    def test_settings_reject_invalid_fields_without_mutating_config(self):
+        registry.save({
+            "schema_version": 1,
+            "dashboard": {"title": "Before"},
+            "accounts": [{"name": "main", "provider": "claude",
+                          "home": "/main"}],
+        })
+        before = paths.load_json(paths.config_path())
+        invalid = [
+            ({"theme": "unknown"}, "invalid_setting_theme"),
+            ({"title": "  "}, "invalid_setting_title"),
+            ({"refresh_interval_seconds": 5},
+             "invalid_setting_refresh_interval"),
+            ({"provider_paths": {"claude": "/missing/claude"}},
+             "invalid_setting_claude_path"),
+            ({"preferred_terminal": "arbitrary-app"},
+             "invalid_setting_preferred_terminal"),
+            ({"notifications": {"global_threshold_percent": 100}},
+             "invalid_setting_notification_threshold"),
+            ({"unknown": True}, "invalid_settings"),
+        ]
+        for patch, code in invalid:
+            with self.subTest(patch=patch), \
+                    self.assertRaises(desktop_bridge.BridgeError) as raised:
+                desktop_bridge.update_settings_desktop(patch)
+            self.assertEqual(raised.exception.code, code)
+            self.assertEqual(paths.load_json(paths.config_path()), before)
+
+    def test_desktop_setting_defaults_are_quiet_and_safe(self):
+        config = {
+            "schema_version": 1,
+            "accounts": [{"name": "main", "provider": "claude",
+                          "home": "/main"}],
+        }
+        settings = desktop_bridge._settings(config)
+        self.assertEqual(settings["refresh_interval_seconds"], 300)
+        self.assertTrue(settings["remember_window"])
+        self.assertEqual(settings["preferred_terminal"], "terminal")
+        self.assertEqual(settings["provider_paths"], {})
+        self.assertFalse(settings["notifications"]["enabled"])
 
     def test_adopt_refuses_a_duplicate_name_before_mutation(self):
         registry.save({
@@ -532,6 +625,8 @@ class DesktopBridgeSubprocess(unittest.TestCase):
         self.assertEqual(frames[0]["result"]["bridge_schema"],
                          desktop_bridge.SCHEMA)
         self.assertIn("resilient_collection",
+                      frames[0]["result"]["capabilities"])
+        self.assertIn("validated_settings",
                       frames[0]["result"]["capabilities"])
         self.assertEqual(frames[1]["result"]["schema"], "headroom_widget@1")
         self.assertIn("prepared sanitized fixture", process.stderr)
