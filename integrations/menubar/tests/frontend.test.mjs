@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset, loginMessage,
+  externalReauthenticationPresentation,
   normalizeBootstrap, normalizeDeviceInstructions, normalizeHandoffHealth,
   normalizeRoutingPreview,
   onboardingPresentation, percentLeft,
@@ -161,6 +162,30 @@ test("normalizes account lifecycle policy without accepting home details", () =>
   assert.equal(JSON.stringify(policy).includes("/private"), false);
   raw.view.accounts[0].policy.reauthentication = "invented";
   assert.equal(normalizeBootstrap(raw).view.accounts[0].policy, null);
+});
+
+test("external provider recovery appears only for an engine-authorized held slot", () => {
+  const raw = structuredClone(bootstrap);
+  raw.view.accounts[0].state = "held";
+  raw.view.accounts[0].recovery_action = "external_reauthentication";
+  raw.view.accounts[0].policy = {
+    schema: "headroom_account_lifecycle@1", home_kind: "headroom",
+    home_retained_on_remove: true, rename_keeps_home: true,
+    reauthentication: "keychain_manual", position: 0, count: 1,
+    can_move_up: false, can_move_down: false, can_remove: false,
+  };
+  const account = normalizeBootstrap(raw).view.accounts[0];
+  const presentation = externalReauthenticationPresentation(account);
+  assert.equal(presentation.label, "Open Claude login");
+  assert.match(presentation.warning, /cannot be rolled back/);
+  assert.match(presentation.confirmation, /personal/);
+
+  raw.view.accounts[0].state = "current";
+  assert.equal(externalReauthenticationPresentation(
+    normalizeBootstrap(raw).view.accounts[0]), null);
+  raw.view.accounts[0].state = "held";
+  raw.view.accounts[0].recovery_action = "invented";
+  assert.equal(normalizeBootstrap(raw).view.accounts[0].recovery_action, null);
 });
 
 test("device instructions accept only the exact OpenAI HTTPS origin", () => {
@@ -396,7 +421,9 @@ test("routing UI exposes only family and account based native actions", () => {
   }
   assert.match(source, /desktop_copy_routing_command/);
   assert.match(source, /desktop_open_routing_launch/);
+  assert.match(source, /desktop_open_external_reauthentication/);
   assert.doesNotMatch(source, /desktop_(copy|open)_routing_(command|launch)[\s\S]{0,180}(command|environment):/);
+  assert.doesNotMatch(source, /desktop_open_external_reauthentication[\s\S]{0,180}(home|command|environment):/);
 });
 
 test("all five themes define the same semantic token contract", () => {

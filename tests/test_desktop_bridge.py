@@ -421,6 +421,25 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertEqual(limited["policy"]["position"], 1)
         self.assertTrue(limited["policy"]["home_retained_on_remove"])
 
+    def test_desktop_projects_external_reauthentication_only_when_actionable(self):
+        config = {"schema_version": 1, "accounts": [
+            {"name": "expired", "provider": "claude", "home": "/adopted"},
+            {"name": "offline", "provider": "claude", "home": "/offline"},
+        ]}
+        snapshot = {"generated": 1_800_000_000, "accounts": [
+            {"name": "expired", "provider": "claude", "ok": False,
+             "note": "cached Claude token has expired",
+             "error_code": "claude_usage_token_expired"},
+            {"name": "offline", "provider": "claude", "ok": False,
+             "note": "provider temporarily unavailable",
+             "error_code": "provider_offline"},
+        ]}
+        value = desktop_bridge._view(config, snapshot, now=1_800_000_000)
+        actions = {row["name"]: row["recovery_action"]
+                   for row in value["accounts"]}
+        self.assertEqual(actions, {
+            "expired": "external_reauthentication", "offline": None})
+
     def test_account_actions_reserve_reorder_rename_and_confirm_remove(self):
         home_a = os.path.join(paths.homes_dir(), "a")
         home_b = os.path.join(paths.homes_dir(), "b")
@@ -815,6 +834,107 @@ class DesktopBridgeUnit(unittest.TestCase):
             desktop_bridge.routing_launch_intent_desktop("claude", "safe-slot")
         self.assertEqual(raised.exception.code, "provider_cli_missing")
 
+    def test_external_reauthentication_intent_is_bounded_and_engine_generated(self):
+        account = {"name": "claude-held", "provider": "claude",
+                   "home": "/provider-owned/claude-held"}
+        registry.save({
+            "schema_version": 1,
+            "desktop": {"preferred_terminal": "iterm"},
+            "accounts": [account],
+        })
+        engine = os.path.join(self.temp.name, "headroom-engine-test")
+        with open(engine, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(engine, 0o700)
+        engine = os.path.realpath(engine)
+        held_view = {"accounts": [{
+            "name": "claude-held", "provider": "claude", "state": "held",
+            "note": "cached Claude token has expired",
+            "recovery_action": "external_reauthentication",
+        }]}
+        with mock.patch.object(desktop_bridge, "discover_desktop",
+                               return_value=held_view), \
+                mock.patch.object(desktop_bridge.route, "slot_lease_active",
+                                  return_value=False), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value="/bin/echo"), \
+                mock.patch.object(desktop_bridge.sys, "frozen", True,
+                                  create=True), \
+                mock.patch.object(desktop_bridge.sys, "executable", engine):
+            intent = desktop_bridge.external_reauthentication_intent_desktop(
+                "claude-held")
+        self.assertEqual(intent, {
+            "schema": desktop_bridge.REAUTH_LAUNCH_INTENT_SCHEMA,
+            "provider": "claude",
+            "account_name": "claude-held",
+            "recovery_kind": "provider_managed",
+            "preferred_terminal": "iterm",
+            "launcher": [engine, "--launch-reauthentication", "claude-held"],
+            "environment": {"HEADROOM_DIR": self.temp.name},
+        })
+        encoded = json.dumps(intent)
+        self.assertNotIn(account["home"], encoded)
+        self.assertNotIn("/bin/echo", encoded)
+
+    def test_external_reauthentication_refuses_healthy_or_safely_managed_slots(self):
+        adopted = {"name": "adopted", "provider": "claude",
+                   "home": "/provider-owned/adopted"}
+        owned_home = os.path.join(paths.homes_dir(), "owned")
+        os.makedirs(owned_home)
+        with open(os.path.join(owned_home, ".credentials.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"token": "fixture"}, handle)
+        owned = {"name": "owned", "provider": "claude", "home": owned_home}
+        registry.save({"schema_version": 1, "accounts": [adopted, owned]})
+        healthy = {"accounts": [{
+            "name": "adopted", "provider": "claude", "state": "current",
+            "note": None,
+            "recovery_action": None,
+        }, {
+            "name": "owned", "provider": "claude", "state": "held",
+            "note": "cached Claude token has expired",
+            "recovery_action": "external_reauthentication",
+        }]}
+        with mock.patch.object(desktop_bridge, "discover_desktop",
+                               return_value=healthy), \
+                mock.patch.object(desktop_bridge.route, "slot_lease_active",
+                                  return_value=False), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value="/bin/echo"):
+            with self.assertRaises(desktop_bridge.BridgeError) as current:
+                desktop_bridge.external_reauthentication_intent_desktop("adopted")
+            with self.assertRaises(desktop_bridge.BridgeError) as managed:
+                desktop_bridge.external_reauthentication_intent_desktop("owned")
+        self.assertEqual(current.exception.code, "reauthentication_not_required")
+        self.assertEqual(managed.exception.code,
+                         "managed_reauthentication_available")
+
+    def test_external_reauthentication_execs_only_the_registered_provider_login(self):
+        account = {"name": "claude-held", "provider": "claude",
+                   "home": "/provider-owned/claude-held"}
+        registry.save({"schema_version": 1, "accounts": [account]})
+        intent = {
+            "schema": desktop_bridge.REAUTH_LAUNCH_INTENT_SCHEMA,
+            "provider": "claude", "account_name": "claude-held",
+            "recovery_kind": "provider_managed",
+            "preferred_terminal": "terminal", "launcher": [],
+            "environment": {"HEADROOM_DIR": self.temp.name},
+        }
+        with mock.patch.object(
+                desktop_bridge, "external_reauthentication_intent_desktop",
+                return_value=intent), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  return_value="/bin/echo"), \
+                mock.patch.object(desktop_bridge.collector, "scrubbed_env",
+                                  return_value={"PATH": "/usr/bin"}), \
+                mock.patch.object(desktop_bridge.os, "execve") as execute:
+            desktop_bridge.launch_external_reauthentication("claude-held")
+        argv, environment = execute.call_args.args[1:]
+        self.assertEqual(execute.call_args.args[0], "/bin/echo")
+        self.assertEqual(argv, ["/bin/echo", "auth", "login"])
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], account["home"])
+        self.assertNotIn("CODEX_HOME", environment)
+
     def test_frozen_launcher_reproves_and_never_accepts_command_text(self):
         intent = {
             "family": "claude", "account_name": "safe-slot",
@@ -948,6 +1068,8 @@ class DesktopBridgeSubprocess(unittest.TestCase):
         self.assertIn("validated_settings",
                       frames[0]["result"]["capabilities"])
         self.assertIn("routing_launch",
+                      frames[0]["result"]["capabilities"])
+        self.assertIn("provider_reauthentication_launch",
                       frames[0]["result"]["capabilities"])
         self.assertEqual(frames[1]["result"]["schema"], "headroom_widget@1")
         self.assertIn("prepared sanitized fixture", process.stderr)
