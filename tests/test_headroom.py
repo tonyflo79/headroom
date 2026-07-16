@@ -26,6 +26,13 @@ from headroom import (  # noqa: E402
 )
 
 
+def _canonical_temp_directory():
+    """Return a fixture root with the same path identity production enforces."""
+    directory = tempfile.TemporaryDirectory()
+    directory.name = os.path.realpath(directory.name)
+    return directory
+
+
 def _claude_row(name="a", used5h=10.0, used7d=20.0, ok=True, **over):
     now = int(time.time())
     row = {
@@ -856,7 +863,7 @@ class HandoffSafety(unittest.TestCase):
     OTHER_SID = "22222222-2222-4222-8222-222222222222"
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _canonical_temp_directory()
         self.old_headroom = os.environ.get("HEADROOM_DIR")
         os.environ["HEADROOM_DIR"] = os.path.join(self.temp.name, "headroom")
         self.old_cwd = os.getcwd()
@@ -2136,7 +2143,7 @@ class CollectionLockOrdering(unittest.TestCase):
 
 class AuthRefreshCommand(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _canonical_temp_directory()
         self.env = mock.patch.dict(os.environ, {"HEADROOM_DIR": self.temp.name})
         self.env.start()
         self.home = os.path.join(paths.homes_dir(), "claude-a")
