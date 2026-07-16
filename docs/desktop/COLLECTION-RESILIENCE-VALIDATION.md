@@ -53,11 +53,41 @@ credentials, provider payloads, raw exception text, or private paths.
 
 ## Evidence record
 
-Status: implementation tests complete; exact packaged-app evidence pending
+Status: automated contract tests and exact packaged-app fault injection complete
 
 | UTC time | Build commit | Scenario | Revision/result | Status |
 |---|---|---|---|---|
-| pending | pending | exact frozen and signed build | pending | pending |
+| 2026-07-16T13:13:10Z | `c319e4e` | frozen bridge capability | `resilient_collection`, frozen arm64 runtime | pass |
+| 2026-07-16T13:13:10Z | `c319e4e` | stale activation before callback registration | reconciled to current snapshot | pass |
+| 2026-07-16T13:13:10Z | `c319e4e` | kill bundled engine, then reopen/refresh | same app PID; `RECOVERING` to `CURRENT` with new engine | pass |
+| 2026-07-16T13:13:10Z | `c319e4e` | fail engine three consecutive times | `DEGRADED`; no engine restart loop | pass |
+| 2026-07-16T13:13:10Z | `c319e4e` | listener and Quit cleanup | zero TCP listeners; app and engine exited | pass |
+
+The exact implementation commit was rebuilt as a PyInstaller arm64 frozen
+engine and bundled into `Headroom.app`. The app received a local ad-hoc
+signature and passed strict deep code-signature verification. This is QA
+sealing, not Developer ID signing or notarization.
+
+The packaged run began from an aged fixture snapshot. Activation completed
+before the JavaScript callback was available, and the explicit Rust-store
+reconciliation still advanced the visible surface to the current revision. An
+injected engine crash displayed `RECOVERING`, retained the same Headroom app
+process, started a new frozen-engine process tree, produced a later private
+snapshot, and returned to `CURRENT`. Three consecutive injected restart
+failures then displayed `DEGRADED` and left no engine process running, proving
+the five-minute cooldown stopped the loop. The app opened no TCP listener and
+Command-Q removed both app and engine processes.
+
+Automated evidence covers the provider matrix that is unsafe or impractical to
+force against real accounts: stable 401/403, 429, 5xx, offline, timeout, and
+malformed-response classification; identity- and age-bound carryover; changed
+identity refusal; provider deadline isolation with ordered partial results;
+capped ±20 percent jitter; wake freshness gating; partial-fleet backoff; exact
+bridge capability gating; and monotonic shared-snapshot publication. The
+focused gates passed 135 Python, 15 frontend, and 17 Rust tests. The full Python
+suite passed 602 tests; its remaining 26 failures and 11 errors are the
+documented pre-existing macOS `/var` versus `/private/var` canonicalization
+cases in handoff/supervisor code, outside this desktop slice.
 
 The terminal-green Midnight design remains the default: black canvas,
 phosphor-green monospace text, and glowing capacity bars. `RECOVERING` retains
