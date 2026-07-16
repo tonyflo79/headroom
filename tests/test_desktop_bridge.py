@@ -253,7 +253,8 @@ class DesktopBridgeUnit(unittest.TestCase):
             row("current"), row("limited", "codex", used=100),
             row("held", trust="unverified"),
             row("stale", captured=now - 2_000),
-            {**row("offline"), "ok": False, "note": "provider unavailable"},
+            {**row("offline"), "ok": False, "note": "provider unavailable",
+             "error_code": "provider_auth_rejected"},
         ]}
         value = desktop_bridge._view(config, snapshot, now=now)
         states = {account["name"]: account["state"]
@@ -267,6 +268,9 @@ class DesktopBridgeUnit(unittest.TestCase):
         offline = next(row for row in value["accounts"]
                        if row["name"] == "offline")
         self.assertEqual(offline["note"], "provider unavailable")
+        self.assertEqual(offline["diagnostic_code"],
+                         "provider_auth_rejected")
+        self.assertIsNone(desktop_bridge._diagnostic_code("../../raw-output"))
         self.assertEqual(limited["policy"]["position"], 1)
         self.assertTrue(limited["policy"]["home_retained_on_remove"])
 

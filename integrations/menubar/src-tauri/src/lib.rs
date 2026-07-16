@@ -9,8 +9,10 @@
 #![allow(dead_code)] // Removed when the legacy popover helpers move onto the bridge.
 
 use std::{
+    fs::{self, OpenOptions},
     io::{Read, Write},
     net::TcpStream,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -24,13 +26,17 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
-    AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Manager, PhysicalPosition, PhysicalSize, Url, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 mod icon;
 
@@ -68,11 +74,16 @@ const FEED_MAX_BYTES: usize = 256 * 1024;
 const FEED_DEADLINE: Duration = Duration::from_secs(6);
 
 const DESKTOP_WINDOW_LABEL: &str = "main";
+const DESKTOP_POPOVER_LABEL: &str = "desktop-popover";
 const DESKTOP_BRIDGE_SCHEMA: &str = "headroom_desktop_bridge@1";
 const DESKTOP_VIEW_SCHEMA: &str = "headroom_desktop_view@1";
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_BRIDGE_FRAME_BYTES: usize = 1024 * 1024;
+const DESKTOP_POPOVER_WIDTH: f64 = 420.0;
+const DESKTOP_POPOVER_HEIGHT: f64 = 680.0;
+const WINDOW_STATE_SCHEMA: &str = "headroom_desktop_window@1";
+const DESKTOP_THEMES: [&str; 5] = ["midnight", "minimal", "chrome", "paper", "terminal"];
 
 struct BridgeSession {
     child: CommandChild,
@@ -90,6 +101,84 @@ impl Default for DesktopEngine {
             session: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+#[derive(Clone)]
+struct DesktopSnapshot {
+    revision: u64,
+    theme: String,
+    view: serde_json::Value,
+}
+
+#[derive(Default)]
+struct DesktopStore {
+    current: Mutex<Option<DesktopSnapshot>>,
+}
+
+impl DesktopStore {
+    fn replace_view(&self, view: serde_json::Value) -> Result<DesktopSnapshot, String> {
+        validate_desktop_view(&view)?;
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| "desktop snapshot store is unavailable".to_string())?;
+        let revision = current.as_ref().map_or(1, |snapshot| snapshot.revision + 1);
+        let theme = current
+            .as_ref()
+            .map(|snapshot| snapshot.theme.clone())
+            .unwrap_or_else(|| configured_theme(&view).to_string());
+        let snapshot = DesktopSnapshot {
+            revision,
+            theme,
+            view,
+        };
+        *current = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn set_theme(&self, theme: &str) -> Result<DesktopSnapshot, String> {
+        if !DESKTOP_THEMES.contains(&theme) {
+            return Err("desktop theme is invalid".into());
+        }
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| "desktop snapshot store is unavailable".to_string())?;
+        let previous = current
+            .as_ref()
+            .ok_or_else(|| "desktop snapshot is unavailable".to_string())?;
+        let snapshot = DesktopSnapshot {
+            revision: previous.revision + 1,
+            theme: theme.to_string(),
+            view: previous.view.clone(),
+        };
+        *current = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn snapshot(&self) -> Result<DesktopSnapshot, String> {
+        self.current
+            .lock()
+            .map_err(|_| "desktop snapshot store is unavailable".to_string())?
+            .clone()
+            .ok_or_else(|| "desktop snapshot is unavailable".to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WindowPlacement {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Default)]
+struct DesktopUiState {
+    placement: Mutex<Option<WindowPlacement>>,
+    last_tray_rect: Mutex<Option<tauri::Rect>>,
+    popover_opened_at: Mutex<Option<Instant>>,
+    refreshing: AtomicBool,
 }
 
 struct AppState {
@@ -831,6 +920,24 @@ fn parse_bridge_response(frame: &[u8], expected_id: &str) -> Result<serde_json::
         .ok_or_else(|| "desktop engine response is missing its result".to_string())
 }
 
+fn validate_desktop_view(view: &serde_json::Value) -> Result<(), String> {
+    if view.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_VIEW_SCHEMA)
+        || !view
+            .get("accounts")
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return Err("bundled desktop engine returned an invalid snapshot".into());
+    }
+    Ok(())
+}
+
+fn configured_theme(view: &serde_json::Value) -> &'static str {
+    view.pointer("/settings/theme")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|theme| DESKTOP_THEMES.iter().copied().find(|known| *known == theme))
+        .unwrap_or("terminal")
+}
+
 fn validate_desktop_bootstrap(
     handshake: &serde_json::Value,
     view: &serde_json::Value,
@@ -864,14 +971,7 @@ fn validate_desktop_bootstrap(
     if !supports_desktop {
         return Err("bundled desktop engine lacks the required capability".into());
     }
-    if view.get("schema").and_then(serde_json::Value::as_str) != Some(DESKTOP_VIEW_SCHEMA)
-        || !view
-            .get("accounts")
-            .is_some_and(serde_json::Value::is_array)
-    {
-        return Err("bundled desktop engine returned an invalid snapshot".into());
-    }
-    Ok(())
+    validate_desktop_view(view)
 }
 
 fn bootstrap_sidecar(
@@ -968,9 +1068,16 @@ fn bootstrap_sidecar(
 
 fn desktop_initialization_script(
     handshake: &serde_json::Value,
-    view: &serde_json::Value,
+    snapshot: &DesktopSnapshot,
+    surface: &str,
 ) -> String {
-    let payload = serde_json::json!({"bridge": handshake, "view": view});
+    let payload = serde_json::json!({
+        "bridge": handshake,
+        "view": snapshot.view,
+        "revision": snapshot.revision,
+        "theme": snapshot.theme,
+        "surface": surface,
+    });
     let payload_json = serde_json::to_string(&payload).expect("desktop bootstrap serializes");
     let payload_literal = serde_json::to_string(&payload_json).expect("JSON string serializes");
     format!(
@@ -981,9 +1088,9 @@ fn desktop_initialization_script(
 fn build_desktop_window(
     app: &AppHandle,
     handshake: &serde_json::Value,
-    view: &serde_json::Value,
+    snapshot: &DesktopSnapshot,
 ) -> tauri::Result<WebviewWindow> {
-    let script = desktop_initialization_script(handshake, view);
+    let script = desktop_initialization_script(handshake, snapshot, "main");
     WebviewWindowBuilder::new(
         app,
         DESKTOP_WINDOW_LABEL,
@@ -997,6 +1104,90 @@ fn build_desktop_window(
     .initialization_script(&script)
     .on_navigation(|url| url.as_str() == "about:blank" || is_bundled_page(url))
     .build()
+}
+
+fn build_desktop_popover(
+    app: &AppHandle,
+    handshake: &serde_json::Value,
+    snapshot: &DesktopSnapshot,
+) -> tauri::Result<WebviewWindow> {
+    let script = desktop_initialization_script(handshake, snapshot, "popover");
+    let builder = WebviewWindowBuilder::new(
+        app,
+        DESKTOP_POPOVER_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("Headroom")
+    .inner_size(DESKTOP_POPOVER_WIDTH, DESKTOP_POPOVER_HEIGHT)
+    .visible(false)
+    .decorations(false)
+    .resizable(false)
+    .maximizable(false)
+    .minimizable(false)
+    .closable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
+    .transparent(true);
+    #[cfg(target_os = "macos")]
+    let builder = builder.theme(Some(tauri::Theme::Dark)).effects(
+        tauri::utils::config::WindowEffectsConfig {
+            effects: vec![tauri::utils::WindowEffect::Popover],
+            state: Some(tauri::utils::WindowEffectState::Active),
+            radius: Some(PANEL_RADIUS),
+            color: None,
+        },
+    );
+    builder
+        .initialization_script(&script)
+        .on_navigation(|url| url.as_str() == "about:blank" || is_bundled_page(url))
+        .build()
+}
+
+fn snapshot_envelope(snapshot: &DesktopSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "revision": snapshot.revision,
+        "theme": snapshot.theme,
+        "view": snapshot.view,
+    })
+}
+
+fn push_snapshot_to_windows(app: &AppHandle, snapshot: &DesktopSnapshot) {
+    let payload = serde_json::to_string(&snapshot_envelope(snapshot))
+        .expect("sanitized desktop snapshot serializes");
+    let payload_literal = serde_json::to_string(&payload).expect("snapshot string serializes");
+    let script = format!(
+        "window.__headroomApplySnapshot&&window.__headroomApplySnapshot(JSON.parse({payload_literal}));"
+    );
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+    update_desktop_tray_icon(app, &snapshot.view);
+}
+
+fn publish_desktop_view(
+    app: &AppHandle,
+    view: serde_json::Value,
+) -> Result<DesktopSnapshot, String> {
+    let snapshot = app.state::<DesktopStore>().replace_view(view)?;
+    push_snapshot_to_windows(app, &snapshot);
+    Ok(snapshot)
+}
+
+fn publish_result_view(app: &AppHandle, value: &serde_json::Value) -> Result<(), String> {
+    if value.get("schema").and_then(serde_json::Value::as_str) == Some(DESKTOP_VIEW_SCHEMA) {
+        publish_desktop_view(app, value.clone())?;
+    } else if value
+        .get("view")
+        .and_then(|view| view.get("schema"))
+        .and_then(serde_json::Value::as_str)
+        == Some(DESKTOP_VIEW_SCHEMA)
+    {
+        publish_desktop_view(app, value["view"].clone())?;
+    }
+    Ok(())
 }
 
 fn request_desktop_engine(
@@ -1085,26 +1276,33 @@ async fn engine_command(
 
 #[tauri::command]
 async fn desktop_discover(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
 ) -> Result<serde_json::Value, String> {
-    engine_command(state.inner().clone(), "discover", serde_json::json!({})).await
+    let value = engine_command(state.inner().clone(), "discover", serde_json::json!({})).await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
 async fn desktop_onboarding(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     action: String,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
+    let value = engine_command(
         state.inner().clone(),
         "onboarding",
         serde_json::json!({"action": action}),
     )
-    .await
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
 async fn desktop_account_action(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     action: String,
     name: String,
@@ -1112,7 +1310,7 @@ async fn desktop_account_action(
     reserved: Option<bool>,
     confirmation: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
+    let value = engine_command(
         state.inner().clone(),
         "account_action",
         serde_json::json!({
@@ -1123,28 +1321,36 @@ async fn desktop_account_action(
             "confirmation": confirmation,
         }),
     )
-    .await
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
 async fn desktop_adopt(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     candidate_id: String,
     name: String,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
+    let value = engine_command(
         state.inner().clone(),
         "adopt",
         serde_json::json!({"candidate_id": candidate_id, "name": name}),
     )
-    .await
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
 async fn desktop_refresh(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
 ) -> Result<serde_json::Value, String> {
-    engine_command(state.inner().clone(), "refresh", serde_json::json!({})).await
+    let value = engine_command(state.inner().clone(), "refresh", serde_json::json!({})).await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
@@ -1215,28 +1421,83 @@ async fn desktop_open_device_url(url: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn desktop_login_status(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     job_id: String,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
+    let value = engine_command(
         state.inner().clone(),
         "login_status",
         serde_json::json!({"job_id": job_id}),
     )
-    .await
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
 }
 
 #[tauri::command]
 async fn desktop_cancel_login(
+    app: AppHandle,
     state: tauri::State<'_, DesktopEngine>,
     job_id: String,
 ) -> Result<serde_json::Value, String> {
-    engine_command(
+    let value = engine_command(
         state.inner().clone(),
         "cancel_login",
         serde_json::json!({"job_id": job_id}),
     )
-    .await
+    .await?;
+    publish_result_view(&app, &value)?;
+    Ok(value)
+}
+
+#[tauri::command]
+fn desktop_set_theme(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopStore>,
+    theme: String,
+) -> Result<serde_json::Value, String> {
+    let snapshot = state.set_theme(&theme)?;
+    push_snapshot_to_windows(&app, &snapshot);
+    Ok(snapshot_envelope(&snapshot))
+}
+
+fn show_desktop_window(app: &AppHandle, panel: Option<&str>) -> Result<(), String> {
+    let window = app
+        .get_webview_window(DESKTOP_WINDOW_LABEL)
+        .ok_or_else(|| "desktop window is unavailable".to_string())?;
+    window
+        .show()
+        .map_err(|_| "desktop window could not be shown".to_string())?;
+    let _ = window.unminimize();
+    window
+        .set_focus()
+        .map_err(|_| "desktop window could not be focused".to_string())?;
+    if let Some(panel) = panel {
+        let panel = js_string_literal(panel);
+        let _ = window.eval(&format!(
+            "window.__headroomOpenPanel&&window.__headroomOpenPanel({panel});"
+        ));
+    }
+    if let Some(popover) = app.get_webview_window(DESKTOP_POPOVER_LABEL) {
+        let _ = popover.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn desktop_show_dashboard(app: AppHandle) -> Result<(), String> {
+    show_desktop_window(&app, None)
+}
+
+#[tauri::command]
+fn desktop_show_settings(app: AppHandle) -> Result<(), String> {
+    show_desktop_window(&app, Some("appearance"))
+}
+
+#[tauri::command]
+fn desktop_quit(app: AppHandle) {
+    app.exit(0);
 }
 
 fn stop_desktop_engine(app: &AppHandle) {
@@ -1272,10 +1533,279 @@ fn stop_desktop_engine(app: &AppHandle) {
     let _ = session.child.kill();
 }
 
+fn desktop_average_level(view: &serde_json::Value) -> Option<f32> {
+    let value = view
+        .pointer("/headline/avg_5h_left_percent")
+        .and_then(serde_json::Value::as_f64)?;
+    (value.is_finite() && (0.0..=100.0).contains(&value)).then_some((value / 100.0) as f32)
+}
+
+fn update_desktop_tray_icon(app: &AppHandle, view: &serde_json::Value) {
+    let Some(tray) = app.tray_by_id("headroom-tray") else {
+        return;
+    };
+    let level = desktop_average_level(view);
+    let (rgba, width, height) = icon::tray_icon_rgba(level);
+    let _ = tray.set_icon(Some(Image::new_owned(rgba, width, height)));
+    let _ = tray.set_icon_as_template(true);
+    let tooltip = level.map_or_else(
+        || "Headroom — no current five-hour reading".to_string(),
+        |level| {
+            format!(
+                "Headroom — {}% average five-hour headroom",
+                (level * 100.0).round()
+            )
+        },
+    );
+    let _ = tray.set_tooltip(Some(tooltip));
+}
+
+fn set_refresh_state_windows(app: &AppHandle, state: &str) {
+    let state = js_string_literal(state);
+    let script =
+        format!("window.__headroomSetRefreshState&&window.__headroomSetRefreshState({state});");
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+}
+
+fn refresh_desktop_async(app: &AppHandle) {
+    let state = app.state::<DesktopUiState>();
+    if state.refreshing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    set_refresh_state_windows(app, "refreshing");
+    let app = app.clone();
+    let engine = app.state::<DesktopEngine>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let result = engine_command(engine, "refresh", serde_json::json!({})).await;
+        let settled = match result {
+            Ok(view) if publish_result_view(&app, &view).is_ok() => "current",
+            _ => "offline",
+        };
+        app.state::<DesktopUiState>()
+            .refreshing
+            .store(false, Ordering::SeqCst);
+        set_refresh_state_windows(&app, settled);
+    });
+}
+
+fn toggle_desktop_popover(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(DESKTOP_POPOVER_LABEL) else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        return;
+    }
+    let max_height = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| {
+            monitor
+                .size()
+                .to_logical::<f64>(monitor.scale_factor())
+                .height
+                - 80.0
+        })
+        .unwrap_or(DESKTOP_POPOVER_HEIGHT);
+    let height = DESKTOP_POPOVER_HEIGHT.min(max_height).max(320.0);
+    let _ = window.set_size(tauri::LogicalSize::new(DESKTOP_POPOVER_WIDTH, height));
+    let _ = window.move_window_constrained(Position::TrayCenter);
+    *app.state::<DesktopUiState>()
+        .popover_opened_at
+        .lock()
+        .expect("desktop popover state poisoned") = Some(Instant::now());
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+fn build_desktop_tray(app: &AppHandle) -> tauri::Result<()> {
+    let dashboard = MenuItem::with_id(app, "dashboard", "Open Dashboard", true, None::<&str>)?;
+    let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Appearance…", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&dashboard, &refresh, &settings, &quit])?;
+    let snapshot = app.state::<DesktopStore>().snapshot().ok();
+    let level = snapshot
+        .as_ref()
+        .and_then(|snapshot| desktop_average_level(&snapshot.view));
+    let (rgba, width, height) = icon::tray_icon_rgba(level);
+    TrayIconBuilder::with_id("headroom-tray")
+        .icon(Image::new_owned(rgba, width, height))
+        .icon_as_template(true)
+        .tooltip("Headroom")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "dashboard" => {
+                let _ = show_desktop_window(app, None);
+            }
+            "refresh" => refresh_desktop_async(app),
+            "settings" => {
+                let _ = show_desktop_window(app, Some("appearance"));
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
+            if let TrayIconEvent::Click { rect, .. }
+            | TrayIconEvent::Enter { rect, .. }
+            | TrayIconEvent::Move { rect, .. } = &event
+            {
+                *tray
+                    .app_handle()
+                    .state::<DesktopUiState>()
+                    .last_tray_rect
+                    .lock()
+                    .expect("desktop tray state poisoned") = Some(*rect);
+            }
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_desktop_popover(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+fn window_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("window-state.json"))
+        .map_err(|_| "desktop window state directory is unavailable".to_string())
+}
+
+fn valid_window_placement(value: &serde_json::Value) -> Option<WindowPlacement> {
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(WINDOW_STATE_SCHEMA) {
+        return None;
+    }
+    let number = |key: &str| value.get(key).and_then(serde_json::Value::as_i64);
+    let placement = WindowPlacement {
+        x: i32::try_from(number("x")?).ok()?,
+        y: i32::try_from(number("y")?).ok()?,
+        width: u32::try_from(number("width")?).ok()?,
+        height: u32::try_from(number("height")?).ok()?,
+    };
+    ((640..=6000).contains(&placement.width)
+        && (440..=4000).contains(&placement.height)
+        && (-50_000..=50_000).contains(&placement.x)
+        && (-50_000..=50_000).contains(&placement.y))
+    .then_some(placement)
+}
+
+fn placement_intersects_monitor(placement: WindowPlacement, monitor: &tauri::Monitor) -> bool {
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let left = placement.x.max(monitor_position.x);
+    let top = placement.y.max(monitor_position.y);
+    let right = (i64::from(placement.x) + i64::from(placement.width))
+        .min(i64::from(monitor_position.x) + i64::from(monitor_size.width));
+    let bottom = (i64::from(placement.y) + i64::from(placement.height))
+        .min(i64::from(monitor_position.y) + i64::from(monitor_size.height));
+    i64::from(left) + 120 <= right && i64::from(top) + 80 <= bottom
+}
+
+fn load_window_placement(app: &AppHandle) -> Option<WindowPlacement> {
+    let path = window_state_path(app).ok()?;
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 8192 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    valid_window_placement(&value)
+}
+
+fn save_window_placement(app: &AppHandle) -> Result<(), String> {
+    let Some(placement) = *app
+        .state::<DesktopUiState>()
+        .placement
+        .lock()
+        .map_err(|_| "desktop window state is unavailable".to_string())?
+    else {
+        return Ok(());
+    };
+    let path = window_state_path(app)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "desktop window state path is invalid".to_string())?;
+    fs::create_dir_all(directory)
+        .map_err(|_| "desktop window state directory could not be created".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "desktop window state permissions could not be set".to_string())?;
+    let temporary = directory.join(format!(".window-state-{}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| "desktop window state could not be prepared".to_string())?;
+    let value = serde_json::json!({
+        "schema": WINDOW_STATE_SCHEMA,
+        "x": placement.x,
+        "y": placement.y,
+        "width": placement.width,
+        "height": placement.height,
+    });
+    serde_json::to_writer(&mut file, &value)
+        .map_err(|_| "desktop window state could not be encoded".to_string())?;
+    file.write_all(b"\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "desktop window state could not be committed".to_string())?;
+    fs::rename(&temporary, &path)
+        .map_err(|_| "desktop window state could not be published".to_string())?;
+    Ok(())
+}
+
+fn restore_window_placement(window: &WebviewWindow) {
+    let app = window.app_handle();
+    let restored = load_window_placement(app).filter(|placement| {
+        window
+            .available_monitors()
+            .map(|monitors| {
+                monitors
+                    .iter()
+                    .any(|monitor| placement_intersects_monitor(*placement, monitor))
+            })
+            .unwrap_or(false)
+    });
+    if let Some(placement) = restored {
+        let _ = window.set_size(PhysicalSize::new(placement.width, placement.height));
+        let _ = window.set_position(PhysicalPosition::new(placement.x, placement.y));
+    }
+    let placement = (|| {
+        let position = window.outer_position().ok()?;
+        let size = window.inner_size().ok()?;
+        Some(WindowPlacement {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        })
+    })();
+    *app.state::<DesktopUiState>()
+        .placement
+        .lock()
+        .expect("desktop window state poisoned") = placement;
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_positioner::init())
         .manage(DesktopEngine::default())
+        .manage(DesktopStore::default())
+        .manage(DesktopUiState::default())
         .invoke_handler(tauri::generate_handler![
             desktop_discover,
             desktop_onboarding,
@@ -1287,7 +1817,11 @@ pub fn run() {
             desktop_start_reauthentication,
             desktop_login_status,
             desktop_cancel_login,
-            desktop_open_device_url
+            desktop_open_device_url,
+            desktop_set_theme,
+            desktop_show_dashboard,
+            desktop_show_settings,
+            desktop_quit
         ])
         .setup(|app| {
             let (handshake, view, session) =
@@ -1296,14 +1830,68 @@ pub fn run() {
                 .session
                 .lock()
                 .expect("desktop engine mutex poisoned") = Some(session);
-            build_desktop_window(app.handle(), &handshake, &view)?;
+            let snapshot = app
+                .state::<DesktopStore>()
+                .replace_view(view)
+                .map_err(std::io::Error::other)?;
+            let main = build_desktop_window(app.handle(), &handshake, &snapshot)?;
+            restore_window_placement(&main);
+            let popover = build_desktop_popover(app.handle(), &handshake, &snapshot)?;
+            #[cfg(target_os = "macos")]
+            round_window_corners(&popover, PANEL_RADIUS);
+            build_desktop_tray(app.handle())?;
+            update_desktop_tray_icon(app.handle(), &snapshot.view);
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == DESKTOP_WINDOW_LABEL
-                && matches!(event, WindowEvent::CloseRequested { .. })
+            if window.label() == DESKTOP_WINDOW_LABEL {
+                let ui = window.app_handle().state::<DesktopUiState>();
+                match event {
+                    WindowEvent::Moved(position) => {
+                        if let Ok(mut placement) = ui.placement.lock() {
+                            let current = placement.get_or_insert(WindowPlacement {
+                                x: position.x,
+                                y: position.y,
+                                width: 900,
+                                height: 650,
+                            });
+                            current.x = position.x;
+                            current.y = position.y;
+                        }
+                    }
+                    WindowEvent::Resized(size) => {
+                        if let Ok(mut placement) = ui.placement.lock() {
+                            let current = placement.get_or_insert(WindowPlacement {
+                                x: 0,
+                                y: 0,
+                                width: size.width,
+                                height: size.height,
+                            });
+                            current.width = size.width;
+                            current.height = size.height;
+                        }
+                    }
+                    WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = save_window_placement(window.app_handle());
+                        let _ = window.hide();
+                    }
+                    _ => {}
+                }
+            } else if window.label() == DESKTOP_POPOVER_LABEL
+                && matches!(event, WindowEvent::Focused(false))
             {
-                window.app_handle().exit(0);
+                let just_opened = window
+                    .app_handle()
+                    .state::<DesktopUiState>()
+                    .popover_opened_at
+                    .lock()
+                    .ok()
+                    .and_then(|opened| *opened)
+                    .is_some_and(|opened| opened.elapsed() < REOPEN_SUPPRESS);
+                if !just_opened {
+                    let _ = window.hide();
+                }
             }
         })
         .build(tauri::generate_context!())
@@ -1311,6 +1899,7 @@ pub fn run() {
 
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            let _ = save_window_placement(handle);
             stop_desktop_engine(handle);
         }
     });
@@ -1518,10 +2107,71 @@ mod tests {
             "bridge_schema": DESKTOP_BRIDGE_SCHEMA
         });
         let view = serde_json::json!({"schema": DESKTOP_VIEW_SCHEMA, "accounts": []});
-        let script = desktop_initialization_script(&handshake, &view);
+        let snapshot = DesktopSnapshot {
+            revision: 7,
+            theme: "terminal".into(),
+            view,
+        };
+        let script = desktop_initialization_script(&handshake, &snapshot, "popover");
         assert!(script.contains("Object.defineProperty"));
         assert!(script.contains("writable:false"));
         assert!(!script.contains("JSON.parse({\"bridge\""));
+    }
+
+    #[test]
+    fn desktop_store_revisions_one_ordered_snapshot_for_both_surfaces() {
+        let store = DesktopStore::default();
+        let first = store
+            .replace_view(serde_json::json!({
+                "schema": DESKTOP_VIEW_SCHEMA,
+                "settings": {"theme": "midnight"},
+                "accounts": [{"name": "codex"}, {"name": "claude"}],
+            }))
+            .unwrap();
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.theme, "midnight");
+        assert_eq!(first.view["accounts"][0]["name"], "codex");
+        let themed = store.set_theme("terminal").unwrap();
+        assert_eq!(themed.revision, 2);
+        assert_eq!(themed.theme, "terminal");
+        assert_eq!(themed.view, first.view);
+        assert!(store.set_theme("remote-css").is_err());
+    }
+
+    #[test]
+    fn window_placement_validation_refuses_unsafe_geometry() {
+        let valid = serde_json::json!({
+            "schema": WINDOW_STATE_SCHEMA,
+            "x": -1200,
+            "y": 40,
+            "width": 1800,
+            "height": 1300,
+        });
+        assert_eq!(
+            valid_window_placement(&valid),
+            Some(WindowPlacement {
+                x: -1200,
+                y: 40,
+                width: 1800,
+                height: 1300,
+            })
+        );
+        assert!(valid_window_placement(&serde_json::json!({
+            "schema": WINDOW_STATE_SCHEMA,
+            "x": 0,
+            "y": 0,
+            "width": 120,
+            "height": 80,
+        }))
+        .is_none());
+        assert!(valid_window_placement(&serde_json::json!({
+            "schema": "other",
+            "x": 0,
+            "y": 0,
+            "width": 900,
+            "height": 650,
+        }))
+        .is_none());
     }
 
     #[test]

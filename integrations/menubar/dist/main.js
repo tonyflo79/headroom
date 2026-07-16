@@ -1,9 +1,64 @@
 const VALID_STATES = new Set(["current", "limited", "held", "stale"]);
+const FRESHNESS_STATES = new Set(["current", "held", "stale"]);
 const VALID_MODES = new Set(["ready", "onboarding", "demo", "recovery"]);
 const ONBOARDING_STEPS = new Set(["welcome", "providers", "accounts", "demo", "complete"]);
 const PROVIDER_STATES = new Set(["unchecked", "ready", "missing", "upgrade_required"]);
 const HOME_KINDS = new Set(["headroom", "adopted"]);
 const REAUTH_STATES = new Set(["available", "provider_managed", "keychain_manual"]);
+const VALID_THEMES = new Set(["midnight", "minimal", "chrome", "paper", "terminal"]);
+const VALID_SURFACES = new Set(["main", "popover"]);
+const TRUST_STATES = new Set([
+  "verified", "verified_local", "verified_remote", "duplicate_identity", "held",
+]);
+
+let activeBootstrap = null;
+let activeInvoke = null;
+let activeRevision = 0;
+
+export function shouldApplySnapshot(currentRevision, incomingRevision) {
+  return Number.isInteger(incomingRevision) && incomingRevision > currentRevision;
+}
+
+export function shouldApplyCommandResult(baseRevision, currentRevision) {
+  return Number.isInteger(baseRevision) && Number.isInteger(currentRevision) &&
+    currentRevision <= baseRevision;
+}
+
+export function formatReset(epoch, now = Date.now()) {
+  const value = Number(epoch);
+  if (!Number.isFinite(value)) return { label: "reset unknown", exact: null };
+  const target = value * 1000;
+  const difference = target - now;
+  const exact = new Date(target).toLocaleString();
+  if (difference <= 0) return { label: "reset due", exact };
+  const minutes = Math.max(1, Math.round(difference / 60_000));
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const remaining = minutes % 60;
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (!days && remaining) parts.push(`${remaining}m`);
+  return { label: `resets in ${parts.join(" ")}`, exact };
+}
+
+export function accountStatePresentation(account) {
+  if (account?.reserved) return {
+    label: "reserved", action: "Monitored, but excluded from automatic routing",
+  };
+  if (account?.state === "current") return {
+    label: "current", action: "Verified capacity is current",
+  };
+  if (account?.state === "limited") return {
+    label: "limited", action: "Capacity is exhausted; wait for the displayed reset",
+  };
+  if (account?.state === "stale") return {
+    label: "stale", action: "Last verified reading has aged out; refresh when online",
+  };
+  return {
+    label: "held", action: account?.note || "Capacity is not proven; refresh or re-authenticate",
+  };
+}
 
 export function accountNameError(value, existingNames = []) {
   if (typeof value !== "string" || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(value)) {
@@ -142,6 +197,24 @@ export function normalizeBootstrap(raw) {
         can_move_down: rawPolicy.can_move_down === true,
         can_remove: rawPolicy.can_remove === true,
       } : null;
+    const windows = {};
+    if (account?.windows && typeof account.windows === "object") {
+      for (const [key, windowValue] of Object.entries(account.windows)) {
+        if (typeof key !== "string" || key.length > 64 ||
+            !windowValue || typeof windowValue !== "object") continue;
+        const state = VALID_STATES.has(windowValue.state) ? windowValue.state : "held";
+        const left = Number(windowValue.left_percent);
+        const last = Number(windowValue.last_observed_left_percent);
+        const resets = Number(windowValue.resets_at);
+        windows[key] = {
+          state,
+          left_percent: Number.isFinite(left) && left >= 0 && left <= 100 ? left : null,
+          last_observed_left_percent:
+            Number.isFinite(last) && last >= 0 && last <= 100 ? last : null,
+          resets_at: Number.isFinite(resets) ? resets : null,
+        };
+      }
+    }
     return {
       name: typeof account?.name === "string" ? account.name : "unknown",
       provider: account?.provider === "claude" || account?.provider === "codex"
@@ -149,11 +222,14 @@ export function normalizeBootstrap(raw) {
       identity: typeof account?.identity === "string" ? account.identity : null,
       plan: typeof account?.plan === "string" ? account.plan : "Unknown",
       note: typeof account?.note === "string" ? account.note : null,
+      diagnostic_code: typeof account?.diagnostic_code === "string" &&
+        /^[a-z0-9_]{1,64}$/.test(account.diagnostic_code)
+        ? account.diagnostic_code : null,
+      trust_state: TRUST_STATES.has(account?.trust_state) ? account.trust_state : null,
       reserved: account?.reserved === true,
       policy,
       state: VALID_STATES.has(account?.state) ? account.state : "held",
-      windows: account?.windows && typeof account.windows === "object"
-        ? account.windows : {},
+      windows,
     };
   }) : [];
   const candidates = Array.isArray(view.candidates) ? view.candidates.filter((row) =>
@@ -173,9 +249,48 @@ export function normalizeBootstrap(raw) {
         connected_count: Number.isInteger(row.connected_count) && row.connected_count >= 0
           ? row.connected_count : 0,
       })) : [];
+  const rawSettings = view.settings && typeof view.settings === "object" ? view.settings : {};
+  const settingsTheme = VALID_THEMES.has(rawSettings.theme) ? rawSettings.theme : "terminal";
+  const rawFreshness = view.freshness && typeof view.freshness === "object"
+    ? view.freshness : {};
+  const freshness = {
+    state: FRESHNESS_STATES.has(rawFreshness.state) ? rawFreshness.state : "held",
+    age_seconds: Number.isFinite(Number(rawFreshness.age_seconds))
+      ? Math.max(0, Math.floor(Number(rawFreshness.age_seconds))) : null,
+    reason: typeof rawFreshness.reason === "string" ? rawFreshness.reason : "unknown",
+  };
+  const rawHeadline = view.headline && typeof view.headline === "object" ? view.headline : {};
+  const numberOrNull = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
   return {
-    bridge: raw.bridge,
-    view: { ...view, mode: VALID_MODES.has(view.mode) ? view.mode : "recovery",
+    bridge: {
+      bridge_schema: raw.bridge.bridge_schema,
+      product_version: typeof raw.bridge.product_version === "string"
+        ? raw.bridge.product_version : "unknown",
+      architecture: typeof raw.bridge.architecture === "string"
+        ? raw.bridge.architecture : "unknown",
+      runtime: raw.bridge.runtime === "frozen" ? "frozen" : "unavailable",
+    },
+    revision: Number.isInteger(raw.revision) && raw.revision >= 0 ? raw.revision : 0,
+    surface: VALID_SURFACES.has(raw.surface) ? raw.surface : "main",
+    theme: VALID_THEMES.has(raw.theme) ? raw.theme : settingsTheme,
+    view: {
+      schema: "headroom_desktop_view@1",
+      mode: VALID_MODES.has(view.mode) ? view.mode : "recovery",
+      settings: {
+        title: typeof rawSettings.title === "string" ? rawSettings.title : "Headroom",
+        theme: settingsTheme,
+        redact_emails: rawSettings.redact_emails !== false,
+        reserve_percent: numberOrNull(rawSettings.reserve_percent) ?? 0,
+        auto_handoff: rawSettings.auto_handoff !== false,
+      },
+      freshness,
+      headline: {
+        avg_5h_left_percent: numberOrNull(rawHeadline.avg_5h_left_percent),
+        avg_7d_left_percent: numberOrNull(rawHeadline.avg_7d_left_percent),
+        current_accounts: numberOrNull(rawHeadline.current_accounts),
+        total_accounts: numberOrNull(rawHeadline.total_accounts),
+      },
+      recovery_code: typeof view.recovery_code === "string" ? view.recovery_code : null,
       accounts, candidates, onboarding: {
         schema: "headroom_desktop_onboarding@1", step,
         resumable: rawOnboarding.resumable === true,
@@ -189,16 +304,21 @@ export function normalizeBootstrap(raw) {
 function windowRow(label, value) {
   const row = document.createElement("div");
   row.className = `window-row window-${VALID_STATES.has(value?.state) ? value.state : "held"}`;
+  if (label.startsWith("scoped:")) row.classList.add("model-scoped");
   const line = document.createElement("div");
   line.className = "window-line";
   const name = document.createElement("span");
   name.textContent = `> ${label.replace("scoped:", "")}`;
   const reading = document.createElement("strong");
   const left = percentLeft(value);
-  const reset = Number(value?.resets_at);
-  const resetText = Number.isFinite(reset)
-    ? ` · resets ${new Date(reset * 1000).toLocaleString()}` : "";
-  reading.textContent = `${left === null ? value?.state || "held" : `${Math.round(left)}% left`}${resetText}`;
+  const reset = formatReset(value?.resets_at);
+  const last = Number(value?.last_observed_left_percent);
+  const capacity = left === null
+    ? Number.isFinite(last) ? `${value?.state || "held"} · last ${Math.round(last)}% left`
+      : value?.state || "held"
+    : `${Math.round(left)}% left`;
+  reading.textContent = `${capacity} · ${reset.label}`;
+  if (reset.exact) reading.title = `Exact local reset: ${reset.exact}`;
   line.append(name, reading);
   const meter = document.createElement("div");
   meter.className = "meter";
@@ -207,6 +327,7 @@ function windowRow(label, value) {
   meter.setAttribute("aria-valuemin", "0");
   meter.setAttribute("aria-valuemax", "100");
   if (left !== null) meter.setAttribute("aria-valuenow", String(left));
+  meter.setAttribute("aria-valuetext", capacity);
   const fill = document.createElement("i");
   fill.style.width = `${left ?? 0}%`;
   meter.append(fill);
@@ -214,9 +335,11 @@ function windowRow(label, value) {
   return row;
 }
 
-function accountCard(account, lifecycle = null) {
+function accountCard(account, lifecycle = null, surface = "main") {
   const article = document.createElement("article");
   article.className = `account state-${account.state}`;
+  if (account.reserved) article.classList.add("is-reserved");
+  article.dataset.provider = account.provider;
   const header = document.createElement("header");
   const identity = document.createElement("div");
   const name = document.createElement("h3");
@@ -227,21 +350,30 @@ function accountCard(account, lifecycle = null) {
   identity.append(name, detail);
   const state = document.createElement("span");
   state.className = "state";
-  state.textContent = account.state;
+  const presentation = accountStatePresentation(account);
+  state.textContent = presentation.label;
+  state.setAttribute("aria-label", `${presentation.label}: ${presentation.action}`);
   header.append(identity, state);
+  const semantics = document.createElement("p");
+  semantics.className = "account-semantics";
+  semantics.textContent = [
+    presentation.action,
+    account.trust_state ? `trust ${account.trust_state.replaceAll("_", " ")}` : "trust unverified",
+    account.diagnostic_code ? `code ${account.diagnostic_code}` : null,
+  ].filter(Boolean).join(" · ");
   const windows = document.createElement("div");
   windows.className = "windows";
   for (const [key, value] of Object.entries(account.windows)) {
     windows.append(windowRow(key, value));
   }
-  article.append(header, windows);
+  article.append(header, semantics, windows);
   if (account.note) {
     const note = document.createElement("p");
     note.className = "note";
     note.textContent = account.note;
     article.append(note);
   }
-  if (lifecycle && account.policy) {
+  if (surface === "main" && lifecycle && account.policy) {
     article.append(accountLifecyclePanel(account, lifecycle));
   }
   return article;
@@ -668,11 +800,89 @@ function demoPanel(invoke, update) {
   return panel;
 }
 
+export function refreshStatePresentation(state) {
+  if (state === "refreshing") return {
+    label: "REFRESHING · verified readings remain visible while providers respond",
+    busy: true,
+  };
+  if (state === "offline") return {
+    label: "OFFLINE · refresh failed; retained readings keep their displayed age and trust state",
+    busy: false,
+  };
+  return { label: "", busy: false };
+}
+
+function applyRefreshState(state) {
+  const presentation = refreshStatePresentation(state);
+  document.body.dataset.refreshState = state;
+  const status = document.getElementById("surface-status");
+  if (presentation.label) status.textContent = presentation.label;
+  else if (activeBootstrap) {
+    const freshness = activeBootstrap.view.freshness;
+    const age = freshness.age_seconds === null ? "age unknown" : `${freshness.age_seconds}s old`;
+    status.textContent =
+      `${freshness.state.toUpperCase()} · ${age} · ${freshness.reason.replaceAll("_", " ")}`;
+  }
+  const refresh = document.getElementById("refresh");
+  refresh.setAttribute("aria-busy", String(presentation.busy));
+  refresh.textContent = presentation.busy ? "Refreshing…" : "Refresh";
+  refresh.disabled = presentation.busy || !activeInvoke ||
+    activeBootstrap?.view.mode !== "ready";
+}
+
+function openAppearancePanel() {
+  if (document.body.dataset.surface !== "main") return;
+  const panel = document.getElementById("appearance");
+  panel.hidden = false;
+  panel.scrollIntoView({ block: "start", behavior: "smooth" });
+  document.getElementById("theme-picker").focus();
+}
+
+function configureSurfaceActions(surface, invoke) {
+  const actions = document.getElementById("surface-actions");
+  const controls = [];
+  if (!invoke) {
+    actions.replaceChildren();
+    return;
+  }
+  if (surface === "popover") {
+    controls.push(
+      actionButton("Dashboard", () => invoke("desktop_show_dashboard"), "primary"),
+      actionButton("Settings", () => invoke("desktop_show_settings")),
+      actionButton("Quit", () => invoke("desktop_quit"), "danger"),
+    );
+  } else {
+    controls.push(actionButton("Appearance", openAppearancePanel));
+  }
+  actions.replaceChildren(...controls);
+}
+
+function configureAppearance(value, invoke) {
+  const picker = document.getElementById("theme-picker");
+  picker.value = value.theme;
+  picker.oninput = invoke ? async () => {
+    if (!VALID_THEMES.has(picker.value)) return;
+    document.body.dataset.theme = picker.value;
+    try { await invoke("desktop_set_theme", { theme: picker.value }); }
+    catch { picker.value = activeBootstrap?.theme || "terminal"; }
+  } : null;
+  document.getElementById("close-appearance").onclick = () => {
+    document.getElementById("appearance").hidden = true;
+  };
+}
+
 export function renderBootstrap(raw, invoke = null) {
   const value = normalizeBootstrap(raw);
   const { view } = value;
+  activeBootstrap = value;
+  activeInvoke = invoke;
+  activeRevision = Math.max(activeRevision, value.revision);
+  document.body.dataset.surface = value.surface;
+  document.body.dataset.theme = value.theme;
+  document.body.dataset.snapshotState = view.freshness.state;
   document.getElementById("engine-badge").textContent = value.bridge.runtime;
-  document.body.dataset.savedTheme = view.settings?.theme || "midnight";
+  document.body.dataset.savedTheme = view.settings?.theme || "terminal";
+  document.getElementById("revision").textContent = `revision ${value.revision}`;
   document.getElementById("page-title").textContent = view.settings?.title || "Headroom";
   document.getElementById("summary").textContent =
     `Engine ${value.bridge.product_version} · ${value.bridge.architecture}`;
@@ -686,16 +896,35 @@ export function renderBootstrap(raw, invoke = null) {
     : view.mode === "onboarding" || view.mode === "demo" ? presentation.headline
       : Number.isFinite(average) ? `${Math.round(average)}% average five-hour headroom`
         : "No current five-hour reading";
-  const update = (nextView) => renderBootstrap({ bridge: value.bridge, view: nextView }, invoke);
+  const update = (nextView) => {
+    // Native commands publish a newer, revisioned snapshot to both surfaces
+    // before their raw view response resolves. Do not let that unrevisioned
+    // response repaint the initiating surface with its older closure state.
+    if (!shouldApplyCommandResult(value.revision, activeRevision)) return activeBootstrap;
+    return renderBootstrap({
+      bridge: value.bridge,
+      view: nextView,
+      revision: value.revision,
+      theme: value.theme,
+      surface: value.surface,
+    }, invoke);
+  };
   const existingNames = view.accounts.map((row) => row.name);
-  const lifecycle = invoke && view.mode === "ready"
+  const lifecycle = invoke && view.mode === "ready" && value.surface === "main"
     ? { invoke, update, existingNames } : null;
-  document.getElementById("accounts").replaceChildren(
-    ...view.accounts.map((account) => accountCard(account, lifecycle)),
-  );
+  const cards = view.accounts.map((account) => accountCard(account, lifecycle, value.surface));
+  if (!cards.length && view.mode === "ready") {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = value.surface === "popover"
+      ? "No connected accounts · open Dashboard to begin setup"
+      : "No connected accounts · begin setup to add Claude or Codex";
+    cards.push(empty);
+  }
+  document.getElementById("accounts").replaceChildren(...cards);
   const actions = document.getElementById("actions");
   let actionCards = [];
-  if (invoke && view.mode === "onboarding") {
+  if (value.surface === "main" && invoke && view.mode === "onboarding") {
     actionCards = [onboardingPanel(view, invoke, update)];
     if (view.onboarding.step === "accounts") {
       actionCards.push(...view.candidates.map((row) =>
@@ -706,9 +935,9 @@ export function renderBootstrap(raw, invoke = null) {
           : prerequisiteCard(provider));
       }
     }
-  } else if (invoke && view.mode === "demo") {
+  } else if (value.surface === "main" && invoke && view.mode === "demo") {
     actionCards = [demoPanel(invoke, update)];
-  } else if (invoke && view.mode === "ready") {
+  } else if (value.surface === "main" && invoke && view.mode === "ready") {
     actionCards = [
       ...view.candidates.map((row) => candidateCard(row, invoke, update, existingNames)),
       providerLoginCard("claude", invoke, update, existingNames),
@@ -716,27 +945,40 @@ export function renderBootstrap(raw, invoke = null) {
     ];
   }
   actions.replaceChildren(...actionCards);
+  configureSurfaceActions(value.surface, invoke);
+  configureAppearance(value, invoke);
+  const freshnessAge = view.freshness.age_seconds === null
+    ? "age unknown" : `${view.freshness.age_seconds}s old`;
+  document.getElementById("surface-status").textContent =
+    `${view.freshness.state.toUpperCase()} · ${freshnessAge} · ${view.freshness.reason.replaceAll("_", " ")}`;
   const refresh = document.getElementById("refresh");
   refresh.disabled = !invoke || view.mode !== "ready";
   refresh.onclick = invoke ? async () => {
-    const pending = refreshPresentation(true);
-    refresh.disabled = pending.busy;
-    refresh.setAttribute("aria-busy", String(pending.busy));
-    refresh.textContent = pending.label;
+    applyRefreshState("refreshing");
     try { update(await invoke("desktop_refresh")); }
-    catch { document.getElementById("headline").textContent =
-      "Refresh could not be completed safely"; }
+    catch { applyRefreshState("offline"); }
     finally {
-      const settled = refreshPresentation(false);
-      refresh.textContent = settled.label;
-      refresh.setAttribute("aria-busy", String(settled.busy));
-      refresh.disabled = false;
+      if (document.body.dataset.refreshState !== "offline") applyRefreshState("current");
     }
   } : null;
   return value;
 }
 
 if (typeof document !== "undefined") {
+  window.__headroomApplySnapshot = (snapshot) => {
+    if (!activeBootstrap || !shouldApplySnapshot(activeRevision, snapshot?.revision)) return;
+    renderBootstrap({
+      bridge: activeBootstrap.bridge,
+      surface: activeBootstrap.surface,
+      revision: snapshot.revision,
+      theme: snapshot.theme,
+      view: snapshot.view,
+    }, activeInvoke);
+  };
+  window.__headroomSetRefreshState = applyRefreshState;
+  window.__headroomOpenPanel = (panel) => {
+    if (panel === "appearance") openAppearancePanel();
+  };
   try {
     renderBootstrap(window.__HEADROOM_BOOTSTRAP__, window.__TAURI__?.core?.invoke || null);
   } catch (error) {

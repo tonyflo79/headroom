@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
-  accountNameError, loginMessage, normalizeBootstrap, normalizeDeviceInstructions,
-  onboardingPresentation, percentLeft, refreshPresentation, suggestedAccountName,
+  accountNameError, accountStatePresentation, formatReset, loginMessage,
+  normalizeBootstrap, normalizeDeviceInstructions, onboardingPresentation, percentLeft,
+  refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
+  shouldApplySnapshot, suggestedAccountName,
 } from "../dist/main.js";
 
 const bootstrap = {
@@ -174,4 +177,55 @@ test("demo presentation is explicit and provider-free", () => {
     title: "> demo mode",
     headline: "Bundled sample data · no provider access",
   });
+});
+
+test("revisioned snapshots preserve account order and sanitize surface metadata", () => {
+  const raw = structuredClone(bootstrap);
+  raw.revision = 9;
+  raw.surface = "popover";
+  raw.theme = "terminal";
+  raw.view.accounts = [
+    { name: "codex-first", provider: "codex", state: "held", windows: {} },
+    { name: "claude-second", provider: "claude", state: "current", windows: {} },
+  ];
+  const value = normalizeBootstrap(raw);
+  assert.equal(value.revision, 9);
+  assert.equal(value.surface, "popover");
+  assert.equal(value.theme, "terminal");
+  assert.deepEqual(value.view.accounts.map((row) => row.name),
+    ["codex-first", "claude-second"]);
+  raw.surface = "remote";
+  raw.theme = "https://evil.test/theme.css";
+  assert.equal(normalizeBootstrap(raw).surface, "main");
+  assert.equal(normalizeBootstrap(raw).theme, "terminal");
+  assert.equal(shouldApplySnapshot(9, 10), true);
+  assert.equal(shouldApplySnapshot(9, 9), false);
+  assert.equal(shouldApplySnapshot(9, 8), false);
+  assert.equal(shouldApplyCommandResult(9, 9), true);
+  assert.equal(shouldApplyCommandResult(9, 10), false);
+});
+
+test("reset and account state copy remain actionable without color", () => {
+  assert.equal(formatReset(1_800_003_600, 1_800_000_000_000).label,
+    "resets in 1h");
+  assert.equal(formatReset(1_799_999_999, 1_800_000_000_000).label, "reset due");
+  assert.match(accountStatePresentation({ state: "stale" }).action, /refresh/);
+  assert.match(accountStatePresentation({ state: "limited" }).action, /wait/);
+  assert.match(accountStatePresentation({ state: "held", note: "Reconnect account" }).action,
+    /Reconnect/);
+  assert.match(accountStatePresentation({ state: "current", reserved: true }).action,
+    /excluded/);
+  assert.match(refreshStatePresentation("offline").label, /OFFLINE/);
+  assert.equal(refreshStatePresentation("refreshing").busy, true);
+});
+
+test("all five themes define the same semantic token contract", () => {
+  const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
+  const tokens = ["--canvas:", "--panel:", "--panel-strong:", "--control:",
+    "--phosphor:", "--phosphor-bright:", "--phosphor-dim:", "--line:",
+    "--warning:", "--danger:", "--scanline:", "--ambient:", "--glow-color:"];
+  for (const theme of ["midnight", "minimal", "chrome", "paper", "terminal"]) {
+    const block = css.split(`body[data-theme="${theme}"] {`, 2)[1].split("}", 1)[0];
+    for (const token of tokens) assert.match(block, new RegExp(token));
+  }
 });

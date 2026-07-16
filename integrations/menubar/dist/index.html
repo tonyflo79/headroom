@@ -17,9 +17,29 @@
         </div>
         <div class="toolbar">
           <button id="refresh" type="button" disabled>Refresh</button>
+          <div id="surface-actions" class="surface-actions"></div>
           <span id="engine-badge" class="badge">connecting</span>
         </div>
       </header>
+
+      <p id="surface-status" class="surface-status" role="status" aria-live="polite"></p>
+
+      <section id="appearance" class="appearance-panel" aria-labelledby="appearance-title" hidden>
+        <div>
+          <p class="eyebrow">HEADROOM // APPEARANCE</p>
+          <h2 id="appearance-title">> live theme preview</h2>
+          <p>One semantic dashboard model, five local themes. Changes update the dashboard and popover together.</p>
+        </div>
+        <label for="theme-picker">Theme</label>
+        <select id="theme-picker">
+          <option value="midnight">Midnight</option>
+          <option value="minimal">Minimal</option>
+          <option value="chrome">Chrome</option>
+          <option value="paper">Paper</option>
+          <option value="terminal">Terminal</option>
+        </select>
+        <button id="close-appearance" type="button">Close</button>
+      </section>
 
       <section class="fleet" aria-labelledby="fleet-title">
         <div class="section-heading">
@@ -30,7 +50,7 @@
         <div id="accounts" class="accounts" aria-live="polite"></div>
       </section>
 
-      <footer>[bundled engine] [private bridge] [no localhost server]</footer>
+      <footer><span id="revision">revision 0</span> · [bundled engine] [private bridge] [no localhost server]</footer>
     </main>
     <script type="module" src="main.js"></script>
   </body>
