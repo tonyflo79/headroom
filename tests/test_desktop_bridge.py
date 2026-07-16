@@ -51,21 +51,149 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.assertFalse(value["ok"])
         self.assertEqual(value["error"]["code"], "incompatible_schema")
 
-    def test_discovery_is_sanitized_and_does_not_create_state(self):
+    def test_first_discovery_discloses_before_any_provider_probe(self):
         found = [{"provider": "codex", "home": "/secret/codex",
                   "email": "person@example.com", "fingerprint": "private"}]
         with mock.patch.object(desktop_bridge.connect, "detect_existing",
-                               return_value=found):
+                               return_value=found) as detect, \
+                mock.patch.object(desktop_bridge.connect,
+                                  "provider_binary") as binary:
             value = desktop_bridge.discover_desktop(now=1_800_000_000)
         self.assertEqual(value["schema"], desktop_bridge.VIEW_SCHEMA)
-        self.assertEqual(value["mode"], "empty")
+        self.assertEqual(value["mode"], "onboarding")
+        self.assertEqual(value["onboarding"]["step"], "welcome")
+        self.assertEqual(value["candidates"], [])
+        detect.assert_not_called()
+        binary.assert_not_called()
+        self.assertFalse(os.path.exists(paths.config_path()))
+        self.assertFalse(os.path.exists(desktop_bridge._onboarding_path()))
+
+    def test_begin_setup_persists_only_safe_progress_then_probes(self):
+        found = [{"provider": "codex", "home": "/secret/codex",
+                  "email": "person@example.com", "fingerprint": "private"}]
+        with mock.patch.object(desktop_bridge.connect, "detect_existing",
+                               return_value=found), \
+                mock.patch.object(desktop_bridge.connect, "provider_binary",
+                                  side_effect=lambda provider: f"/bin/{provider}"), \
+                mock.patch.object(desktop_bridge.connect,
+                                  "desktop_login_prerequisite",
+                                  return_value=True), \
+                mock.patch.object(desktop_bridge.connect,
+                                  "desktop_codex_prerequisite",
+                                  return_value=False):
+            value = desktop_bridge.onboarding_desktop(
+                "begin", now=1_800_000_000)
+        self.assertEqual(value["mode"], "onboarding")
+        self.assertEqual(value["onboarding"]["step"], "providers")
         self.assertEqual(value["candidates"], [{
             "id": "existing-codex", "provider": "codex",
             "identity": "p***@example.com"}])
-        self.assertFalse(os.path.exists(paths.config_path()))
+        states = {row["provider"]: row["state"]
+                  for row in value["onboarding"]["providers"]}
+        self.assertEqual(states, {"claude": "ready",
+                                  "codex": "upgrade_required"})
+        with open(desktop_bridge._onboarding_path(), encoding="utf-8") as handle:
+            progress = json.load(handle)
+        self.assertEqual(set(progress), {"schema", "step", "updated_at"})
+        self.assertEqual(progress["step"], "providers")
+        self.assertEqual(os.stat(desktop_bridge._onboarding_path()).st_mode & 0o777,
+                         0o600)
         encoded = json.dumps(value)
         self.assertNotIn("/secret", encoded)
         self.assertNotIn("person@example.com", encoded)
+
+    def test_all_provider_readiness_combinations_are_first_class(self):
+        combinations = [
+            ({"claude": "ready", "codex": "missing"},
+             ("ready", "missing")),
+            ({"claude": "missing", "codex": "ready"},
+             ("missing", "ready")),
+            ({"claude": "ready", "codex": "ready"},
+             ("ready", "ready")),
+            ({"claude": "missing", "codex": "missing"},
+             ("missing", "missing")),
+        ]
+        for index, (states, expected) in enumerate(combinations):
+            with self.subTest(states=states), mock.patch.object(
+                    desktop_bridge.connect, "detect_existing", return_value=[]), \
+                    mock.patch.object(desktop_bridge, "_provider_state",
+                                      side_effect=lambda provider: states[provider]):
+                if index:
+                    desktop_bridge._save_onboarding("welcome")
+                value = desktop_bridge.onboarding_desktop("begin")
+            observed = {row["provider"]: row["state"]
+                        for row in value["onboarding"]["providers"]}
+            self.assertEqual((observed["claude"], observed["codex"]), expected)
+
+    def test_demo_never_probes_or_creates_provider_or_registry_state(self):
+        with mock.patch.object(desktop_bridge.connect, "detect_existing") as detect, \
+                mock.patch.object(desktop_bridge.connect,
+                                  "provider_binary") as binary:
+            value = desktop_bridge.onboarding_desktop(
+                "demo", now=1_800_000_000)
+        self.assertEqual(value["mode"], "demo")
+        self.assertEqual(value["onboarding"]["step"], "demo")
+        self.assertEqual([row["state"] for row in value["accounts"]],
+                         ["current", "current"])
+        self.assertEqual({row["provider"] for row in value["accounts"]},
+                         {"claude", "codex"})
+        detect.assert_not_called()
+        binary.assert_not_called()
+        self.assertFalse(os.path.exists(paths.config_path()))
+        self.assertNotIn("claude-demo@example.invalid", json.dumps(value))
+
+    def test_interrupted_onboarding_resumes_without_a_login_job(self):
+        with mock.patch.object(desktop_bridge.connect, "detect_existing",
+                               return_value=[]), \
+                mock.patch.object(desktop_bridge, "_provider_state",
+                                  return_value="missing"):
+            desktop_bridge.onboarding_desktop("begin")
+            accounts = desktop_bridge.onboarding_desktop("accounts")
+            resumed = desktop_bridge.discover_desktop()
+        self.assertEqual(accounts["onboarding"]["step"], "accounts")
+        self.assertEqual(resumed["onboarding"]["step"], "accounts")
+        self.assertTrue(resumed["onboarding"]["resumable"])
+        self.assertIsNone(desktop_bridge.LOGIN_MANAGER._job)
+        self.assertFalse(os.path.exists(paths.config_path()))
+
+    def test_corrupt_onboarding_progress_restarts_read_only(self):
+        paths.ensure_private(paths.state_dir())
+        with open(desktop_bridge._onboarding_path(), "w", encoding="utf-8") as handle:
+            handle.write("not-json")
+        with open(desktop_bridge._onboarding_path(), encoding="utf-8") as handle:
+            before = handle.read()
+        with mock.patch.object(desktop_bridge.connect, "detect_existing") as detect:
+            value = desktop_bridge.discover_desktop()
+        self.assertEqual(value["mode"], "onboarding")
+        self.assertEqual(value["onboarding"]["step"], "welcome")
+        self.assertEqual(value["onboarding"]["recovery_code"],
+                         "onboarding_progress_unreadable")
+        detect.assert_not_called()
+        with open(desktop_bridge._onboarding_path(), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_onboarding_progress_never_follows_a_symlink(self):
+        outside = os.path.join(self.temp.name, "outside.json")
+        paths.ensure_private(paths.state_dir())
+        with open(outside, "w", encoding="utf-8") as handle:
+            json.dump({"schema": desktop_bridge.ONBOARDING_SCHEMA,
+                       "step": "accounts"}, handle)
+        os.symlink(outside, desktop_bridge._onboarding_path())
+        with mock.patch.object(desktop_bridge.connect, "detect_existing") as detect:
+            value = desktop_bridge.discover_desktop()
+        self.assertEqual(value["onboarding"]["step"], "welcome")
+        self.assertEqual(value["onboarding"]["recovery_code"],
+                         "onboarding_progress_unreadable")
+        detect.assert_not_called()
+
+    def test_onboarding_rejects_skips_and_unknown_actions(self):
+        with self.assertRaises(desktop_bridge.BridgeError) as skipped:
+            desktop_bridge.onboarding_desktop("accounts")
+        self.assertEqual(skipped.exception.code, "invalid_onboarding_transition")
+        with self.assertRaises(desktop_bridge.BridgeError) as unknown:
+            desktop_bridge.onboarding_desktop("provider raw command")
+        self.assertEqual(unknown.exception.code, "invalid_onboarding_action")
+        self.assertFalse(os.path.exists(desktop_bridge._onboarding_path()))
 
     def test_corrupt_registry_opens_recovery_without_overwrite(self):
         os.makedirs(self.temp.name, exist_ok=True)
@@ -344,8 +472,33 @@ class DesktopBridgeSubprocess(unittest.TestCase):
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(frames[0]["result"]["schema"],
                          desktop_bridge.VIEW_SCHEMA)
-        self.assertEqual(frames[0]["result"]["mode"], "empty")
+        self.assertEqual(frames[0]["result"]["mode"], "onboarding")
+        self.assertEqual(frames[0]["result"]["onboarding"]["step"], "welcome")
         self.assertEqual(frames[0]["result"]["candidates"], [])
+
+    def test_provider_free_demo_crosses_the_subprocess_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ)
+            env.update({
+                "HEADROOM_DIR": os.path.join(directory, "headroom"),
+                "PATH": os.path.join(directory, "no-provider-bin"),
+                "CLAUDE_CONFIG_DIR": os.path.join(directory, "no-claude"),
+                "CODEX_HOME": os.path.join(directory, "no-codex"),
+            })
+            process, frames = self.run_bridge([
+                request("1", "onboarding", {
+                    "action": "demo", "now": 1_800_000_000}),
+                request("2", "shutdown"),
+            ], env=env)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        demo = frames[0]["result"]
+        self.assertEqual(demo["mode"], "demo")
+        self.assertEqual(demo["onboarding"]["step"], "demo")
+        self.assertEqual([row["state"] for row in demo["accounts"]],
+                         ["current", "current"])
+        encoded = json.dumps(demo)
+        self.assertNotIn("claude-demo@example.invalid", encoded)
+        self.assertNotIn("codex-demo@example.invalid", encoded)
 
     def test_claude_login_crosses_protocol_without_terminal_or_raw_output(self):
         with tempfile.TemporaryDirectory() as directory:

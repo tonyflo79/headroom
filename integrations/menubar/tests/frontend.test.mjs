@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  loginMessage, normalizeBootstrap, normalizeDeviceInstructions, percentLeft,
-  refreshPresentation,
+  accountNameError, loginMessage, normalizeBootstrap, normalizeDeviceInstructions,
+  onboardingPresentation, percentLeft, refreshPresentation, suggestedAccountName,
 } from "../dist/main.js";
 
 const bootstrap = {
@@ -92,4 +92,51 @@ test("device instructions accept only the exact OpenAI HTTPS origin", () => {
   assert.equal(normalizeDeviceInstructions({ ...safe,
     verification_url: "https://auth.openai.com/other" }), null);
   assert.equal(normalizeDeviceInstructions({ ...safe, user_code: "<secret>" }), null);
+});
+
+test("generated slot names are valid and avoid configured names", () => {
+  assert.equal(suggestedAccountName("claude", []), "claude-1");
+  assert.equal(suggestedAccountName("claude", ["claude-1"]), "claude-2");
+  assert.equal(suggestedAccountName("codex", ["codex-new"], "new"), "codex-2");
+  assert.equal(accountNameError("Codex 1"),
+    "Use lowercase letters, digits, - or _ (32 characters maximum)");
+  assert.equal(accountNameError("codex-1", ["codex-1"]),
+    "That slot name is already in use");
+  assert.equal(accountNameError("codex-2", ["codex-1"]), null);
+});
+
+test("normalizes resumable onboarding without accepting provider details", () => {
+  const raw = structuredClone(bootstrap);
+  raw.view.mode = "onboarding";
+  raw.view.onboarding = {
+    schema: "headroom_desktop_onboarding@1",
+    step: "providers",
+    resumable: true,
+    providers: [
+      { provider: "claude", state: "ready", candidate_available: true,
+        connected_count: 0, path: "/private/claude" },
+      { provider: "codex", state: "missing", candidate_available: false,
+        connected_count: 0, version: "secret-version" },
+      { provider: "other", state: "ready" },
+    ],
+  };
+  const value = normalizeBootstrap(raw);
+  assert.equal(value.view.onboarding.step, "providers");
+  assert.equal(value.view.onboarding.resumable, true);
+  assert.deepEqual(value.view.onboarding.providers, [
+    { provider: "claude", state: "ready", candidate_available: true,
+      connected_count: 0 },
+    { provider: "codex", state: "missing", candidate_available: false,
+      connected_count: 0 },
+  ]);
+  assert.equal(JSON.stringify(value).includes("/private/claude"), false);
+  assert.equal(onboardingPresentation(value.view.onboarding).headline,
+    "Choose which provider accounts to use");
+});
+
+test("demo presentation is explicit and provider-free", () => {
+  assert.deepEqual(onboardingPresentation({ step: "demo" }), {
+    title: "> demo mode",
+    headline: "Bundled sample data · no provider access",
+  });
 });
