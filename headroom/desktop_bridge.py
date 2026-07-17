@@ -19,8 +19,8 @@ import threading
 import time
 
 from . import (
-    __version__, account_lifecycle, capabilities, collect as collector, connect,
-    notify, paths, registry, route, widget,
+    __version__, account_lifecycle, activity, capabilities,
+    collect as collector, connect, notify, paths, registry, route, widget,
 )
 
 
@@ -386,6 +386,12 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
         step = "complete" if configured else "welcome"
         onboarding = _onboarding_projection(
             step, candidates=candidates, config=config, probe=False)
+    account_activity = activity.unavailable(config)
+    if mode == "ready" and config is not None:
+        try:
+            account_activity = activity.snapshot(config, now=now)
+        except Exception:  # noqa: BLE001 - activity must never break capacity
+            account_activity = activity.unavailable(config)
     return {
         "schema": VIEW_SCHEMA,
         "mode": mode,
@@ -399,6 +405,7 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
         "freshness": projected["freshness"],
         "headline": projected["headline"],
         "accounts": accounts,
+        "activity": account_activity,
     }
 
 
