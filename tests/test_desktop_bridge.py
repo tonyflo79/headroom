@@ -43,49 +43,40 @@ class DesktopBridgeUnit(unittest.TestCase):
         for secret_field in ("email", "token", "credential", "home"):
             self.assertNotIn(secret_field, encoded.lower())
 
-    def test_ready_view_projects_activity_without_private_source_material(self):
+    def test_ready_view_projects_reconciled_activity_metrics(self):
         config = {
             "schema_version": 1,
             "accounts": [{"name": "codex1", "provider": "codex",
                           "home": "/private/codex-home"}],
         }
-        metric = {"value": 1234, "coverage": "partial"}
-        activity_value = {
-            "schema": "headroom_activity@1", "tracking_started_at": 1.0,
-            "accounts": [{
-                "name": "codex1", "provider": "codex",
-                "tokens": {period: dict(metric)
-                           for period in ("24h", "7d", "30d")},
-                "sessions": {period: {"value": 1, "coverage": "partial"}
-                             for period in ("24h", "7d", "30d")},
-            }],
-            "totals": {
-                "tokens": {period: dict(metric)
-                           for period in ("24h", "7d", "30d")},
-                "sessions": {period: {"value": 1, "coverage": "partial"}
-                             for period in ("24h", "7d", "30d")},
-            },
-            "commits": {"value": None, "coverage": "unavailable"},
-            "pull_requests": {"value": None, "coverage": "unavailable"},
-        }
+        activity_value = desktop_bridge.activity.unavailable(
+            config, status="indexing")
         with mock.patch.object(desktop_bridge.activity, "snapshot",
-                               return_value=activity_value):
+                               return_value=activity_value) as snapshot:
             value = desktop_bridge._view(config, mode="ready", now=2.0)
+        snapshot.assert_called_once_with(config, now=2.0)
         self.assertEqual(value["activity"], activity_value)
-        encoded = json.dumps(value["activity"])
-        for private in ("/private", "thread_id", "session_id", "cursor"):
-            self.assertNotIn(private, encoded)
 
     def test_activity_failure_cannot_break_capacity_view(self):
+        config = {
+            "schema_version": 1,
+            "accounts": [{"name": "codex1", "provider": "codex",
+                          "home": "/private/codex-home"}],
+        }
+        with mock.patch.object(desktop_bridge.activity, "snapshot",
+                               side_effect=RuntimeError("private source failed")):
+            value = desktop_bridge._view(config, mode="ready", now=2.0)
+        self.assertEqual(value["activity"],
+                         desktop_bridge.activity.unavailable(config))
+
+    def test_non_ready_view_also_hides_activity_metrics(self):
         config = {
             "schema_version": 1,
             "accounts": [{"name": "claude1", "provider": "claude",
                           "home": "/private/claude-home"}],
         }
-        with mock.patch.object(desktop_bridge.activity, "snapshot",
-                               side_effect=RuntimeError("private source failed")):
-            value = desktop_bridge._view(config, mode="ready", now=2.0)
-        self.assertEqual(value["activity"]["accounts"][0]["tokens"]["24h"], {
+        value = desktop_bridge._view(config, mode="onboarding", now=2.0)
+        self.assertEqual(value["activity"]["accounts"][0]["tokens"]["today"], {
             "value": None, "coverage": "unavailable",
         })
 

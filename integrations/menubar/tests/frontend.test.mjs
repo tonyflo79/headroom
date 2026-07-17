@@ -51,35 +51,48 @@ test("normalizes a compatible sanitized bootstrap", () => {
 
 test("normalizes bounded activity and renders coverage honestly", () => {
   const periods = (value, coverage) => Object.fromEntries(
-    ["24h", "7d", "30d"].map((period) => [period, { value, coverage }]),
+    ["today", "7d", "30d"].map((period) => [period, { value, coverage }]),
   );
+  const aggregate = (value, coverage) => ({
+    tokens: periods(value, coverage), sessions: periods(2, coverage),
+    calls: periods(3, coverage),
+  });
   const raw = {
-    schema: "headroom_activity@1", tracking_started_at: 1_800_000_000,
+    schema: "headroom_daily_burn@1", timezone: "America/Los_Angeles",
+    status: "ready", indexed_at: 1_800_000_000,
     accounts: [{
       name: "personal", provider: "claude",
+      attribution: "exact",
       tokens: periods(1250, "partial"), sessions: periods(2, "partial"),
     }],
-    totals: { tokens: periods(1250, "partial"), sessions: periods(2, "partial") },
-    commits: { value: null, coverage: "unavailable" },
-    pull_requests: { value: null, coverage: "unavailable" },
+    unattributed: { claude_code: aggregate(0, "exact") },
+    totals: aggregate(1250, "partial"),
+    daily: [{
+      date: "2026-07-16", codex_tokens: 250, claude_code_tokens: 1000,
+      claude_code_calls: 3, total: 1250, driver: "unlabeled", evidence: "",
+    }],
+    warnings: ["source_read_incomplete"],
   };
   const normalized = normalizeActivity(raw, [{ name: "personal", provider: "claude" }]);
-  assert.equal(normalized.accounts[0].tokens["24h"].value, 1250);
+  assert.equal(normalized.accounts[0].tokens.today.value, 1250);
+  assert.equal(normalized.daily[0].total, 1250);
   assert.match(formatActivityValue(1250), /^1[.,]3K$/);
   assert.match(formatActivityMetric({ value: 1250, coverage: "partial" }), /^≥1[.,]3K$/);
-  assert.equal(formatActivityMetric({ value: 0, coverage: "tracking" }), "…");
   assert.equal(formatActivityMetric({ value: null, coverage: "unavailable" }), "—");
-  assert.equal(formatActivityMetric({ value: 0, coverage: "complete" }), "0");
+  assert.equal(formatActivityMetric({ value: 0, coverage: "exact" }), "0");
   assert.throws(() => normalizeActivity({ ...raw, raw_path: "/private" }, []),
     /activity contract/);
+  assert.throws(() => normalizeActivity({ ...raw, daily: [{
+    ...raw.daily[0], total: 1251,
+  }] }, [{ name: "personal", provider: "claude" }]), /daily row/);
 });
 
 test("malformed optional activity fails closed without hiding capacity", () => {
   const raw = structuredClone(bootstrap);
-  raw.view.activity = { schema: "headroom_activity@1", accounts: "private" };
+  raw.view.activity = { schema: "headroom_daily_burn@1", accounts: "private" };
   const normalized = normalizeBootstrap(raw);
   assert.equal(normalized.view.accounts[0].state, "current");
-  assert.equal(normalized.view.activity.accounts[0].tokens["24h"].coverage,
+  assert.equal(normalized.view.activity.accounts[0].tokens.today.coverage,
     "unavailable");
 });
 
@@ -115,10 +128,16 @@ test("compact activity is present on cards and in the totals strip", () => {
   const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
   const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
   assert.match(html, /id="activity-summary"/);
-  assert.match(html, /id="total-tokens-24h"/);
+  assert.match(html, /id="total-tokens-today"/);
   assert.match(html, /id="total-sessions-30d"/);
+  assert.match(html, /id="burn-heatmap"/);
+  assert.match(html, /id="burn-trend"/);
+  assert.match(html, /id="burn-drivers"/);
+  assert.match(html, /id="burn-scale"/);
+  assert.match(html, /id="burn-table-body"/);
   assert.match(css, /\.account-activity/);
   assert.match(css, /\.activity-summary/);
+  assert.match(css, /\.burn-dashboard/);
 });
 
 test("rejects an incompatible bridge", () => {
