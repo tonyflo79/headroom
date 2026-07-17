@@ -956,7 +956,8 @@ def launch_external_reauthentication(account_name):
     home_key = "CLAUDE_CONFIG_DIR" if account["provider"] == "claude" \
         else "CODEX_HOME"
     environment[home_key] = registry.expand(account["home"])
-    argv = connect.login_argv(account["provider"], executable)
+    argv = connect.login_argv(
+        account["provider"], executable, account.get("expected_email"))
     os.execve(executable, argv, environment)
     return 2
 

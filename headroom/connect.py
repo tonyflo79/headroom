@@ -62,8 +62,15 @@ def provider_binary(provider):
                  if os.path.isfile(path) and os.access(path, os.X_OK)), None)
 
 
-def login_argv(provider, binary):
-    return [binary, "auth", "login"] if provider == "claude" else [binary, "login"]
+def login_argv(provider, binary, expected_email=None):
+    if provider != "claude":
+        return [binary, "login"]
+    argv = [binary, "auth", "login"]
+    if isinstance(expected_email, str) and expected_email \
+            and len(expected_email) <= 254 and "@" in expected_email \
+            and "\0" not in expected_email:
+        argv.extend(["--email", expected_email])
+    return argv
 
 
 def desktop_login_prerequisite(provider, binary, runner=None):
@@ -503,7 +510,8 @@ def desktop_connect_fresh(config, name, provider, *, expected_email=None,
         progress("browser_login")
         try:
             process = popen(
-                login_argv(provider, binary), env=env, stdin=subprocess.DEVNULL,
+                login_argv(provider, binary, expected_email), env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
         except OSError:
@@ -736,7 +744,8 @@ def _interactive_login(config, name, provider, home, expected_email=None,
         print("Complete the browser flow with the account you want on THIS slot.\n")
     completed = False
     try:
-        code = subprocess.run(login_argv(provider, binary), env=env).returncode
+        code = subprocess.run(
+            login_argv(provider, binary, expected_email), env=env).returncode
         if code != 0:
             print(f"login exited {code}; credentials restored", file=sys.stderr)
             return None
