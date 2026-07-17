@@ -1014,7 +1014,8 @@ class DesktopBridgeUnit(unittest.TestCase):
 
     def test_external_reauthentication_execs_only_the_registered_provider_login(self):
         account = {"name": "claude-held", "provider": "claude",
-                   "home": "/provider-owned/claude-held"}
+                   "home": "/provider-owned/claude-held",
+                   "expected_email": "owner@example.test"}
         registry.save({"schema_version": 1, "accounts": [account]})
         intent = {
             "schema": desktop_bridge.REAUTH_LAUNCH_INTENT_SCHEMA,
@@ -1035,7 +1036,8 @@ class DesktopBridgeUnit(unittest.TestCase):
         argv, environment = execute.call_args.args[1:]
         resolved_executable = os.path.realpath("/bin/echo")
         self.assertEqual(execute.call_args.args[0], resolved_executable)
-        self.assertEqual(argv, [resolved_executable, "auth", "login"])
+        self.assertEqual(argv, [resolved_executable, "auth", "login",
+                                "--email", "owner@example.test"])
         self.assertEqual(environment["CLAUDE_CONFIG_DIR"], account["home"])
         self.assertNotIn("CODEX_HOME", environment)
 
