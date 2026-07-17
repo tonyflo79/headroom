@@ -63,7 +63,7 @@
               <label class="settings-field" for="settings-reserve">
                 <span>Reserve threshold (%)</span>
                 <input id="settings-reserve" name="reserve_percent" type="number" min="0" max="99" step="0.5" inputmode="decimal" />
-                <small>Capacity protected from automatic handoff.</small>
+                <small>Optional reserve for manual account routing.</small>
               </label>
               <label class="settings-field" for="settings-refresh">
                 <span>Refresh interval (seconds)</span>
@@ -71,7 +71,6 @@
                 <small>60–3600 seconds; applies to the native scheduler.</small>
               </label>
               <label class="settings-check"><input id="settings-redact" name="redact_emails" type="checkbox" /> <span>Redact account emails</span></label>
-              <label class="settings-check"><input id="settings-auto-handoff" name="auto_handoff" type="checkbox" /> <span>Allow automatic account handoff on the next Claude launch</span></label>
             </div>
           </fieldset>
 
@@ -184,23 +183,6 @@
           <summary>+ add account</summary>
           <div id="actions" class="actions" aria-live="polite"></div>
         </details>
-      </section>
-
-      <section id="handoff-health" class="handoff-health" aria-labelledby="handoff-title" hidden>
-        <div class="handoff-copy">
-          <p class="eyebrow">AUTO-HANDOFF</p>
-          <h2 id="handoff-title">Handoff health</h2>
-          <p id="handoff-explanation">Waiting for the bundled engine.</p>
-          <p id="handoff-context" class="handoff-context">next compatible Claude launch</p>
-        </div>
-        <div class="handoff-signal" aria-hidden="true">
-          <i></i><i></i><i></i><i></i><i></i>
-        </div>
-        <div class="handoff-status" role="status" aria-live="polite">
-          <span id="handoff-state">unavailable</span>
-          <small id="handoff-code">engine starting</small>
-          <small id="handoff-action">No action required</small>
-        </div>
       </section>
 
       <footer><span id="revision">revision 0</span> · [bundled engine] [private bridge] [no localhost server]</footer>

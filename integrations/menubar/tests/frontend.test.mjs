@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
-  accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset, loginMessage,
+  accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset,
+  formatWeeklyReset, loginMessage,
   compactAccountWindows, externalReauthenticationConfirmation,
   externalReauthenticationPresentation,
   normalizeBootstrap, normalizeDeviceInstructions, normalizeHandoffHealth,
@@ -68,16 +69,11 @@ test("normalizes only the bounded engine handoff contract", () => {
   }));
 });
 
-test("renders the terminal handoff health console and next-launch disclosure", () => {
+test("removes automatic handoff from the desktop surface", () => {
   const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
-  const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
-  for (const id of ["handoff-health", "handoff-state", "handoff-code",
-    "handoff-action", "handoff-explanation", "handoff-context"]) {
-    assert.match(html, new RegExp(`id="${id}"`));
-  }
-  assert.match(html, /next Claude launch/);
-  assert.match(css, /\.handoff-signal/);
-  assert.match(css, /box-shadow: var\(--glow\)/);
+  assert.doesNotMatch(html, /id="handoff-health"/);
+  assert.doesNotMatch(html, /settings-auto-handoff/);
+  assert.doesNotMatch(html, /automatic account handoff/i);
 });
 
 test("rejects an incompatible bridge", () => {
@@ -321,6 +317,8 @@ test("reset and account state copy remain actionable without color", () => {
   assert.equal(formatReset(1_800_003_600, 1_800_000_000_000).label,
     "resets in 1 hour");
   assert.equal(formatReset(1_799_999_999, 1_800_000_000_000).label, "reset due");
+  assert.match(formatWeeklyReset(1_800_086_400), /\w{3,}.*\d{1,2}.*\d{1,2}:\d{2}/);
+  assert.equal(formatWeeklyReset(null), "—");
   assert.match(accountStatePresentation({ state: "stale" }).action, /refresh/);
   assert.match(accountStatePresentation({
     state: "stale", diagnostic_code: "provider_offline",
@@ -481,7 +479,7 @@ test("all five themes define the same semantic token contract", () => {
   assert.match(css, /body\[data-surface="main"\] \.accounts \{ grid-template-columns: repeat\(5/);
   assert.match(html, /id="routing"[^>]*hidden/);
   assert.ok(html.indexOf('id="accounts"') < html.indexOf('id="add-account"'));
-  assert.ok(html.indexOf('class="fleet"') < html.indexOf('id="handoff-health"'));
+  assert.match(css, /\.weekly-reset/);
   const tokens = ["--canvas:", "--panel:", "--panel-strong:", "--control:",
     "--phosphor:", "--phosphor-bright:", "--phosphor-dim:", "--line:",
     "--warning:", "--danger:", "--scanline:", "--ambient:", "--glow-color:"];

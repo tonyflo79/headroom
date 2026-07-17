@@ -78,6 +78,16 @@ export function formatReset(epoch, now = Date.now()) {
   return { label: `resets ${formatter.format(minutes, "minute")}`, exact };
 }
 
+export function formatWeeklyReset(epoch) {
+  if (epoch === null || epoch === undefined || epoch === "") return "—";
+  const value = Number(epoch);
+  if (!Number.isFinite(value) || value <= 0) return "—";
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit", timeZoneName: "short",
+  }).format(new Date(value * 1000));
+}
+
 export function formatPercent(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
@@ -611,6 +621,7 @@ export function normalizeBootstrap(raw) {
 
 function renderHandoffHealth(handoff, mode) {
   const panel = document.getElementById("handoff-health");
+  if (!panel) return;
   panel.hidden = mode !== "ready";
   panel.dataset.state = handoff.state;
   document.getElementById("handoff-state").textContent = handoff.state.replaceAll("_", " ");
@@ -679,6 +690,21 @@ function windowRow(label, value) {
   return row;
 }
 
+function weeklyResetRow(value) {
+  const row = document.createElement("div");
+  row.className = "weekly-reset";
+  const label = document.createElement("span");
+  label.textContent = "WEEKLY RESET";
+  const reading = document.createElement("time");
+  reading.textContent = formatWeeklyReset(value?.resets_at);
+  const epoch = Number(value?.resets_at);
+  if (Number.isFinite(epoch) && epoch > 0) {
+    reading.dateTime = new Date(epoch * 1000).toISOString();
+  }
+  row.append(label, reading);
+  return row;
+}
+
 function accountCard(account, lifecycle = null, surface = "main") {
   const article = document.createElement("article");
   article.className = `account state-${account.state}`;
@@ -702,7 +728,7 @@ function accountCard(account, lifecycle = null, surface = "main") {
   for (const item of compactAccountWindows(account.windows)) {
     windows.append(windowRow(item.label, item.value));
   }
-  article.append(header, windows);
+  article.append(header, windows, weeklyResetRow(account.windows?.["7d"]));
   if (surface === "main" && lifecycle && account.policy) {
     article.append(accountLifecyclePanel(account, lifecycle));
   }
@@ -1121,7 +1147,7 @@ function settingsDraftFromForm(form) {
     title: form.elements.title.value,
     redact_emails: form.elements.redact_emails.checked,
     reserve_percent: form.elements.reserve_percent.value,
-    auto_handoff: form.elements.auto_handoff.checked,
+    auto_handoff: false,
     refresh_interval_seconds: form.elements.refresh_interval_seconds.value,
     claude_path: form.elements.claude_path.value,
     codex_path: form.elements.codex_path.value,
@@ -1143,7 +1169,6 @@ function populateSettingsForm(settings) {
   form.elements.title.value = settings.title;
   form.elements.redact_emails.checked = settings.redact_emails;
   form.elements.reserve_percent.value = String(settings.reserve_percent);
-  form.elements.auto_handoff.checked = settings.auto_handoff;
   form.elements.refresh_interval_seconds.value = String(settings.refresh_interval_seconds);
   form.elements.claude_path.value = paths.claude || "";
   form.elements.codex_path.value = paths.codex || "";
