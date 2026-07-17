@@ -13,6 +13,10 @@ const REFRESH_INTERVAL_MIN = 60;
 const REFRESH_INTERVAL_MAX = 3600;
 const ROUTING_SCHEMA = "headroom_desktop_routing@1";
 const HANDOFF_HEALTH_SCHEMA = "headroom_handoff_health@1";
+const ACTIVITY_SCHEMA = "headroom_activity@1";
+const ACTIVITY_PERIODS = ["24h", "7d", "30d"];
+const ACTIVITY_COVERAGE = new Set(["complete", "partial", "tracking", "unavailable"]);
+const MAX_ACTIVITY_VALUE = 1_000_000_000_000_000;
 const HANDOFF_STATES = new Set([
   "configured", "unavailable", "downgraded", "armed",
   "supervision_lost", "loop_guard", "disabled",
@@ -94,6 +98,102 @@ export function formatPercent(value) {
   return new Intl.NumberFormat(undefined, {
     style: "percent", maximumFractionDigits: 0,
   }).format(number / 100);
+}
+
+export function formatActivityValue(value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_ACTIVITY_VALUE) return "—";
+  return new Intl.NumberFormat(undefined, {
+    notation: "compact", maximumFractionDigits: value < 1000 ? 0 : 1,
+  }).format(value);
+}
+
+export function formatActivityMetric(metric) {
+  if (!metric || metric.coverage === "unavailable") return "—";
+  if (metric.coverage === "tracking") return "…";
+  const value = formatActivityValue(metric.value);
+  if (value === "—") return value;
+  return metric.coverage === "partial" ? `≥${value}` : value;
+}
+
+function unavailableActivity(accounts = []) {
+  const metric = () => ({ value: null, coverage: "unavailable" });
+  const periods = () => Object.fromEntries(ACTIVITY_PERIODS.map((period) => [period, metric()]));
+  return {
+    schema: ACTIVITY_SCHEMA,
+    tracking_started_at: null,
+    accounts: accounts.map((account) => ({
+      name: account.name, provider: account.provider,
+      tokens: periods(), sessions: periods(),
+    })),
+    totals: { tokens: periods(), sessions: periods() },
+    commits: metric(), pull_requests: metric(),
+  };
+}
+
+function normalizeActivityMetric(raw) {
+  const keys = Object.keys(raw || {});
+  if (keys.length !== 2 || !keys.includes("value") || !keys.includes("coverage") ||
+      !ACTIVITY_COVERAGE.has(raw.coverage)) throw new Error("invalid activity metric");
+  const value = raw.value;
+  if (raw.coverage === "unavailable") {
+    if (value !== null) throw new Error("invalid activity metric");
+  } else if (!Number.isSafeInteger(value) || value < 0 || value > MAX_ACTIVITY_VALUE) {
+    throw new Error("invalid activity metric");
+  }
+  return { value, coverage: raw.coverage };
+}
+
+function normalizeActivityPeriods(raw) {
+  if (!raw || Object.keys(raw).length !== ACTIVITY_PERIODS.length ||
+      ACTIVITY_PERIODS.some((period) => !(period in raw))) {
+    throw new Error("invalid activity periods");
+  }
+  return Object.fromEntries(ACTIVITY_PERIODS.map(
+    (period) => [period, normalizeActivityMetric(raw[period])],
+  ));
+}
+
+export function normalizeActivity(raw, accounts = []) {
+  const expected = [
+    "schema", "tracking_started_at", "accounts", "totals", "commits", "pull_requests",
+  ];
+  const keys = Object.keys(raw || {});
+  if (!raw || keys.length !== expected.length || expected.some((key) => !keys.includes(key)) ||
+      raw.schema !== ACTIVITY_SCHEMA || !Array.isArray(raw.accounts) ||
+      raw.accounts.length > 256 || !raw.totals ||
+      Object.keys(raw.totals).length !== 2 || !("tokens" in raw.totals) ||
+      !("sessions" in raw.totals) ||
+      (raw.tracking_started_at !== null &&
+        (!Number.isFinite(raw.tracking_started_at) || raw.tracking_started_at < 0))) {
+    throw new Error("invalid activity contract");
+  }
+  const known = new Map(accounts.map((account) => [account.name, account.provider]));
+  const seen = new Set();
+  const normalizedAccounts = raw.accounts.map((row) => {
+    if (!row || Object.keys(row).length !== 4 ||
+        !Object.keys(row).every((key) => ["name", "provider", "tokens", "sessions"].includes(key)) ||
+        typeof row.name !== "string" || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(row.name) ||
+        !["claude", "codex"].includes(row.provider) || known.get(row.name) !== row.provider ||
+        seen.has(row.name)) throw new Error("invalid activity account");
+    seen.add(row.name);
+    return {
+      name: row.name, provider: row.provider,
+      tokens: normalizeActivityPeriods(row.tokens),
+      sessions: normalizeActivityPeriods(row.sessions),
+    };
+  });
+  if (seen.size !== known.size) throw new Error("invalid activity accounts");
+  return {
+    schema: ACTIVITY_SCHEMA,
+    tracking_started_at: raw.tracking_started_at,
+    accounts: normalizedAccounts,
+    totals: {
+      tokens: normalizeActivityPeriods(raw.totals.tokens),
+      sessions: normalizeActivityPeriods(raw.totals.sessions),
+    },
+    commits: normalizeActivityMetric(raw.commits),
+    pull_requests: normalizeActivityMetric(raw.pull_requests),
+  };
 }
 
 function validLocalPath(value) {
@@ -561,6 +661,11 @@ export function normalizeBootstrap(raw) {
   const rawHeadline = view.headline && typeof view.headline === "object" ? view.headline : {};
   const numberOrNull = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
   const handoff = normalizeHandoffHealth(view.handoff);
+  let accountActivity = unavailableActivity(accounts);
+  if (view.activity !== undefined) {
+    try { accountActivity = normalizeActivity(view.activity, accounts); }
+    catch { accountActivity = unavailableActivity(accounts); }
+  }
   return {
     bridge: {
       bridge_schema: raw.bridge.bridge_schema,
@@ -609,7 +714,7 @@ export function normalizeBootstrap(raw) {
         total_accounts: numberOrNull(rawHeadline.total_accounts),
       },
       recovery_code: typeof view.recovery_code === "string" ? view.recovery_code : null,
-      handoff, accounts, candidates, onboarding: {
+      handoff, activity: accountActivity, accounts, candidates, onboarding: {
         schema: "headroom_desktop_onboarding@1", step,
         resumable: rawOnboarding.resumable === true,
         recovery_code: typeof rawOnboarding.recovery_code === "string"
@@ -705,7 +810,21 @@ function weeklyResetRow(value) {
   return row;
 }
 
-function accountCard(account, lifecycle = null, surface = "main") {
+function accountActivityRow(activity) {
+  const row = document.createElement("div");
+  row.className = "account-activity";
+  row.title = "… tracking from now · ≥ partial history · — unavailable";
+  const label = document.createElement("span");
+  label.textContent = "TOKENS";
+  const metrics = document.createElement("span");
+  metrics.textContent = ACTIVITY_PERIODS.map(
+    (period) => `${period.toUpperCase()} ${formatActivityMetric(activity?.tokens?.[period])}`,
+  ).join(" · ");
+  row.append(label, metrics);
+  return row;
+}
+
+function accountCard(account, activity = null, lifecycle = null, surface = "main") {
   const article = document.createElement("article");
   article.className = `account state-${account.state}`;
   if (account.reserved) article.classList.add("is-reserved");
@@ -728,11 +847,32 @@ function accountCard(account, lifecycle = null, surface = "main") {
   for (const item of compactAccountWindows(account.windows)) {
     windows.append(windowRow(item.label, item.value));
   }
-  article.append(header, windows, weeklyResetRow(account.windows?.["7d"]));
+  article.append(
+    header, windows, weeklyResetRow(account.windows?.["7d"]),
+    accountActivityRow(activity),
+  );
   if (surface === "main" && lifecycle && account.policy) {
     article.append(accountLifecyclePanel(account, lifecycle));
   }
   return article;
+}
+
+function renderActivitySummary(activity, mode) {
+  const panel = document.getElementById("activity-summary");
+  if (!panel) return;
+  panel.hidden = mode !== "ready";
+  const setPeriods = (prefix, metrics) => {
+    for (const period of ACTIVITY_PERIODS) {
+      const element = document.getElementById(`${prefix}-${period}`);
+      if (element) element.textContent = formatActivityMetric(metrics?.[period]);
+    }
+  };
+  setPeriods("total-tokens", activity?.totals?.tokens);
+  setPeriods("total-sessions", activity?.totals?.sessions);
+  document.getElementById("total-commits").textContent =
+    formatActivityMetric(activity?.commits);
+  document.getElementById("total-prs").textContent =
+    formatActivityMetric(activity?.pull_requests);
 }
 
 function accountLifecyclePanel(account, { invoke, update }) {
@@ -1480,7 +1620,10 @@ export function renderBootstrap(raw, invoke = null) {
   const existingNames = view.accounts.map((row) => row.name);
   const lifecycle = invoke && view.mode === "ready" && value.surface === "main"
     ? { invoke, update, existingNames } : null;
-  const cards = view.accounts.map((account) => accountCard(account, lifecycle, value.surface));
+  const activityByName = new Map(view.activity.accounts.map((row) => [row.name, row]));
+  const cards = view.accounts.map((account) => accountCard(
+    account, activityByName.get(account.name), lifecycle, value.surface,
+  ));
   if (!cards.length && view.mode === "ready") {
     const empty = document.createElement("div");
     empty.className = "empty-state";
@@ -1490,6 +1633,7 @@ export function renderBootstrap(raw, invoke = null) {
     cards.push(empty);
   }
   document.getElementById("accounts").replaceChildren(...cards);
+  renderActivitySummary(view.activity, view.mode);
   const actions = document.getElementById("actions");
   let actionCards = [];
   if (value.surface === "main" && invoke && view.mode === "onboarding") {

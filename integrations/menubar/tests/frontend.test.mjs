@@ -3,11 +3,12 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
-  accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset,
+  accountNameError, accountStatePresentation, formatActivityMetric,
+  formatActivityValue, formatAge, formatPercent, formatReset,
   formatWeeklyReset, loginMessage,
   compactAccountWindows, externalReauthenticationConfirmation,
   externalReauthenticationPresentation,
-  normalizeBootstrap, normalizeDeviceInstructions, normalizeHandoffHealth,
+  normalizeActivity, normalizeBootstrap, normalizeDeviceInstructions, normalizeHandoffHealth,
   normalizeRoutingPreview,
   onboardingPresentation, percentLeft,
   refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
@@ -48,6 +49,40 @@ test("normalizes a compatible sanitized bootstrap", () => {
   assert.equal(value.view.accounts[0].provider, "claude");
 });
 
+test("normalizes bounded activity and renders coverage honestly", () => {
+  const periods = (value, coverage) => Object.fromEntries(
+    ["24h", "7d", "30d"].map((period) => [period, { value, coverage }]),
+  );
+  const raw = {
+    schema: "headroom_activity@1", tracking_started_at: 1_800_000_000,
+    accounts: [{
+      name: "personal", provider: "claude",
+      tokens: periods(1250, "partial"), sessions: periods(2, "partial"),
+    }],
+    totals: { tokens: periods(1250, "partial"), sessions: periods(2, "partial") },
+    commits: { value: null, coverage: "unavailable" },
+    pull_requests: { value: null, coverage: "unavailable" },
+  };
+  const normalized = normalizeActivity(raw, [{ name: "personal", provider: "claude" }]);
+  assert.equal(normalized.accounts[0].tokens["24h"].value, 1250);
+  assert.match(formatActivityValue(1250), /^1[.,]3K$/);
+  assert.match(formatActivityMetric({ value: 1250, coverage: "partial" }), /^≥1[.,]3K$/);
+  assert.equal(formatActivityMetric({ value: 0, coverage: "tracking" }), "…");
+  assert.equal(formatActivityMetric({ value: null, coverage: "unavailable" }), "—");
+  assert.equal(formatActivityMetric({ value: 0, coverage: "complete" }), "0");
+  assert.throws(() => normalizeActivity({ ...raw, raw_path: "/private" }, []),
+    /activity contract/);
+});
+
+test("malformed optional activity fails closed without hiding capacity", () => {
+  const raw = structuredClone(bootstrap);
+  raw.view.activity = { schema: "headroom_activity@1", accounts: "private" };
+  const normalized = normalizeBootstrap(raw);
+  assert.equal(normalized.view.accounts[0].state, "current");
+  assert.equal(normalized.view.activity.accounts[0].tokens["24h"].coverage,
+    "unavailable");
+});
+
 test("normalizes only the bounded engine handoff contract", () => {
   const raw = structuredClone(bootstrap.view.handoff);
   raw.state = "armed";
@@ -74,6 +109,16 @@ test("removes automatic handoff from the desktop surface", () => {
   assert.doesNotMatch(html, /id="handoff-health"/);
   assert.doesNotMatch(html, /settings-auto-handoff/);
   assert.doesNotMatch(html, /automatic account handoff/i);
+});
+
+test("compact activity is present on cards and in the totals strip", () => {
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
+  assert.match(html, /id="activity-summary"/);
+  assert.match(html, /id="total-tokens-24h"/);
+  assert.match(html, /id="total-sessions-30d"/);
+  assert.match(css, /\.account-activity/);
+  assert.match(css, /\.activity-summary/);
 });
 
 test("rejects an incompatible bridge", () => {

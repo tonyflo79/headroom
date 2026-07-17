@@ -49,8 +49,8 @@ also offers Minimal, Chrome, Paper, and Terminal live previews; all five themes
 use the same semantic state model and never rely on color alone. Midnight is
 the default terminal treatment.
 
-The native Settings console owns title, redaction, routing reserve, automatic
-handoff, collection interval, provider executable overrides, preferred
+The native Settings console owns title, redaction, routing reserve,
+collection interval, provider executable overrides, preferred
 terminal, window memory, and opt-in notification preferences. The frozen
 engine validates every partial update under the registry lock and commits it
 atomically; the webview has no file access. Provider overrides must resolve to
@@ -99,13 +99,17 @@ re-proves it a final time, acquires the account lease, and refuses instead of
 silently switching slots if anything changed. The terminal-style black,
 phosphor-green, and glowing-bar treatment remains the default Midnight theme.
 
-The dashboard and menu-bar popover also show an engine-authoritative
-automatic-handoff health console. It distinguishes configured, unavailable,
-downgraded, armed, supervision-lost, and loop-guard states using bounded
-sanitized supervisor events; process identifiers, supervisor identifiers,
-paths, raw reasons, and provider output never cross the bridge. The setting is
-explicitly next-launch-only. Saving it cannot signal, kill, recover, or alter
-an already running provider child.
+The compact account cards show the exact weekly reset alongside incremental
+24-hour, 7-day, and 30-day token activity. Codex activity comes from its local
+telemetry database; Claude activity is read only from the registered
+Headroom-owned account home, so shared transcripts are never guessed into an
+account. The totals strip aggregates tokens and distinct sessions. Coverage is
+explicit: normal values are complete, `≥` is partial history, `…` is tracking
+from now, and `—` is unavailable. Commits and pull requests remain unavailable
+until a repository scope and attributable source are defined. Raw transcripts,
+paths, session IDs, thread IDs, and provider payloads never cross the bridge.
+Automatic handoff is disabled by default and has no desktop control or health
+panel; account changes remain manual.
 
 This is still an implementation build, not a production release. Complete
 account management, signing, notarization, updates, and release
@@ -138,8 +142,8 @@ Headroom.app
   theme. Both webviews receive the same immutable snapshot envelope; stale or
   duplicate revisions and stale command responses are ignored.
 - The bridge exposes only narrow onboarding, account, refresh, login-job,
-  validated-settings, routing-preview, app-owned launch-intent, and passive
-  automatic-handoff health projections.
+  validated-settings, routing-preview, app-owned launch-intent, and bounded
+  activity projections.
   Calls are serialized, bounded, and a timed-out or malformed session is
   retired so a late frame cannot be mistaken for a later response.
 - Bootstrap requires the `resilient_collection` capability. Rust owns one
@@ -163,10 +167,10 @@ Headroom.app
   `HEADROOM_DIR` value; provider homes, executables, arbitrary arguments, and
   extra environment variables are rejected. The recovery launcher never
   acquires a routing lease and refuses while an existing lease is active.
-- Automatic-handoff health is projected from the same CLI capability contract
-  and supervisor notification transitions used by terminal launches. The
-  webview receives only the exact `headroom_handoff_health@1` schema and has no
-  process, transcript, hook, lease, ledger, or recovery command.
+- Activity projection crosses only the exact `headroom_activity@1` schema with
+  bounded numeric counts and coverage states. Its incremental cursors and
+  hashed session membership stay in a private `0600` state file, and one
+  refresh has a fixed Claude transcript-read budget.
 - The app opens no HTTP listener.
 
 ## Supported development target
