@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   accountNameError, accountStatePresentation, formatAge, formatPercent, formatReset, loginMessage,
+  compactAccountWindows, externalReauthenticationConfirmation,
   externalReauthenticationPresentation,
   normalizeBootstrap, normalizeDeviceInstructions, normalizeHandoffHealth,
   normalizeRoutingPreview,
@@ -186,6 +187,50 @@ test("external provider recovery appears only for an engine-authorized held slot
   raw.view.accounts[0].state = "held";
   raw.view.accounts[0].recovery_action = "invented";
   assert.equal(normalizeBootstrap(raw).view.accounts[0].recovery_action, null);
+});
+
+test("external provider recovery uses visible two-step confirmation", () => {
+  const raw = structuredClone(bootstrap);
+  raw.view.accounts[0].state = "held";
+  raw.view.accounts[0].recovery_action = "external_reauthentication";
+  raw.view.accounts[0].policy = {
+    schema: "headroom_account_lifecycle@1", home_kind: "headroom",
+    home_retained_on_remove: true, rename_keeps_home: true,
+    reauthentication: "keychain_manual", position: 0, count: 1,
+    can_move_up: false, can_move_down: false, can_remove: false,
+  };
+  const account = normalizeBootstrap(raw).view.accounts[0];
+  assert.deepEqual(externalReauthenticationConfirmation(account), {
+    shouldLaunch: false,
+    label: "Confirm Claude login",
+    message: "Click again to open claude sign-in for personal.",
+  });
+  assert.deepEqual(externalReauthenticationConfirmation(account, true), {
+    shouldLaunch: true,
+    label: "Opening Claude login…",
+    message: "Re-proving personal before opening provider sign-in…",
+  });
+  const source = readFileSync(new URL("../dist/main.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /window\.confirm/);
+});
+
+test("compact account cards show only 5h, week, and Fable without inventing windows", () => {
+  const five = { state: "current", left_percent: 80 };
+  const week = { state: "current", left_percent: 60 };
+  const fable = { state: "current", left_percent: 40 };
+  assert.deepEqual(compactAccountWindows({
+    "5h": five, "7d": week, "scoped:FABLE": fable,
+    "scoped:Opus": { state: "current", left_percent: 20 },
+  }), [
+    { label: "5h", value: five },
+    { label: "week", value: week },
+    { label: "Fable", value: fable },
+  ]);
+  assert.deepEqual(compactAccountWindows({ "7d": week }), [
+    { label: "5h", value: null },
+    { label: "week", value: week },
+    { label: "Fable", value: null },
+  ]);
 });
 
 test("device instructions accept only the exact OpenAI HTTPS origin", () => {
@@ -422,12 +467,21 @@ test("routing UI exposes only family and account based native actions", () => {
   assert.match(source, /desktop_copy_routing_command/);
   assert.match(source, /desktop_open_routing_launch/);
   assert.match(source, /desktop_open_external_reauthentication/);
+  assert.doesNotMatch(source, /desktop_account_action/);
   assert.doesNotMatch(source, /desktop_(copy|open)_routing_(command|launch)[\s\S]{0,180}(command|environment):/);
   assert.doesNotMatch(source, /desktop_open_external_reauthentication[\s\S]{0,180}(home|command|environment):/);
 });
 
 test("all five themes define the same semantic token contract", () => {
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
   const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
+  assert.match(css, /\.account header > div \{ min-width: 0; \}/);
+  assert.match(css, /\.account header \.state \{ flex: 0 0 auto; \}/);
+  assert.match(css, /overflow-wrap: anywhere/);
+  assert.match(css, /body\[data-surface="main"\] \.accounts \{ grid-template-columns: repeat\(5/);
+  assert.match(html, /id="routing"[^>]*hidden/);
+  assert.ok(html.indexOf('id="accounts"') < html.indexOf('id="add-account"'));
+  assert.ok(html.indexOf('class="fleet"') < html.indexOf('id="handoff-health"'));
   const tokens = ["--canvas:", "--panel:", "--panel-strong:", "--control:",
     "--phosphor:", "--phosphor-bright:", "--phosphor-dim:", "--line:",
     "--warning:", "--danger:", "--scanline:", "--ambient:", "--glow-color:"];
