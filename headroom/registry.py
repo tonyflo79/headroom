@@ -323,20 +323,16 @@ def reserve_percent(config=None):
 def auto_handoff(config=None):
     """Whether the supervisor may hand a capped session off automatically.
 
-    ON by default — uninterrupted continuation is the product.  Only an
-    explicit ``routing.auto_handoff: false`` turns it off; every guard in the
-    supervisor itself stays fail-closed, so ambiguity degrades to a plain
-    launch rather than any destructive action.  A wrong-typed value (e.g. the
-    string ``"false"``) keeps the default rather than guessing intent.
+    OFF by default. Automatic account switching is an explicit opt-in because
+    ordinary manual routing remains useful without it. A wrong-typed value
+    never enables the supervisor.
     """
     try:
         config = load() if config is None else config
     except RegistryError:
-        return True
-    routing = (config or {}).get("routing")
-    if isinstance(routing, dict) and routing.get("auto_handoff") is False:
         return False
-    return True
+    routing = (config or {}).get("routing")
+    return isinstance(routing, dict) and routing.get("auto_handoff") is True
 
 
 def save(config):

@@ -429,6 +429,17 @@ body[data-surface="main"] .surface-status { display: none; }
 .meter i { display: block; height: 100%; background: var(--phosphor); box-shadow: var(--glow); }
 .window-limited .meter { border-color: var(--danger); }
 .window-held .meter, .window-stale .meter { border-style: dashed; opacity: 0.58; }
+.weekly-reset {
+  display: grid;
+  gap: 2px;
+  margin-top: 7px;
+  border-top: 1px solid var(--phosphor);
+  padding-top: 6px;
+  color: var(--phosphor-bright);
+  text-shadow: var(--glow);
+}
+.weekly-reset span { color: var(--phosphor-dim); font-size: 8px; font-weight: 800; letter-spacing: 0.08em; }
+.weekly-reset time { font-size: 11px; font-weight: 800; white-space: nowrap; }
 .note { color: var(--phosphor-dim); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
 
 .account-lifecycle {
