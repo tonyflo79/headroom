@@ -386,12 +386,10 @@ def _view(config, public_snapshot=None, *, mode="ready", candidates=None,
         step = "complete" if configured else "welcome"
         onboarding = _onboarding_projection(
             step, candidates=candidates, config=config, probe=False)
+    # The first activity collector sampled an incomplete telemetry database and
+    # could therefore present precise-looking but materially false totals. Keep
+    # the UI fail-closed until the event-level, reconciled collector replaces it.
     account_activity = activity.unavailable(config)
-    if mode == "ready" and config is not None:
-        try:
-            account_activity = activity.snapshot(config, now=now)
-        except Exception:  # noqa: BLE001 - activity must never break capacity
-            account_activity = activity.unavailable(config)
     return {
         "schema": VIEW_SCHEMA,
         "mode": mode,
