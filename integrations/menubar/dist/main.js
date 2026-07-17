@@ -13,9 +13,18 @@ const REFRESH_INTERVAL_MIN = 60;
 const REFRESH_INTERVAL_MAX = 3600;
 const ROUTING_SCHEMA = "headroom_desktop_routing@1";
 const HANDOFF_HEALTH_SCHEMA = "headroom_handoff_health@1";
-const ACTIVITY_SCHEMA = "headroom_activity@1";
-const ACTIVITY_PERIODS = ["24h", "7d", "30d"];
-const ACTIVITY_COVERAGE = new Set(["complete", "partial", "tracking", "unavailable"]);
+const ACTIVITY_SCHEMA = "headroom_daily_burn@1";
+const ACTIVITY_PERIODS = ["today", "7d", "30d"];
+const ACTIVITY_COVERAGE = new Set(["exact", "partial", "unavailable"]);
+const ACTIVITY_STATUS = new Set(["indexing", "refreshing", "ready", "unavailable"]);
+const ACTIVITY_WARNINGS = new Set([
+  "claude_history_unattributed", "codex_legacy_usage_unavailable",
+  "source_read_incomplete",
+]);
+const ACTIVITY_DRIVERS = new Set([
+  "shipping", "research", "review", "video", "planning", "admin",
+  "support", "writing", "unlabeled",
+]);
 const MAX_ACTIVITY_VALUE = 1_000_000_000_000_000;
 const HANDOFF_STATES = new Set([
   "configured", "unavailable", "downgraded", "armed",
@@ -52,6 +61,7 @@ let activeBootstrap = null;
 let activeInvoke = null;
 let activeRevision = 0;
 let activeRoutingPreview = null;
+let activityPollTimer = null;
 
 export function shouldApplySnapshot(currentRevision, incomingRevision) {
   return Number.isInteger(incomingRevision) && incomingRevision > currentRevision;
@@ -109,7 +119,6 @@ export function formatActivityValue(value) {
 
 export function formatActivityMetric(metric) {
   if (!metric || metric.coverage === "unavailable") return "—";
-  if (metric.coverage === "tracking") return "…";
   const value = formatActivityValue(metric.value);
   if (value === "—") return value;
   return metric.coverage === "partial" ? `≥${value}` : value;
@@ -118,15 +127,16 @@ export function formatActivityMetric(metric) {
 function unavailableActivity(accounts = []) {
   const metric = () => ({ value: null, coverage: "unavailable" });
   const periods = () => Object.fromEntries(ACTIVITY_PERIODS.map((period) => [period, metric()]));
+  const aggregate = () => ({ tokens: periods(), sessions: periods(), calls: periods() });
   return {
     schema: ACTIVITY_SCHEMA,
-    tracking_started_at: null,
+    timezone: "local time", status: "unavailable", indexed_at: null,
     accounts: accounts.map((account) => ({
       name: account.name, provider: account.provider,
-      tokens: periods(), sessions: periods(),
+      attribution: "unavailable", tokens: periods(), sessions: periods(),
     })),
-    totals: { tokens: periods(), sessions: periods() },
-    commits: metric(), pull_requests: metric(),
+    unattributed: { claude_code: aggregate() },
+    totals: aggregate(), daily: [], warnings: [],
   };
 }
 
@@ -155,44 +165,85 @@ function normalizeActivityPeriods(raw) {
 
 export function normalizeActivity(raw, accounts = []) {
   const expected = [
-    "schema", "tracking_started_at", "accounts", "totals", "commits", "pull_requests",
+    "schema", "timezone", "status", "indexed_at", "accounts", "unattributed",
+    "totals", "daily", "warnings",
   ];
   const keys = Object.keys(raw || {});
   if (!raw || keys.length !== expected.length || expected.some((key) => !keys.includes(key)) ||
       raw.schema !== ACTIVITY_SCHEMA || !Array.isArray(raw.accounts) ||
-      raw.accounts.length > 256 || !raw.totals ||
-      Object.keys(raw.totals).length !== 2 || !("tokens" in raw.totals) ||
-      !("sessions" in raw.totals) ||
-      (raw.tracking_started_at !== null &&
-        (!Number.isFinite(raw.tracking_started_at) || raw.tracking_started_at < 0))) {
+      raw.accounts.length > 256 || typeof raw.timezone !== "string" ||
+      raw.timezone.length < 1 || raw.timezone.length > 64 ||
+      !ACTIVITY_STATUS.has(raw.status) ||
+      (raw.indexed_at !== null &&
+        (!Number.isFinite(raw.indexed_at) || raw.indexed_at < 0)) ||
+      !raw.totals || Object.keys(raw.totals).length !== 3 ||
+      !raw.unattributed || Object.keys(raw.unattributed).length !== 1 ||
+      !raw.unattributed.claude_code ||
+      !Array.isArray(raw.daily) || raw.daily.length > 800 ||
+      !Array.isArray(raw.warnings) || raw.warnings.length > ACTIVITY_WARNINGS.size ||
+      raw.warnings.some((warning) => !ACTIVITY_WARNINGS.has(warning))) {
     throw new Error("invalid activity contract");
   }
   const known = new Map(accounts.map((account) => [account.name, account.provider]));
   const seen = new Set();
   const normalizedAccounts = raw.accounts.map((row) => {
-    if (!row || Object.keys(row).length !== 4 ||
-        !Object.keys(row).every((key) => ["name", "provider", "tokens", "sessions"].includes(key)) ||
+    if (!row || Object.keys(row).length !== 5 ||
+        !Object.keys(row).every((key) =>
+          ["name", "provider", "attribution", "tokens", "sessions"].includes(key)) ||
         typeof row.name !== "string" || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(row.name) ||
         !["claude", "codex"].includes(row.provider) || known.get(row.name) !== row.provider ||
+        !["exact", "unavailable"].includes(row.attribution) ||
         seen.has(row.name)) throw new Error("invalid activity account");
     seen.add(row.name);
     return {
       name: row.name, provider: row.provider,
+      attribution: row.attribution,
       tokens: normalizeActivityPeriods(row.tokens),
       sessions: normalizeActivityPeriods(row.sessions),
     };
   });
   if (seen.size !== known.size) throw new Error("invalid activity accounts");
+  const normalizeAggregate = (value) => {
+    if (!value || Object.keys(value).length !== 3 ||
+        !["tokens", "sessions", "calls"].every((key) => key in value)) {
+      throw new Error("invalid activity aggregate");
+    }
+    return {
+      tokens: normalizeActivityPeriods(value.tokens),
+      sessions: normalizeActivityPeriods(value.sessions),
+      calls: normalizeActivityPeriods(value.calls),
+    };
+  };
+  const daily = raw.daily.map((row) => {
+    const dailyKeys = [
+      "date", "codex_tokens", "claude_code_tokens", "claude_code_calls",
+      "total", "driver", "evidence",
+    ];
+    if (!row || Object.keys(row).length !== dailyKeys.length ||
+        dailyKeys.some((key) => !(key in row)) ||
+        typeof row.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(row.date) ||
+        !ACTIVITY_DRIVERS.has(row.driver) || typeof row.evidence !== "string" ||
+        row.evidence.length > 160 ||
+        ["codex_tokens", "claude_code_tokens", "claude_code_calls", "total"]
+          .some((key) => !Number.isSafeInteger(row[key]) || row[key] < 0 ||
+            row[key] > MAX_ACTIVITY_VALUE) ||
+        row.total !== row.codex_tokens + row.claude_code_tokens) {
+      throw new Error("invalid activity daily row");
+    }
+    return { ...row };
+  });
+  for (let index = 1; index < daily.length; index += 1) {
+    if (daily[index - 1].date >= daily[index].date) {
+      throw new Error("invalid activity daily order");
+    }
+  }
   return {
     schema: ACTIVITY_SCHEMA,
-    tracking_started_at: raw.tracking_started_at,
+    timezone: raw.timezone, status: raw.status, indexed_at: raw.indexed_at,
     accounts: normalizedAccounts,
-    totals: {
-      tokens: normalizeActivityPeriods(raw.totals.tokens),
-      sessions: normalizeActivityPeriods(raw.totals.sessions),
-    },
-    commits: normalizeActivityMetric(raw.commits),
-    pull_requests: normalizeActivityMetric(raw.pull_requests),
+    unattributed: { claude_code: normalizeAggregate(raw.unattributed.claude_code) },
+    totals: normalizeAggregate(raw.totals), daily,
+    warnings: [...new Set(raw.warnings)],
   };
 }
 
@@ -813,7 +864,13 @@ function weeklyResetRow(value) {
 function accountActivityRow(activity) {
   const row = document.createElement("div");
   row.className = "account-activity";
-  row.title = "… tracking from now · ≥ partial history · — unavailable";
+  const partial = ACTIVITY_PERIODS.some(
+    (period) => activity?.tokens?.[period]?.coverage === "partial");
+  row.title = activity?.attribution === "exact" && partial
+    ? "Exact recorded events; ≥ marks incomplete provider source coverage"
+    : activity?.attribution === "exact"
+      ? "Exact provider events grouped by local calendar day"
+    : "Historical usage cannot be assigned safely to this account";
   const label = document.createElement("span");
   label.textContent = "TOKENS";
   const metrics = document.createElement("span");
@@ -857,10 +914,167 @@ function accountCard(account, activity = null, lifecycle = null, surface = "main
   return article;
 }
 
+let activeBurnRange = "90";
+
+function burnRowsInRange(rows, range) {
+  if (range === "all" || rows.length === 0) return rows;
+  const last = new Date(`${rows.at(-1).date}T00:00:00.000Z`);
+  const first = new Date(last);
+  first.setUTCDate(first.getUTCDate() - Number(range) + 1);
+  return rows.filter((row) => new Date(`${row.date}T00:00:00.000Z`) >= first);
+}
+
+function logHeatLevel(value, maximum) {
+  if (value <= 0 || maximum <= 0) return 0;
+  return Math.max(1, Math.min(5,
+    Math.ceil((Math.log10(value + 1) / Math.log10(maximum + 1)) * 5)));
+}
+
+function isoWeek(date) {
+  const value = new Date(`${date}T00:00:00.000Z`);
+  const day = (value.getUTCDay() + 6) % 7;
+  value.setUTCDate(value.getUTCDate() - day);
+  return value.toISOString().slice(0, 10);
+}
+
+function renderBurnHeatmap(rows) {
+  const target = document.getElementById("burn-heatmap");
+  if (!target) return;
+  const maximum = Math.max(0, ...rows.map((row) => row.total));
+  const cells = rows.map((row) => {
+    const cell = document.createElement("span");
+    cell.className = `burn-day burn-level-${logHeatLevel(row.total, maximum)}`;
+    cell.tabIndex = 0;
+    cell.title = `${row.date} · ${formatActivityValue(row.total)} tokens · ${row.driver}`;
+    cell.setAttribute("aria-label", cell.title);
+    return cell;
+  });
+  target.replaceChildren(...cells);
+}
+
+function renderBurnTrend(rows) {
+  const target = document.getElementById("burn-trend");
+  if (!target) return;
+  const totals = new Map();
+  for (const row of rows) {
+    const week = isoWeek(row.date);
+    totals.set(week, (totals.get(week) || 0) + row.total);
+  }
+  const weekly = [...totals].map(([week, total]) => ({ week, total }));
+  if (!weekly.length) {
+    target.replaceChildren();
+    return;
+  }
+  const namespace = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(namespace, "svg");
+  svg.setAttribute("viewBox", "0 0 600 100");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Weekly exact token totals on a logarithmic scale");
+  const maximum = Math.max(...weekly.map((row) => Math.log10(row.total + 1)), 1);
+  const points = weekly.map((row, index) => {
+    const x = weekly.length === 1 ? 300 : (index / (weekly.length - 1)) * 590 + 5;
+    const y = 94 - (Math.log10(row.total + 1) / maximum) * 86;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const line = document.createElementNS(namespace, "polyline");
+  line.setAttribute("points", points);
+  line.setAttribute("fill", "none");
+  line.setAttribute("stroke", "currentColor");
+  line.setAttribute("stroke-width", "2");
+  const title = document.createElementNS(namespace, "title");
+  const peak = weekly.reduce((best, row) => row.total > best.total ? row : best);
+  title.textContent = `Peak week ${peak.week}: ${formatActivityValue(peak.total)} tokens`;
+  svg.append(title, line);
+  target.replaceChildren(svg);
+}
+
+function renderBurnDrivers(rows) {
+  const target = document.getElementById("burn-drivers");
+  if (!target) return;
+  const groups = new Map();
+  for (const row of rows) groups.set(row.driver, (groups.get(row.driver) || 0) + row.total);
+  const total = rows.reduce((sum, row) => sum + row.total, 0);
+  const items = [...groups].sort((a, b) => b[1] - a[1]).map(([driver, tokens]) => {
+    const item = document.createElement("div");
+    const label = document.createElement("span");
+    label.textContent = driver.toUpperCase();
+    const value = document.createElement("strong");
+    const share = total ? Math.round(tokens / total * 100) : 0;
+    value.textContent = `${formatActivityValue(tokens)} · ${share}%`;
+    item.append(label, value);
+    return item;
+  });
+  target.replaceChildren(...items);
+}
+
+function renderBurnScale(rows) {
+  const target = document.getElementById("burn-scale");
+  if (!target) return;
+  const total = rows.reduce((sum, row) => sum + row.total, 0);
+  const words = total * 0.75;
+  const values = [
+    ["WORDS", formatActivityValue(Math.round(words)), "tokens × 0.75"],
+    ["READING", `${formatActivityValue(Math.round(words / 250 / 60))}h`, "250 words/min"],
+    ["NOVELS", formatActivityValue(Math.round(words / 90_000)), "90k words/novel"],
+  ];
+  target.replaceChildren(...values.map(([labelText, valueText, noteText]) => {
+    const item = document.createElement("div");
+    const label = document.createElement("span");
+    const value = document.createElement("strong");
+    const note = document.createElement("small");
+    label.textContent = labelText;
+    value.textContent = valueText;
+    note.textContent = noteText;
+    item.append(label, value, note);
+    return item;
+  }));
+}
+
+function renderBurnTable(rows) {
+  const body = document.getElementById("burn-table-body");
+  if (!body) return;
+  const visible = rows.slice(-30).reverse();
+  body.replaceChildren(...visible.map((row) => {
+    const index = rows.indexOf(row);
+    const averageRows = rows.slice(Math.max(0, index - 6), index + 1);
+    const average = averageRows.reduce((sum, item) => sum + item.total, 0) /
+      Math.max(1, averageRows.length);
+    const tr = document.createElement("tr");
+    for (const value of [
+      row.date, formatActivityValue(row.total), formatActivityValue(Math.round(average)),
+      formatActivityValue(row.codex_tokens), formatActivityValue(row.claude_code_tokens),
+      formatActivityValue(row.claude_code_calls), row.driver,
+    ]) {
+      const td = document.createElement("td");
+      td.textContent = value;
+      tr.append(td);
+    }
+    return tr;
+  }));
+}
+
+function renderBurnDashboard(activity) {
+  const rows = burnRowsInRange(activity?.daily || [], activeBurnRange);
+  for (const button of document.querySelectorAll("[data-burn-range]")) {
+    button.classList.toggle("active", button.dataset.burnRange === activeBurnRange);
+    button.onclick = () => {
+      activeBurnRange = button.dataset.burnRange;
+      renderBurnDashboard(activity);
+    };
+  }
+  renderBurnHeatmap(rows);
+  renderBurnTrend(rows);
+  renderBurnDrivers(rows);
+  renderBurnScale(rows);
+  renderBurnTable(rows);
+}
+
 function renderActivitySummary(activity, mode) {
   const panel = document.getElementById("activity-summary");
   if (!panel) return;
   panel.hidden = mode !== "ready";
+  const dashboard = document.getElementById("burn-dashboard");
+  if (dashboard) dashboard.hidden = mode !== "ready";
   const setPeriods = (prefix, metrics) => {
     for (const period of ACTIVITY_PERIODS) {
       const element = document.getElementById(`${prefix}-${period}`);
@@ -869,10 +1083,30 @@ function renderActivitySummary(activity, mode) {
   };
   setPeriods("total-tokens", activity?.totals?.tokens);
   setPeriods("total-sessions", activity?.totals?.sessions);
-  document.getElementById("total-commits").textContent =
-    formatActivityMetric(activity?.commits);
-  document.getElementById("total-prs").textContent =
-    formatActivityMetric(activity?.pull_requests);
+  setPeriods("total-calls", activity?.totals?.calls);
+  setPeriods("unattributed-claude", activity?.unattributed?.claude_code?.tokens);
+  const status = document.getElementById("activity-status");
+  if (status) {
+    const label = activity?.status === "indexing" ? "INDEXING EXACT LOCAL LOGS"
+      : activity?.status === "refreshing" ? "REFRESHING INDEX"
+        : activity?.status === "ready" ? "EXACT LOCAL-DAY INDEX" : "INDEX UNAVAILABLE";
+    const warning = activity?.warnings?.includes("source_read_incomplete")
+      ? " · SOURCE READ INCOMPLETE"
+      : activity?.warnings?.includes("codex_legacy_usage_unavailable")
+        ? " · ≥ CODEX LEGACY GAPS" : "";
+    status.textContent = `${label} · ${activity?.timezone || "local time"}${warning}`;
+  }
+  if (mode === "ready" && activity?.status === "indexing" && activeInvoke &&
+      activityPollTimer === null) {
+    activityPollTimer = setTimeout(() => {
+      activityPollTimer = null;
+      activeInvoke("desktop_refresh").catch(() => {});
+    }, 15_000);
+  } else if (activity?.status !== "indexing" && activityPollTimer !== null) {
+    clearTimeout(activityPollTimer);
+    activityPollTimer = null;
+  }
+  renderBurnDashboard(activity);
 }
 
 function accountLifecyclePanel(account, { invoke, update }) {

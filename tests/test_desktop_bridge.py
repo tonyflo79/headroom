@@ -43,15 +43,29 @@ class DesktopBridgeUnit(unittest.TestCase):
         for secret_field in ("email", "token", "credential", "home"):
             self.assertNotIn(secret_field, encoded.lower())
 
-    def test_ready_view_hides_unreconciled_activity_metrics(self):
+    def test_ready_view_projects_reconciled_activity_metrics(self):
         config = {
             "schema_version": 1,
             "accounts": [{"name": "codex1", "provider": "codex",
                           "home": "/private/codex-home"}],
         }
-        with mock.patch.object(desktop_bridge.activity, "snapshot") as snapshot:
+        activity_value = desktop_bridge.activity.unavailable(
+            config, status="indexing")
+        with mock.patch.object(desktop_bridge.activity, "snapshot",
+                               return_value=activity_value) as snapshot:
             value = desktop_bridge._view(config, mode="ready", now=2.0)
-        snapshot.assert_not_called()
+        snapshot.assert_called_once_with(config, now=2.0)
+        self.assertEqual(value["activity"], activity_value)
+
+    def test_activity_failure_cannot_break_capacity_view(self):
+        config = {
+            "schema_version": 1,
+            "accounts": [{"name": "codex1", "provider": "codex",
+                          "home": "/private/codex-home"}],
+        }
+        with mock.patch.object(desktop_bridge.activity, "snapshot",
+                               side_effect=RuntimeError("private source failed")):
+            value = desktop_bridge._view(config, mode="ready", now=2.0)
         self.assertEqual(value["activity"],
                          desktop_bridge.activity.unavailable(config))
 
@@ -62,7 +76,7 @@ class DesktopBridgeUnit(unittest.TestCase):
                           "home": "/private/claude-home"}],
         }
         value = desktop_bridge._view(config, mode="onboarding", now=2.0)
-        self.assertEqual(value["activity"]["accounts"][0]["tokens"]["24h"], {
+        self.assertEqual(value["activity"]["accounts"][0]["tokens"]["today"], {
             "value": None, "coverage": "unavailable",
         })
 

@@ -1,0 +1,54 @@
+# Token-burn validation
+
+The desktop token-burn view follows the normalized local-day contract from
+Nate B. Jones's token-burn guide, adapted to Headroom's bundled native sidecar.
+It does not use a localhost or Vercel service.
+
+## Fidelity contract
+
+- Codex is exact where a `token_count` event contains
+  `last_token_usage.total_tokens`. Cached input is already included in that
+  total and is not added a second time.
+- Claude Code is exact from input, output, cache-creation, and cache-read token
+  fields.
+- Repeated Claude transcript rows with the same session and message ID are one
+  API call. The index retains the maximum observed usage for that call.
+- Copied or forked Codex event rows are deduplicated by an opaque event hash.
+- UTC timestamps are converted to the configured system timezone before local
+  calendar dates and today/7-day/30-day windows are calculated.
+- Historical Claude logs in a shared provider home are reported as exact but
+  unattributed. They are never assigned to one of the four configured account
+  cards without account evidence.
+- Codex sessions that contain no token events create a visible partial-coverage
+  warning. Their cumulative thread total is not guessed onto a date.
+- No Claude chat or ChatGPT estimates are produced by this version.
+
+## Privacy boundary
+
+`~/.headroom/state/activity-v2.sqlite` is mode `0600`. Raw logs, prompts,
+emails, project names, file paths, session IDs, request IDs, and message IDs do
+not cross the desktop bridge. The UI receives bounded numeric daily rows,
+generic driver labels, fidelity state, and stable warning codes only.
+
+## Reconciliation gate
+
+For local day `2026-07-15` in `America/Los_Angeles`, an independent raw-log
+calculation produced:
+
+- Codex: `142,282,028`
+- Claude Code: `41,052,176`
+- Combined: `183,334,204`
+
+The private index returned `183,334,204` for the same day, a delta of zero.
+The reconciliation command used an independent `rg`/`jq`/`awk` pipeline rather
+than the application parser.
+
+## Release gate
+
+1. Run `python3 -m unittest discover -s tests`.
+2. Run `npm test` in `integrations/menubar`.
+3. Run `cargo test` in `integrations/menubar/src-tauri`.
+4. Reconcile at least one completed local day independently.
+5. Confirm an initial full index runs off the UI thread and subsequent scans
+   read only appended bytes.
+6. Confirm the desktop app has no listening TCP socket.
