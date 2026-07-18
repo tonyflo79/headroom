@@ -431,18 +431,25 @@ class ClaudeLimits(unittest.TestCase):
 
 
 class ClaudeCredentialRefresh(unittest.TestCase):
-    def test_provider_doctor_refreshes_exact_slot_without_inference(self):
+    def test_provider_refresh_token_login_refreshes_exact_slot_without_browser(self):
         with tempfile.TemporaryDirectory() as home:
             expired = {"accessToken": "old", "refreshToken": "refresh",
-                       "expiresAt": 1}
+                       "expiresAt": 1,
+                       "scopes": ["user:profile", "user:inference"]}
             fresh = {"accessToken": "new", "refreshToken": "rotated",
                      "expiresAt": 9_999_999_999_000}
 
             def runner(argv, **kwargs):
-                self.assertEqual(argv, ["/provider/claude", "doctor"])
+                self.assertEqual(
+                    argv, ["/provider/claude", "auth", "login", "--claudeai"])
                 self.assertEqual(kwargs["cwd"], home)
                 self.assertEqual(kwargs["env"]["CLAUDE_CONFIG_DIR"], home)
                 self.assertEqual(kwargs["env"]["CLAUDE_CODE_SAFE_MODE"], "1")
+                self.assertEqual(
+                    kwargs["env"]["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"], "refresh")
+                self.assertEqual(
+                    kwargs["env"]["CLAUDE_CODE_OAUTH_SCOPES"],
+                    "user:profile user:inference")
                 self.assertTrue(kwargs["capture_output"])
                 return FakeCompleted(returncode=0)
 
@@ -453,6 +460,18 @@ class ClaudeCredentialRefresh(unittest.TestCase):
                 result = collect.refresh_claude_oauth(
                     home, runner=runner, now=100)
         self.assertEqual(result["accessToken"], "new")
+
+    def test_missing_refresh_metadata_never_opens_browser(self):
+        expired = {"accessToken": "old", "expiresAt": 1}
+        runner = mock.Mock(side_effect=AssertionError(
+            "refresh without complete provider metadata must fail closed"))
+        with mock.patch.object(collect, "claude_oauth", return_value=expired), \
+                mock.patch.object(collect, "claude_bin",
+                                  return_value="/provider/claude"):
+            result = collect.refresh_claude_oauth(
+                "/slot", force=True, runner=runner, now=100)
+        self.assertIs(result, expired)
+        runner.assert_not_called()
 
     def test_fresh_credential_skips_provider_process(self):
         fresh = {"accessToken": "current", "expiresAt": 9_999_999_999_000}

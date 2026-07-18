@@ -45,7 +45,10 @@ from . import paths, registry
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
 CLAUDE_REFRESH_TIMEOUT = paths.env_int("HEADROOM_CLAUDE_REFRESH_TIMEOUT", 30)
-CLAUDE_REFRESH_MARGIN = paths.env_int("HEADROOM_CLAUDE_REFRESH_MARGIN", 300)
+# Renew well before the eight-hour access-token boundary.  A five-minute
+# margin can be skipped by scheduler jitter or a short macOS sleep; thirty
+# minutes leaves several normal collection cycles while remaining infrequent.
+CLAUDE_REFRESH_MARGIN = paths.env_int("HEADROOM_CLAUDE_REFRESH_MARGIN", 1800)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
 # how long a past reading stays serviceable — keep in sync with route.py,
 # which enforces the same bound at routing time (collect must not import
@@ -349,12 +352,17 @@ def claude_oauth_expiry(oauth):
 
 
 def refresh_claude_oauth(home, force=False, runner=subprocess.run, now=None):
-    """Let Claude Code refresh one slot's OAuth credential without inference.
+    """Let Claude Code refresh one slot's OAuth credential without a browser.
 
-    ``claude doctor`` exercises Claude Code's own credential manager, including
-    its Keychain namespace, refresh-token rotation, and concurrent-write
-    protections. Headroom never posts the refresh token itself. The exact
-    ``CLAUDE_CONFIG_DIR`` is supplied so one account can never refresh another.
+    Claude's ``doctor`` command only checks the installation and settings; it
+    does not guarantee an OAuth exchange.  Current Claude Code builds expose a
+    provider-owned refresh-token login through ``CLAUDE_CODE_OAUTH_*``.  Feed
+    the existing slot metadata to that command so Claude Code, not Headroom,
+    performs and persists the exchange (including Keychain writes and refresh-
+    token rotation).  The exact ``CLAUDE_CONFIG_DIR`` keeps slots isolated.
+
+    Incomplete refresh metadata fails closed instead of falling back to an
+    interactive login that could open a browser or bind the wrong account.
     """
     now = time.time() if now is None else float(now)
     current = claude_oauth(home) or {}
@@ -364,15 +372,33 @@ def refresh_claude_oauth(home, force=False, runner=subprocess.run, now=None):
     binary = claude_bin()
     if not binary:
         return current
+    refresh_token = current.get("refreshToken")
+    raw_scopes = current.get("scopes")
+    if isinstance(raw_scopes, str):
+        scopes = raw_scopes.split()
+    elif isinstance(raw_scopes, (list, tuple)):
+        scopes = list(raw_scopes)
+    else:
+        scopes = []
+    if (not isinstance(refresh_token, str) or not refresh_token
+            or not scopes
+            or any(not isinstance(scope, str) or not scope
+                   or len(scope) > 128
+                   or re.fullmatch(r"[A-Za-z0-9:_-]+", scope) is None
+                   for scope in scopes)):
+        return current
     env = scrubbed_env()
     env["CLAUDE_CONFIG_DIR"] = home
-    # Keep this maintenance probe independent of project hooks/plugins. Doctor
-    # still owns and refreshes the OAuth credential in safe mode.
+    # Keep this provider-owned maintenance exchange independent of project
+    # hooks/plugins.  Secrets remain in the child environment and are never
+    # placed in argv, logs, snapshots, or error text.
     env["CLAUDE_CODE_SAFE_MODE"] = "1"
+    env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
+    env["CLAUDE_CODE_OAUTH_SCOPES"] = " ".join(scopes)
     try:
         runner(
-            [binary, "doctor"], cwd=home, env=env, capture_output=True,
-            text=True, timeout=CLAUDE_REFRESH_TIMEOUT,
+            [binary, "auth", "login", "--claudeai"], cwd=home, env=env,
+            capture_output=True, text=True, timeout=CLAUDE_REFRESH_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError):
         return current
