@@ -19,6 +19,8 @@ jobs:
           version: "0.11.29"
           python-version: "3.13.12"
           enable-cache: false
+      - name: Verify the single release version
+        run: uv run --python 3.13.12 python scripts/release-version.py --check
       - name: Compile Python sources
         run: uv run --python 3.13.12 python -m compileall -q headroom
       - name: Run the complete engine suite
@@ -42,6 +44,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt
+      - name: Verify the single release version
+        id: release-version
+        run: |
+          uv run --python 3.13.12 python scripts/release-version.py --check
+          echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+          echo "target=$(rustc --print host-tuple)" >> "$GITHUB_OUTPUT"
       - name: Build and smoke-test the frozen sidecar
         run: scripts/build-desktop-sidecar.sh
       - name: Test the private bridge
@@ -59,11 +67,11 @@ jobs:
         run: >-
           ditto -c -k --sequesterRsrc --keepParent
           integrations/menubar/src-tauri/target/release/bundle/macos/Headroom.app
-          Headroom-unsigned-tracer.zip
+          Headroom-${{ steps.release-version.outputs.version }}-${{ steps.release-version.outputs.target }}-unsigned.zip
       - uses: actions/upload-artifact@v7
         with:
-          name: Headroom-unsigned-tracer
-          path: Headroom-unsigned-tracer.zip
+          name: Headroom-${{ steps.release-version.outputs.version }}-${{ steps.release-version.outputs.target }}-unsigned
+          path: Headroom-${{ steps.release-version.outputs.version }}-${{ steps.release-version.outputs.target }}-unsigned.zip
           if-no-files-found: error
 
   secrets:

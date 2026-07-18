@@ -1,6 +1,6 @@
 [package]
 name = "headroom-menubar"
-version = "0.1.0"
+version = "0.4.0"
 description = "headroom menu-bar / system-tray popover: the liquid-glass /widget page as a native click-down panel"
 license = "MIT"
 repository = "https://github.com/domanski-ai/headroom"
