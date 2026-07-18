@@ -5,7 +5,7 @@ description = "headroom menu-bar / system-tray popover: the liquid-glass /widget
 license = "MIT"
 repository = "https://github.com/domanski-ai/headroom"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [lib]
 name = "headroom_menubar_lib"
