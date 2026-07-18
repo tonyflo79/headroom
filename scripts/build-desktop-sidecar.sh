@@ -15,6 +15,7 @@ uvx --python 3.13.12 --from pyinstaller==6.21.0 pyinstaller \
   --distpath "$BIN_DIR" \
   --workpath "$BUILD_DIR/work" \
   --specpath "$BUILD_DIR/spec" \
+  --add-data "$ROOT/VERSION:." \
   --paths "$ROOT" \
   "$ROOT/desktop_bridge_entry.py"
 
