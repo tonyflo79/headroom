@@ -20,7 +20,9 @@ jobs:
           python-version: "3.13.12"
           enable-cache: false
       - name: Verify the single release version
-        run: uv run --python 3.13.12 python scripts/release-version.py --check
+        run: |
+          uv run --python 3.13.12 python scripts/release-version.py --check
+          uv run --python 3.13.12 python scripts/updater_release.py --check-config
       - name: Compile Python sources
         run: uv run --python 3.13.12 python -m compileall -q headroom
       - name: Run the complete engine suite
