@@ -39,6 +39,7 @@ use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
+use tauri_plugin_updater::UpdaterExt;
 
 #[cfg(unix)]
 use std::{
@@ -105,6 +106,11 @@ const DESKTOP_POPOVER_WIDTH: f64 = 420.0;
 const DESKTOP_POPOVER_HEIGHT: f64 = 680.0;
 const WINDOW_STATE_SCHEMA: &str = "headroom_desktop_window@1";
 const NOTIFICATION_STATE_SCHEMA: &str = "headroom_capacity_notifications@1";
+const DESKTOP_UPDATE_SCHEMA: &str = "headroom_desktop_update@1";
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_INITIAL_DELAY: Duration = Duration::from_secs(30);
+const MAX_UPDATE_VERSION_BYTES: usize = 64;
+const MAX_UPDATE_NOTES_BYTES: usize = 2_000;
 const DESKTOP_THEMES: [&str; 5] = ["midnight", "minimal", "chrome", "paper", "terminal"];
 const COLLECTION_IDLE_INTERVAL: Duration = Duration::from_secs(300);
 const COLLECTION_INTERVAL_MIN_SECONDS: u64 = 60;
@@ -207,6 +213,52 @@ struct DiagnosticEvent {
 #[derive(Default)]
 struct DiagnosticJournal {
     events: Mutex<VecDeque<DiagnosticEvent>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UpdateProjection {
+    phase: String,
+    available_version: Option<String>,
+    notes: Option<String>,
+    code: String,
+}
+
+impl Default for UpdateProjection {
+    fn default() -> Self {
+        Self {
+            phase: "not_checked".to_string(),
+            available_version: None,
+            notes: None,
+            code: "update_not_checked".to_string(),
+        }
+    }
+}
+
+impl UpdateProjection {
+    fn as_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema": DESKTOP_UPDATE_SCHEMA,
+            "channel": desktop_update_channel(),
+            "current_version": env!("CARGO_PKG_VERSION"),
+            "phase": self.phase,
+            "available_version": self.available_version,
+            "notes": self.notes,
+            "code": self.code,
+        })
+    }
+}
+
+fn desktop_update_channel() -> &'static str {
+    match option_env!("HEADROOM_UPDATE_CHANNEL") {
+        Some("prerelease") => "prerelease",
+        _ => "stable",
+    }
+}
+
+#[derive(Default)]
+struct DesktopUpdateState {
+    projection: Mutex<UpdateProjection>,
+    busy: AtomicBool,
 }
 
 #[cfg(unix)]
@@ -4007,6 +4059,56 @@ fn support_bundle_value(
     Ok(value)
 }
 
+fn bounded_update_version(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > MAX_UPDATE_VERSION_BYTES
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn bounded_update_notes(value: Option<&str>) -> Option<String> {
+    let filtered = value?
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(MAX_UPDATE_NOTES_BYTES)
+        .collect::<String>();
+    let filtered = filtered.trim();
+    (!filtered.is_empty()).then(|| filtered.to_string())
+}
+
+fn update_projection(state: &DesktopUpdateState) -> Result<serde_json::Value, String> {
+    state
+        .projection
+        .lock()
+        .map(|projection| projection.as_value())
+        .map_err(|_| "desktop update state is unavailable".to_string())
+}
+
+fn publish_update_projection(
+    app: &AppHandle,
+    projection: UpdateProjection,
+) -> Result<serde_json::Value, String> {
+    let value = projection.as_value();
+    *app.state::<DesktopUpdateState>()
+        .projection
+        .lock()
+        .map_err(|_| "desktop update state is unavailable".to_string())? = projection;
+    let encoded = serde_json::to_string(&value)
+        .map_err(|_| "desktop update state could not be encoded".to_string())?;
+    let script = format!("window.__headroomApplyUpdate&&window.__headroomApplyUpdate({encoded});");
+    for label in [DESKTOP_WINDOW_LABEL, DESKTOP_POPOVER_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+    Ok(value)
+}
+
 fn write_support_bundle_path(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -4071,6 +4173,175 @@ async fn desktop_export_diagnostics(
     write_support_bundle_path(&path, &bundle)?;
     record_diagnostic_event(&app, "support_bundle_saved");
     Ok(serde_json::json!({"status": "saved"}))
+}
+
+async fn perform_update_check(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.state::<DesktopUpdateState>();
+    if state.busy.swap(true, Ordering::SeqCst) {
+        return update_projection(state.inner());
+    }
+    let _ = publish_update_projection(
+        app,
+        UpdateProjection {
+            phase: "checking".to_string(),
+            available_version: None,
+            notes: None,
+            code: "update_checking".to_string(),
+        },
+    );
+    let result = match app.updater().and_then(|updater| Ok(updater)) {
+        Ok(updater) => updater.check().await,
+        Err(error) => Err(error),
+    };
+    let projection = match result {
+        Ok(Some(update)) => match bounded_update_version(&update.version) {
+            Some(version) => UpdateProjection {
+                phase: "available".to_string(),
+                available_version: Some(version),
+                notes: bounded_update_notes(update.body.as_deref()),
+                code: "update_available".to_string(),
+            },
+            None => UpdateProjection {
+                phase: "failed".to_string(),
+                available_version: None,
+                notes: None,
+                code: "update_metadata_invalid".to_string(),
+            },
+        },
+        Ok(None) => UpdateProjection {
+            phase: "current".to_string(),
+            available_version: None,
+            notes: None,
+            code: "update_current".to_string(),
+        },
+        Err(_) => UpdateProjection {
+            phase: "failed".to_string(),
+            available_version: None,
+            notes: None,
+            code: "update_check_failed".to_string(),
+        },
+    };
+    state.busy.store(false, Ordering::SeqCst);
+    publish_update_projection(app, projection)
+}
+
+#[tauri::command]
+fn desktop_update_status(
+    state: tauri::State<'_, DesktopUpdateState>,
+) -> Result<serde_json::Value, String> {
+    update_projection(state.inner())
+}
+
+#[tauri::command]
+async fn desktop_check_for_update(app: AppHandle) -> Result<serde_json::Value, String> {
+    perform_update_check(&app).await
+}
+
+#[tauri::command]
+async fn desktop_install_update(
+    app: AppHandle,
+    confirmed: bool,
+) -> Result<serde_json::Value, String> {
+    if !confirmed {
+        return Err("desktop update installation requires confirmation".to_string());
+    }
+    let state = app.state::<DesktopUpdateState>();
+    let projection = state
+        .projection
+        .lock()
+        .map_err(|_| "desktop update state is unavailable".to_string())?
+        .clone();
+    if projection.phase != "available" {
+        return Err("no desktop update is ready to install".to_string());
+    }
+    let expected_version = projection
+        .available_version
+        .ok_or_else(|| "no desktop update is ready to install".to_string())?;
+    let notes = projection.notes;
+    if state.busy.swap(true, Ordering::SeqCst) {
+        return Err("another desktop update operation is in progress".to_string());
+    }
+    let _ = publish_update_projection(
+        &app,
+        UpdateProjection {
+            phase: "downloading".to_string(),
+            available_version: Some(expected_version.clone()),
+            notes: notes.clone(),
+            code: "update_downloading".to_string(),
+        },
+    );
+    let candidate = match app.updater() {
+        Ok(updater) => updater.check().await.ok().flatten(),
+        Err(_) => None,
+    };
+    let result = match candidate {
+        Some(update)
+            if bounded_update_version(&update.version).as_deref()
+                == Some(expected_version.as_str()) =>
+        {
+            update.download_and_install(|_, _| {}, || {}).await
+        }
+        _ => {
+            state.busy.store(false, Ordering::SeqCst);
+            return publish_update_projection(
+                &app,
+                UpdateProjection {
+                    phase: "failed".to_string(),
+                    available_version: None,
+                    notes: None,
+                    code: "update_changed".to_string(),
+                },
+            );
+        }
+    };
+    state.busy.store(false, Ordering::SeqCst);
+    let projection = if result.is_ok() {
+        UpdateProjection {
+            phase: "ready_to_restart".to_string(),
+            available_version: Some(expected_version),
+            notes,
+            code: "update_installed".to_string(),
+        }
+    } else {
+        UpdateProjection {
+            phase: "failed".to_string(),
+            available_version: Some(expected_version),
+            notes: None,
+            code: "update_verification_or_install_failed".to_string(),
+        }
+    };
+    publish_update_projection(&app, projection)
+}
+
+#[tauri::command]
+fn desktop_restart_after_update(app: AppHandle, confirmed: bool) -> Result<(), String> {
+    if !confirmed {
+        return Err("desktop update restart requires confirmation".to_string());
+    }
+    let ready = app
+        .state::<DesktopUpdateState>()
+        .projection
+        .lock()
+        .map_err(|_| "desktop update state is unavailable".to_string())?
+        .phase
+        == "ready_to_restart";
+    if !ready {
+        return Err("no installed desktop update is ready to restart".to_string());
+    }
+    let _ = save_window_placement(&app);
+    stop_desktop_engine(&app);
+    app.restart()
+}
+
+fn start_update_scheduler(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(UPDATE_INITIAL_DELAY).await;
+        loop {
+            let _ = perform_update_check(&app).await;
+            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+        }
+    });
 }
 
 #[tauri::command]
@@ -5003,12 +5274,14 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(DesktopEngine::default())
         .manage(DesktopStore::default())
         .manage(DesktopUiState::default())
         .manage(CollectionScheduler::default())
         .manage(CapacityNotificationState::default())
         .manage(DiagnosticJournal::default())
+        .manage(DesktopUpdateState::default())
         .manage(StartupRouting {
             login_launch,
             decision_complete: AtomicBool::new(false),
@@ -5026,6 +5299,10 @@ pub fn run() {
             desktop_cancel_login,
             desktop_open_device_url,
             desktop_snapshot,
+            desktop_update_status,
+            desktop_check_for_update,
+            desktop_install_update,
+            desktop_restart_after_update,
             desktop_retry_engine,
             desktop_diagnostics,
             desktop_export_diagnostics,
@@ -5081,6 +5358,7 @@ pub fn run() {
             build_desktop_tray(app.handle())?;
             update_desktop_tray_icon(app.handle(), &snapshot.view);
             start_collection_scheduler(app.handle(), &snapshot);
+            start_update_scheduler(app.handle());
             start_engine_watchdog(app.handle());
             start_desktop_engine_async(app.handle());
             Ok(())
@@ -5160,6 +5438,44 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_projection_contains_no_transport_or_signature_material() {
+        let projection = UpdateProjection {
+            phase: "available".to_string(),
+            available_version: Some("0.4.1".to_string()),
+            notes: Some("A bounded release note.".to_string()),
+            code: "update_available".to_string(),
+        }
+        .as_value();
+        assert_eq!(projection["schema"], DESKTOP_UPDATE_SCHEMA);
+        assert!(matches!(
+            projection["channel"].as_str(),
+            Some("stable" | "prerelease")
+        ));
+        assert!(projection.get("url").is_none());
+        assert!(projection.get("signature").is_none());
+        assert!(projection.get("path").is_none());
+    }
+
+    #[test]
+    fn update_metadata_is_bounded_before_reaching_the_webview() {
+        assert_eq!(bounded_update_version(" 0.4.1 ").as_deref(), Some("0.4.1"));
+        assert!(bounded_update_version("").is_none());
+        assert!(bounded_update_version(&"v".repeat(MAX_UPDATE_VERSION_BYTES + 1)).is_none());
+        assert!(bounded_update_version("0.4.1\nprivate").is_none());
+        assert_eq!(
+            bounded_update_notes(Some("release\u{0} note\nnext")).as_deref(),
+            Some("release note\nnext")
+        );
+        assert_eq!(
+            bounded_update_notes(Some(&"x".repeat(MAX_UPDATE_NOTES_BYTES + 50)))
+                .expect("bounded notes")
+                .chars()
+                .count(),
+            MAX_UPDATE_NOTES_BYTES
+        );
+    }
 
     fn url(raw: &str) -> Url {
         Url::parse(raw).expect("test URL parses")
