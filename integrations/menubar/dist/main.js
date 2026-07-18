@@ -14,6 +14,12 @@ const REFRESH_INTERVAL_MAX = 3600;
 const ROUTING_SCHEMA = "headroom_desktop_routing@1";
 const HANDOFF_HEALTH_SCHEMA = "headroom_handoff_health@1";
 const ACTIVITY_SCHEMA = "headroom_daily_burn@1";
+const DIAGNOSTICS_SCHEMA = "headroom_desktop_diagnostics@1";
+const DIAGNOSTIC_COMPONENTS = new Set([
+  "app", "sidecar", "update", "engine", "bridge", "registry", "snapshot",
+  "activity", "provider_claude", "provider_codex",
+]);
+const DIAGNOSTIC_STATES = new Set(["ok", "attention", "unavailable"]);
 const ACTIVITY_PERIODS = ["today", "7d", "30d"];
 const ACTIVITY_COVERAGE = new Set(["exact", "partial", "unavailable"]);
 const ACTIVITY_STATUS = new Set(["indexing", "refreshing", "ready", "unavailable"]);
@@ -463,6 +469,67 @@ export function settingsPatch(draft) {
           : Number(draft.codex_notification_threshold),
       },
     },
+  };
+}
+
+export function normalizeDiagnostics(raw) {
+  const expected = [
+    "schema", "generated_at", "app_version", "engine_version",
+    "private_backup", "components", "inventory",
+  ];
+  if (!raw || Object.keys(raw).length !== expected.length ||
+      expected.some((key) => !(key in raw)) || raw.schema !== DIAGNOSTICS_SCHEMA ||
+      !Number.isSafeInteger(raw.generated_at) || raw.generated_at < 0 ||
+      typeof raw.private_backup !== "boolean" ||
+      !/^[A-Za-z0-9.+-]{1,32}$/.test(raw.app_version) ||
+      !/^[A-Za-z0-9.+-]{1,32}$/.test(raw.engine_version) ||
+      !Array.isArray(raw.components) ||
+      raw.components.length !== DIAGNOSTIC_COMPONENTS.size) {
+    throw new Error("invalid desktop diagnostics");
+  }
+  const seen = new Set();
+  const components = raw.components.map((row) => {
+    const keys = ["id", "state", "code", "remediation"];
+    if (!row || Object.keys(row).length !== keys.length ||
+        keys.some((key) => !(key in row)) || !DIAGNOSTIC_COMPONENTS.has(row.id) ||
+        seen.has(row.id) || !DIAGNOSTIC_STATES.has(row.state) ||
+        !/^[a-z0-9_]{1,64}$/.test(row.code) ||
+        !/^[a-z0-9_]{1,64}$/.test(row.remediation)) {
+      throw new Error("invalid desktop diagnostic component");
+    }
+    seen.add(row.id);
+    return { ...row };
+  });
+  if ([...DIAGNOSTIC_COMPONENTS].some((id) => !seen.has(id)) ||
+      !Array.isArray(raw.inventory) || raw.inventory.length !== 2) {
+    throw new Error("invalid desktop diagnostics inventory");
+  }
+  const expectedInventory = new Map([
+    ["health.json", "redacted_health"],
+    ["events.json", "code_only_events"],
+  ]);
+  const inventory = raw.inventory.map((row) => {
+    if (!row || Object.keys(row).length !== 3 ||
+        !["name", "kind", "records"].every((key) => key in row) ||
+        expectedInventory.get(row.name) !== row.kind ||
+        !Number.isSafeInteger(row.records) || row.records < 0 || row.records > 128) {
+      throw new Error("invalid desktop diagnostics inventory");
+    }
+    expectedInventory.delete(row.name);
+    return { ...row };
+  });
+  if (expectedInventory.size ||
+      inventory.find((row) => row.name === "health.json")?.records !== components.length) {
+    throw new Error("invalid desktop diagnostics inventory");
+  }
+  return {
+    schema: DIAGNOSTICS_SCHEMA,
+    generated_at: raw.generated_at,
+    app_version: raw.app_version,
+    engine_version: raw.engine_version,
+    private_backup: raw.private_backup,
+    components,
+    inventory,
   };
 }
 
@@ -1756,6 +1823,7 @@ async function openSettingsPanel() {
   if (document.body.dataset.surface !== "main") return;
   const panel = document.getElementById("settings");
   document.getElementById("routing").hidden = true;
+  document.getElementById("diagnostics").hidden = true;
   if (activeBootstrap) populateSettingsForm(activeBootstrap.view.settings);
   panel.hidden = false;
   panel.scrollIntoView({
@@ -1791,6 +1859,110 @@ function openRoutingPanel() {
     block: "start", behavior: prefersReducedMotion() ? "auto" : "smooth",
   });
   document.getElementById("routing-family").focus();
+function diagnosticRemediationCopy(action) {
+  return ({
+    none: "no action",
+    retry_engine: "retry engine",
+    refresh_capacity: "refresh capacity",
+    refresh_activity: "refresh activity index",
+    wait_for_index: "wait for indexing",
+    repair_registry: "repair account registry",
+    restore_private_backup: "restore private backup locally",
+    repair_config_manually: "repair configuration manually",
+    complete_onboarding: "complete onboarding",
+    install_claude_cli: "install Claude CLI",
+    install_codex_cli: "install Codex CLI",
+    update_manually: "update manually",
+  })[action] || "inspect locally";
+}
+
+function renderDiagnostics(value, invoke) {
+  const panel = document.getElementById("diagnostics");
+  const status = document.getElementById("diagnostics-status");
+  const rows = value.components.map((component) => {
+    const row = document.createElement("div");
+    row.className = "diagnostics-component";
+    row.dataset.state = component.state;
+    const name = document.createElement("strong");
+    name.textContent = component.id.replaceAll("_", " ");
+    const state = document.createElement("span");
+    state.textContent = component.state.toUpperCase();
+    const detail = document.createElement("small");
+    detail.textContent = `${component.code} · ${diagnosticRemediationCopy(component.remediation)}`;
+    row.append(name, state, detail);
+    return row;
+  });
+  document.getElementById("diagnostics-components").replaceChildren(...rows);
+  const attention = value.components.filter((row) => row.state !== "ok").length;
+  status.textContent = attention
+    ? `${attention} component${attention === 1 ? "" : "s"} need attention · app ${value.app_version} · engine ${value.engine_version}`
+    : `All components healthy · app ${value.app_version} · engine ${value.engine_version}`;
+  if (value.private_backup) status.textContent += " · private recovery backup available";
+  document.getElementById("diagnostics-inventory-copy").textContent = value.inventory
+    .map((row) => `${row.name} · ${row.records} ${row.kind.replaceAll("_", " ")} records`)
+    .join(" | ");
+  const retry = document.getElementById("diagnostics-retry");
+  const sidecar = value.components.find((row) => row.id === "sidecar");
+  retry.disabled = !invoke || sidecar?.state !== "unavailable";
+  retry.onclick = invoke ? async () => {
+    retry.disabled = true;
+    status.textContent = "Starting one bounded engine retry…";
+    try {
+      await invoke("desktop_retry_engine");
+      status.textContent = "Retry started. Refresh health after the engine settles.";
+    } catch {
+      status.textContent = "Retry was refused because the engine is already recovering.";
+    }
+  } : null;
+  const refresh = document.getElementById("diagnostics-refresh");
+  refresh.disabled = !invoke;
+  refresh.onclick = invoke ? () => openDiagnosticsPanel() : null;
+  const exportButton = document.getElementById("diagnostics-export");
+  exportButton.disabled = !invoke;
+  exportButton.onclick = invoke ? async () => {
+    exportButton.disabled = true;
+    status.textContent = "Re-validating redaction before opening the native save dialog…";
+    try {
+      const result = await invoke("desktop_export_diagnostics");
+      status.textContent = result?.status === "saved"
+        ? "Redacted support report saved."
+        : "Save cancelled; no report was written.";
+    } catch {
+      status.textContent = "Report was not saved because the redaction boundary refused it.";
+    } finally {
+      exportButton.disabled = false;
+    }
+  } : null;
+  document.getElementById("diagnostics-quit").onclick = invoke
+    ? () => invoke("desktop_quit").catch(() => {}) : null;
+  panel.hidden = false;
+}
+
+async function openDiagnosticsPanel() {
+  if (document.body.dataset.surface !== "main") return;
+  document.getElementById("settings").hidden = true;
+  document.getElementById("routing").hidden = true;
+  const panel = document.getElementById("diagnostics");
+  const status = document.getElementById("diagnostics-status");
+  panel.hidden = false;
+  panel.scrollIntoView({ block: "start", behavior: "smooth" });
+  document.getElementById("diagnostics-export").disabled = true;
+  status.textContent = "Loading bounded health…";
+  if (!activeInvoke) {
+    status.textContent = "Diagnostics are available only inside the desktop app.";
+    return;
+  }
+  try {
+    renderDiagnostics(normalizeDiagnostics(
+      await activeInvoke("desktop_diagnostics")), activeInvoke);
+  } catch {
+    status.textContent = "Health could not be validated. Retry the engine or quit safely.";
+    document.getElementById("diagnostics-retry").disabled = false;
+  }
+  document.getElementById("close-diagnostics").onclick = () => {
+    panel.hidden = true;
+  };
+  document.getElementById("close-diagnostics").focus();
 }
 
 function configureSurfaceActions(surface, invoke) {
@@ -1804,6 +1976,7 @@ function configureSurfaceActions(surface, invoke) {
     controls.push(
       actionButton("Dashboard", () => invoke("desktop_show_dashboard"), "primary"),
       actionButton("Settings", () => invoke("desktop_show_settings")),
+      actionButton("Diagnostics", () => invoke("desktop_show_diagnostics")),
       actionButton("Quit", () => invoke("desktop_quit"), "danger"),
     );
   } else {
@@ -1813,6 +1986,10 @@ function configureSurfaceActions(surface, invoke) {
     settings.id = "open-settings";
     settings.setAttribute("aria-keyshortcuts", "Meta+,");
     controls.push(routing, settings);
+    controls.push(
+      actionButton("Diagnostics", openDiagnosticsPanel),
+      actionButton("Settings", openSettingsPanel),
+    );
   }
   actions.replaceChildren(...controls);
 }
@@ -2156,6 +2333,16 @@ if (typeof document !== "undefined") {
       if (!document.getElementById("routing").hidden) {
         document.getElementById("close-routing").click();
         return;
+    if (panel === "diagnostics") openDiagnosticsPanel();
+  };
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      for (const id of ["diagnostics", "settings"]) {
+        const panel = document.getElementById(id);
+        if (!panel.hidden) {
+          panel.hidden = true;
+          return;
+        }
       }
     }
     if (!event.metaKey || event.ctrlKey || event.altKey) return;

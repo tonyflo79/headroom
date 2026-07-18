@@ -149,6 +149,32 @@
         </form>
       </section>
 
+      <section id="diagnostics" class="diagnostics-panel" aria-labelledby="diagnostics-title" hidden>
+        <div class="diagnostics-heading">
+          <div>
+            <p class="eyebrow">HEADROOM // DIAGNOSTICS</p>
+            <h2 id="diagnostics-title">$ headroom health --redacted</h2>
+            <p>Stable codes only. No account identity, provider output, paths, credentials, prompts, or conversation content.</p>
+          </div>
+          <button id="close-diagnostics" type="button" aria-label="Close Diagnostics">Close</button>
+        </div>
+        <p id="diagnostics-status" class="diagnostics-status" role="status" aria-live="polite">Loading bounded health…</p>
+        <div id="diagnostics-components" class="diagnostics-components" aria-live="polite"></div>
+        <div class="diagnostics-inventory">
+          <div>
+            <span>[SUPPORT REPORT INVENTORY]</span>
+            <p id="diagnostics-inventory-copy">Inventory unavailable until health loads.</p>
+          </div>
+          <p>Review this exact inventory before saving. Private recovery backups are never included.</p>
+        </div>
+        <div class="diagnostics-actions">
+          <button id="diagnostics-retry" type="button">Retry engine</button>
+          <button id="diagnostics-refresh" type="button">Refresh health</button>
+          <button id="diagnostics-export" class="primary" type="button" disabled>Save redacted report</button>
+          <button id="diagnostics-quit" class="danger" type="button">Quit Headroom</button>
+        </div>
+      </section>
+
       <section id="routing" class="routing-panel" aria-labelledby="routing-title" hidden>
         <div class="routing-heading">
           <div>
