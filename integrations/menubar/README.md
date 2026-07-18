@@ -133,7 +133,10 @@ Headroom.app
   owner removes a safely owned stale endpoint after force-quit; normal exit
   removes the live endpoint and releases the kernel lock.
 - Startup has a 12-second bound and requires the exact
-  `headroom_desktop_bridge@1` schema, frozen runtime, and required capability.
+  `headroom_desktop_bridge@1` schema, frozen runtime, required capabilities,
+  and the exact redacted `headroom_compatibility@1` matrix. The matrix binds
+  product and engine versions, bridge/state schema ranges, platform,
+  architecture, and capabilities before the first live view is trusted.
 - Startup and restart handshakes run on the blocking pool; the native UI stays
   responsive and fail-closed while the engine starts.
 - Engine stdout is protocol-only. Imported or child-process output is diverted
@@ -224,6 +227,7 @@ uv run --python 3.13.12 python -m unittest tests.test_resilient_collection
 uv run --python 3.13.12 python -m unittest tests.test_desktop_login
 uv run --python 3.13.12 python -m unittest tests.test_codex_desktop_login
 uv run --python 3.13.12 python -m unittest tests.test_account_lifecycle
+uv run --python 3.13.12 python -m unittest tests.test_compatibility
 npm --prefix integrations/menubar test
 cargo fmt --check --manifest-path integrations/menubar/src-tauri/Cargo.toml
 cargo test --locked --manifest-path integrations/menubar/src-tauri/Cargo.toml
@@ -258,6 +262,10 @@ locale formatting, and reversible launch-at-login acceptance, see
 For engine/CLI routing parity, safely quoted copy output, allowlisted terminal
 launch, final selection re-proof, and lease-race acceptance, see
 `docs/desktop/ROUTING-VALIDATION.md`.
+
+For the engine/bridge/state compatibility matrix, migration safety,
+concurrent CLI coexistence, and downgrade refusal, see
+`docs/desktop/COMPATIBILITY-VALIDATION.md`.
 
 For engine-authoritative automatic-handoff states, next-launch preference
 behavior, strict sanitization, and packaged active-child acceptance, see
