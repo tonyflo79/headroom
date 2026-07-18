@@ -271,6 +271,10 @@ For engine-authoritative automatic-handoff states, next-launch preference
 behavior, strict sanitization, and packaged active-child acceptance, see
 `docs/desktop/HANDOFF-HEALTH-VALIDATION.md`.
 
+For stable component health, bounded code-only event history, native redacted
+support export, and read-only corrupt-registry recovery, see
+`docs/desktop/DIAGNOSTICS-VALIDATION.md`.
+
 ## Current limitations
 
 - The app is macOS-only and is built for the runner's native architecture.
@@ -280,7 +284,7 @@ behavior, strict sanitization, and packaged active-child acceptance, see
 - Claude access-token expiry is repaired through Claude Code's own per-slot
   credential manager; rejected/revoked refresh credentials still require the
   explicit human reauthentication workflow.
-- There is no updater, diagnostics export, signing, or notarization yet.
+- There is no updater, signing, or notarization yet.
 - Native capacity notifications are durable, deduplicated, verified-reading
   only, and off by default. macOS permission is requested only after opt-in.
 - The old loopback viewer helpers remain in Rust for their security tests but

@@ -21,6 +21,9 @@ import time
 from . import (
     __version__, account_lifecycle, activity, capabilities, compatibility,
     collect as collector, connect, notify, paths, registry, route, widget,
+    __version__, account_lifecycle, activity, capabilities,
+    collect as collector, connect, diagnostics, notify, paths, registry, route,
+    widget,
 )
 
 
@@ -33,6 +36,7 @@ ROUTING_SCHEMA = "headroom_desktop_routing@1"
 LAUNCH_INTENT_SCHEMA = "headroom_provider_launch_intent@1"
 REAUTH_LAUNCH_INTENT_SCHEMA = "headroom_provider_reauthentication_intent@1"
 HANDOFF_HEALTH_SCHEMA = "headroom_handoff_health@1"
+ENGINE_HEALTH_SCHEMA = diagnostics.SCHEMA
 DESKTOP_FAMILIES = ("claude", "opus", "sonnet", "haiku", "fable", "codex")
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_REQUEST_ID = 128
@@ -174,13 +178,29 @@ def _registry_discovery():
     config_path = paths.config_path()
     if not os.path.exists(config_path):
         return "missing", None, None
+    if os.path.islink(config_path) or not os.path.isfile(config_path):
+        diagnostics.backup_corrupt_config()
+        return "recovery", None, "registry_unreadable"
     raw = paths.load_json(config_path)
     if raw is None:
+        diagnostics.backup_corrupt_config()
         return "recovery", None, "registry_unreadable"
     try:
         return "compatible", registry.validate(raw), None
     except registry.RegistryError:
+        diagnostics.backup_corrupt_config()
         return "recovery", None, "registry_incompatible"
+
+
+def diagnostics_desktop(now=None):
+    """Stable engine health without raw paths, identities, or provider output."""
+    state, config, recovery_code = _registry_discovery()
+    backup_state = None
+    if state == "recovery":
+        backup_state = diagnostics.backup_corrupt_config().get("state")
+    return diagnostics.engine_health(
+        config=config, recovery_code=recovery_code,
+        backup_state=backup_state, now=now)
 
 
 def _candidate_projection(rows, config=None):
@@ -1289,6 +1309,13 @@ def _handle(command, args):
             "architecture": platform.machine(),
             "capabilities": advertised_capabilities,
             "compatibility": compatibility.contract(advertised_capabilities),
+            "capabilities": [
+                "fixture_snapshot", "discover", "adopt", "refresh",
+                "claude_login", "codex_device_login", "onboarding",
+                "account_lifecycle", "reauthentication",
+                "resilient_collection", "validated_settings",
+                "routing_launch", "provider_reauthentication_launch",
+                "handoff_health", "redacted_diagnostics", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
@@ -1346,6 +1373,10 @@ def _handle(command, args):
                 "invalid_args", "reauthentication intent arguments are invalid")
         return external_reauthentication_intent_desktop(
             args.get("account_name")), False
+    if command == "diagnostics":
+        if set(args) - {"now"}:
+            raise BridgeError("invalid_args", "diagnostics arguments are invalid")
+        return diagnostics_desktop(args.get("now")), False
     if command == "start_claude_login":
         if set(args) - {"name", "expected_email"}:
             raise BridgeError("invalid_args", "login arguments are invalid")
