@@ -13,7 +13,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::TcpStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -32,6 +32,7 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_positioner::{Position, WindowExt};
 use tauri_plugin_shell::{
@@ -111,6 +112,24 @@ const ROUTING_SCHEMA: &str = "headroom_desktop_routing@1";
 const LAUNCH_INTENT_SCHEMA: &str = "headroom_provider_launch_intent@1";
 const REAUTH_LAUNCH_INTENT_SCHEMA: &str = "headroom_provider_reauthentication_intent@1";
 const HANDOFF_HEALTH_SCHEMA: &str = "headroom_handoff_health@1";
+const ENGINE_HEALTH_SCHEMA: &str = "headroom_engine_health@1";
+const DESKTOP_DIAGNOSTICS_SCHEMA: &str = "headroom_desktop_diagnostics@1";
+const SUPPORT_BUNDLE_SCHEMA: &str = "headroom_support_bundle@1";
+const DIAGNOSTIC_JOURNAL_SCHEMA: &str = "headroom_diagnostic_events@1";
+const DIAGNOSTIC_EVENT_MAX: usize = 256;
+const DIAGNOSTIC_EVENT_EXPORT_MAX: usize = 128;
+const DIAGNOSTIC_JOURNAL_MAX_BYTES: u64 = 128 * 1024;
+const SUPPORT_BUNDLE_MAX_BYTES: usize = 256 * 1024;
+const DIAGNOSTIC_EVENT_MAX_AGE: u64 = 7 * 24 * 60 * 60;
+const ENGINE_COMPONENT_IDS: [&str; 7] = [
+    "engine",
+    "bridge",
+    "registry",
+    "snapshot",
+    "activity",
+    "provider_claude",
+    "provider_codex",
+];
 const ROUTING_FAMILIES: &[&str] = &["claude", "opus", "sonnet", "haiku", "fable", "codex"];
 const ROUTING_CODES: &[&str] = &[
     "selected",
@@ -176,6 +195,17 @@ struct CapacityNotification {
 #[derive(Default)]
 struct CapacityNotificationState {
     windows: Mutex<HashMap<String, NotificationWindowState>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DiagnosticEvent {
+    timestamp: u64,
+    code: String,
+}
+
+#[derive(Default)]
+struct DiagnosticJournal {
+    events: Mutex<VecDeque<DiagnosticEvent>>,
 }
 
 #[cfg(unix)]
@@ -1928,6 +1958,7 @@ fn validate_desktop_bootstrap(
                 "routing_launch",
                 "provider_reauthentication_launch",
                 "handoff_health",
+                "redacted_diagnostics",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -1936,6 +1967,372 @@ fn validate_desktop_bootstrap(
         return Err("bundled desktop engine lacks the required capability".into());
     }
     validate_desktop_view(view)
+}
+
+fn stable_diagnostic_token(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn diagnostic_component(id: &str, state: &str, code: &str, remediation: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "state": state,
+        "code": code,
+        "remediation": remediation,
+    })
+}
+
+fn validate_engine_health(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if !object_has_only(
+        value,
+        &[
+            "schema",
+            "generated_at",
+            "engine_version",
+            "components",
+            "private_backup",
+        ],
+    ) || value.get("schema").and_then(serde_json::Value::as_str) != Some(ENGINE_HEALTH_SCHEMA)
+    {
+        return Err("desktop engine diagnostics schema is invalid".into());
+    }
+    let generated_at = value
+        .get("generated_at")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "desktop engine diagnostics timestamp is invalid".to_string())?;
+    let engine_version = value
+        .get("engine_version")
+        .and_then(serde_json::Value::as_str)
+        .filter(|version| {
+            (1..=32).contains(&version.len())
+                && version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+        })
+        .ok_or_else(|| "desktop engine diagnostics version is invalid".to_string())?;
+    let private_backup = value
+        .get("private_backup")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "desktop engine diagnostics recovery state is invalid".to_string())?;
+    let rows = value
+        .get("components")
+        .and_then(serde_json::Value::as_array)
+        .filter(|rows| rows.len() == ENGINE_COMPONENT_IDS.len())
+        .ok_or_else(|| "desktop engine diagnostics components are invalid".to_string())?;
+    let mut seen = std::collections::HashSet::new();
+    let mut components = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !object_has_only(row, &["id", "state", "code", "remediation"])
+            || row.as_object().map_or(0, serde_json::Map::len) != 4
+        {
+            return Err("desktop engine diagnostic component contains unknown fields".into());
+        }
+        let id = row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| ENGINE_COMPONENT_IDS.contains(id))
+            .ok_or_else(|| "desktop engine diagnostic component is invalid".to_string())?;
+        let state = row
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .filter(|state| matches!(*state, "ok" | "attention" | "unavailable"))
+            .ok_or_else(|| "desktop engine diagnostic state is invalid".to_string())?;
+        let code = row
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| stable_diagnostic_token(code))
+            .ok_or_else(|| "desktop engine diagnostic code is invalid".to_string())?;
+        let remediation = row
+            .get("remediation")
+            .and_then(serde_json::Value::as_str)
+            .filter(|remediation| stable_diagnostic_token(remediation))
+            .ok_or_else(|| "desktop engine diagnostic remediation is invalid".to_string())?;
+        if !seen.insert(id) {
+            return Err("desktop engine diagnostic component is duplicated".into());
+        }
+        components.push(diagnostic_component(id, state, code, remediation));
+    }
+    if !ENGINE_COMPONENT_IDS.iter().all(|id| seen.contains(id)) {
+        return Err("desktop engine diagnostics omitted a component".into());
+    }
+    Ok(serde_json::json!({
+        "schema": ENGINE_HEALTH_SCHEMA,
+        "generated_at": generated_at,
+        "engine_version": engine_version,
+        "components": components,
+        "private_backup": private_backup,
+    }))
+}
+
+fn unavailable_engine_components() -> Vec<serde_json::Value> {
+    ENGINE_COMPONENT_IDS
+        .iter()
+        .map(|id| {
+            diagnostic_component(
+                id,
+                "unavailable",
+                &format!("{id}_unavailable"),
+                "retry_engine",
+            )
+        })
+        .collect()
+}
+
+fn diagnostic_event_code_allowed(code: &str) -> bool {
+    [
+        "app_started",
+        "diagnostics_opened",
+        "engine_ready",
+        "engine_manual_retry",
+        "engine_startup_timeout",
+        "engine_startup_exited",
+        "engine_startup_pipe_failed",
+        "engine_request_timeout",
+        "engine_exited_mid_request",
+        "engine_communication_failed",
+        "engine_incompatible",
+        "engine_start_failed",
+        "engine_unexpected_exit",
+        "engine_state_unavailable",
+        "collection_current",
+        "collection_attention",
+        "collection_offline",
+        "support_bundle_saved",
+        "support_bundle_cancelled",
+    ]
+    .contains(&code)
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn prune_diagnostic_events(events: &mut VecDeque<DiagnosticEvent>, now: u64) {
+    let minimum = now.saturating_sub(DIAGNOSTIC_EVENT_MAX_AGE);
+    while events
+        .front()
+        .is_some_and(|event| event.timestamp < minimum)
+    {
+        events.pop_front();
+    }
+    while events.len() > DIAGNOSTIC_EVENT_MAX {
+        events.pop_front();
+    }
+}
+
+fn diagnostic_events_value(events: &VecDeque<DiagnosticEvent>) -> serde_json::Value {
+    serde_json::json!({
+        "schema": DIAGNOSTIC_JOURNAL_SCHEMA,
+        "events": events.iter().map(|event| serde_json::json!({
+            "timestamp": event.timestamp,
+            "code": event.code,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn load_diagnostic_events_path(path: &Path, now: u64) -> VecDeque<DiagnosticEvent> {
+    let Some(metadata) = fs::symlink_metadata(path).ok() else {
+        return VecDeque::new();
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > DIAGNOSTIC_JOURNAL_MAX_BYTES
+    {
+        return VecDeque::new();
+    }
+    let Some(value) = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return VecDeque::new();
+    };
+    if !object_has_only(&value, &["schema", "events"])
+        || value.get("schema").and_then(serde_json::Value::as_str)
+            != Some(DIAGNOSTIC_JOURNAL_SCHEMA)
+    {
+        return VecDeque::new();
+    }
+    let Some(rows) = value
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .filter(|rows| rows.len() <= DIAGNOSTIC_EVENT_MAX)
+    else {
+        return VecDeque::new();
+    };
+    let mut events = VecDeque::new();
+    for row in rows {
+        if !object_has_only(row, &["timestamp", "code"])
+            || row.as_object().map_or(0, serde_json::Map::len) != 2
+        {
+            return VecDeque::new();
+        }
+        let Some(timestamp) = row.get("timestamp").and_then(serde_json::Value::as_u64) else {
+            return VecDeque::new();
+        };
+        let Some(code) = row
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| diagnostic_event_code_allowed(code))
+        else {
+            return VecDeque::new();
+        };
+        events.push_back(DiagnosticEvent {
+            timestamp,
+            code: code.to_string(),
+        });
+    }
+    prune_diagnostic_events(&mut events, now);
+    events
+}
+
+fn write_private_json_atomic(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("diagnostic state destination is unsafe".into());
+        }
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| "diagnostic state path is invalid".to_string())?;
+    fs::create_dir_all(directory)
+        .map_err(|_| "diagnostic state directory could not be created".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "diagnostic state directory permissions could not be set".to_string())?;
+    let temporary = directory.join(format!(
+        ".headroom-diagnostic-{}-{}.tmp",
+        std::process::id(),
+        epoch_seconds()
+    ));
+    let _ = fs::remove_file(&temporary);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| "diagnostic state could not be prepared".to_string())?;
+    serde_json::to_writer(&mut file, value)
+        .map_err(|_| "diagnostic state could not be encoded".to_string())?;
+    file.write_all(b"\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "diagnostic state could not be committed".to_string())?;
+    fs::rename(&temporary, path).map_err(|_| "diagnostic state could not be published".to_string())
+}
+
+fn write_diagnostic_events_path(
+    path: &Path,
+    events: &mut VecDeque<DiagnosticEvent>,
+    now: u64,
+) -> Result<(), String> {
+    prune_diagnostic_events(events, now);
+    let mut value = diagnostic_events_value(events);
+    while serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len())
+        > DIAGNOSTIC_JOURNAL_MAX_BYTES as usize
+    {
+        if events.pop_front().is_none() {
+            return Err("diagnostic state exceeds its size bound".into());
+        }
+        value = diagnostic_events_value(events);
+    }
+    write_private_json_atomic(path, &value)
+}
+
+fn diagnostic_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("diagnostics").join("events.json"))
+        .map_err(|_| "diagnostic state directory is unavailable".to_string())
+}
+
+fn record_diagnostic_event(app: &AppHandle, code: &'static str) {
+    if !diagnostic_event_code_allowed(code) {
+        return;
+    }
+    let now = epoch_seconds();
+    let state = app.state::<DiagnosticJournal>();
+    let Ok(mut events) = state.events.lock() else {
+        return;
+    };
+    events.push_back(DiagnosticEvent {
+        timestamp: now,
+        code: code.to_string(),
+    });
+    if let Ok(path) = diagnostic_state_path(app) {
+        let _ = write_diagnostic_events_path(&path, &mut events, now);
+    }
+}
+
+fn support_value_is_safe(value: &serde_json::Value) -> bool {
+    fn walk(value: &serde_json::Value, depth: usize) -> bool {
+        if depth > 12 {
+            return false;
+        }
+        match value {
+            serde_json::Value::String(text) => {
+                if text.len() > 256 {
+                    return false;
+                }
+                let lower = text.to_ascii_lowercase();
+                let email_like = text
+                    .split(|character: char| {
+                        character.is_whitespace()
+                            || matches!(character, '<' | '>' | '"' | '\'' | '(' | ')' | ',' | ';')
+                    })
+                    .any(|word| {
+                        let Some((local, domain)) = word.split_once('@') else {
+                            return false;
+                        };
+                        !local.is_empty() && domain.bytes().any(|byte| byte.is_ascii_alphabetic())
+                    });
+                !email_like
+                    && !text.contains("/Users/")
+                    && !text.contains("/home/")
+                    && !text.contains("\\Users\\")
+                    && !lower.contains("authorization")
+                    && !lower.contains("bearer ")
+                    && !lower.contains("access_token")
+                    && !lower.contains("refresh_token")
+                    && !lower.contains("api_key")
+                    && !lower.contains("sk-")
+                    && !lower.contains("conversation")
+                    && !lower.contains("transcript")
+                    && !lower.contains("prompt")
+            }
+            serde_json::Value::Array(rows) => {
+                rows.len() <= 256 && rows.iter().all(|row| walk(row, depth + 1))
+            }
+            serde_json::Value::Object(object) => {
+                object.len() <= 32
+                    && object.iter().all(|(key, child)| {
+                        let lower = key.to_ascii_lowercase();
+                        ![
+                            "token",
+                            "authorization",
+                            "credential",
+                            "email",
+                            "header",
+                            "prompt",
+                            "message",
+                            "content",
+                            "conversation",
+                            "transcript",
+                            "path",
+                        ]
+                        .iter()
+                        .any(|marker| lower.contains(marker))
+                            && walk(child, depth + 1)
+                    })
+            }
+            _ => true,
+        }
+    }
+    walk(value, 0)
 }
 
 fn engine_failure_code(error: &str) -> &'static str {
@@ -2685,6 +3082,9 @@ async fn engine_command(
         .lock()
         .map(|session| session.is_none())
         .unwrap_or(true);
+    if let Err(error) = &result {
+        record_diagnostic_event(&app, engine_failure_code(error));
+    }
     if result.is_err() && missing && !engine.starting.load(Ordering::SeqCst) {
         let (state, code, retry) = engine.recovery.lock().map_or(
             ("degraded", Some("engine_state_unavailable"), None),
@@ -2704,7 +3104,7 @@ async fn engine_command(
         );
         set_engine_state_windows(&app, state, code);
         if state != "degraded" {
-            schedule_engine_restart(app, retry.unwrap_or(Duration::from_millis(100)));
+            schedule_engine_restart(app.clone(), retry.unwrap_or(Duration::from_millis(100)));
         }
     }
     result
@@ -3201,6 +3601,200 @@ fn desktop_snapshot(state: tauri::State<'_, DesktopStore>) -> Result<serde_json:
     Ok(snapshot_envelope(&state.snapshot()?))
 }
 
+fn desktop_diagnostics_projection(
+    app: &AppHandle,
+    engine_health: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let now = epoch_seconds();
+    let validated = engine_health
+        .as_ref()
+        .and_then(|value| validate_engine_health(value).ok());
+    let engine_version = validated
+        .as_ref()
+        .and_then(|value| value.get("engine_version"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unavailable")
+        .to_string();
+    let private_backup = validated
+        .as_ref()
+        .and_then(|value| value.get("private_backup"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let engine = app.state::<DesktopEngine>();
+    let has_session = engine
+        .session
+        .lock()
+        .map(|session| session.is_some())
+        .unwrap_or(false);
+    let degraded = engine
+        .recovery
+        .lock()
+        .map(|policy| policy.degraded)
+        .unwrap_or(true);
+    let sidecar = if has_session && validated.is_some() {
+        diagnostic_component("sidecar", "ok", "sidecar_ready", "none")
+    } else if degraded {
+        diagnostic_component("sidecar", "unavailable", "sidecar_degraded", "retry_engine")
+    } else {
+        diagnostic_component("sidecar", "attention", "sidecar_recovering", "retry_engine")
+    };
+    let mut components = vec![
+        diagnostic_component("app", "ok", "app_ready", "none"),
+        sidecar,
+        diagnostic_component(
+            "update",
+            "attention",
+            "update_not_configured",
+            "update_manually",
+        ),
+    ];
+    if let Some(value) = validated {
+        if let Some(rows) = value
+            .get("components")
+            .and_then(serde_json::Value::as_array)
+        {
+            components.extend(rows.iter().cloned());
+        }
+    } else {
+        components.extend(unavailable_engine_components());
+    }
+    let event_count = app
+        .state::<DiagnosticJournal>()
+        .events
+        .lock()
+        .map(|events| events.len().min(DIAGNOSTIC_EVENT_EXPORT_MAX))
+        .unwrap_or(0);
+    let component_count = components.len();
+    serde_json::json!({
+        "schema": DESKTOP_DIAGNOSTICS_SCHEMA,
+        "generated_at": now,
+        "app_version": app.package_info().version.to_string(),
+        "engine_version": engine_version,
+        "private_backup": private_backup,
+        "components": components,
+        "inventory": [
+            {"name": "health.json", "kind": "redacted_health", "records": component_count},
+            {"name": "events.json", "kind": "code_only_events", "records": event_count},
+        ],
+    })
+}
+
+async fn collect_desktop_diagnostics(app: AppHandle, engine: DesktopEngine) -> serde_json::Value {
+    let raw = engine_command(app.clone(), engine, "diagnostics", serde_json::json!({}))
+        .await
+        .ok();
+    if raw
+        .as_ref()
+        .is_some_and(|value| validate_engine_health(value).is_err())
+    {
+        record_diagnostic_event(&app, "engine_incompatible");
+    }
+    desktop_diagnostics_projection(&app, raw)
+}
+
+fn support_bundle_value(
+    app: &AppHandle,
+    health: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let journal = app.state::<DiagnosticJournal>();
+    let events = journal
+        .events
+        .lock()
+        .map_err(|_| "diagnostic event history is unavailable".to_string())?;
+    let exported = events
+        .iter()
+        .rev()
+        .take(DIAGNOSTIC_EVENT_EXPORT_MAX)
+        .rev()
+        .map(|event| {
+            serde_json::json!({
+                "timestamp": event.timestamp,
+                "code": event.code,
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = serde_json::json!({
+        "schema": SUPPORT_BUNDLE_SCHEMA,
+        "generated_at": epoch_seconds(),
+        "app_version": app.package_info().version.to_string(),
+        "health": health,
+        "events": exported,
+    });
+    let size = serde_json::to_vec(&value)
+        .map_err(|_| "support bundle could not be encoded".to_string())?
+        .len();
+    if size > SUPPORT_BUNDLE_MAX_BYTES || !support_value_is_safe(&value) {
+        return Err("support bundle failed the redaction boundary".into());
+    }
+    Ok(value)
+}
+
+fn write_support_bundle_path(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("support bundle destination is unsafe".into());
+        }
+    }
+    let directory = path
+        .parent()
+        .filter(|directory| directory.is_dir())
+        .ok_or_else(|| "support bundle destination is invalid".to_string())?;
+    let temporary = directory.join(format!(
+        ".headroom-support-{}-{}.tmp",
+        std::process::id(),
+        epoch_seconds()
+    ));
+    let _ = fs::remove_file(&temporary);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| "support bundle could not be prepared".to_string())?;
+    serde_json::to_writer_pretty(&mut file, value)
+        .map_err(|_| "support bundle could not be encoded".to_string())?;
+    file.write_all(b"\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "support bundle could not be committed".to_string())?;
+    fs::rename(&temporary, path).map_err(|_| "support bundle could not be saved".to_string())
+}
+
+#[tauri::command]
+async fn desktop_diagnostics(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+) -> Result<serde_json::Value, String> {
+    record_diagnostic_event(&app, "diagnostics_opened");
+    Ok(collect_desktop_diagnostics(app, state.inner().clone()).await)
+}
+
+#[tauri::command]
+async fn desktop_export_diagnostics(
+    app: AppHandle,
+    state: tauri::State<'_, DesktopEngine>,
+) -> Result<serde_json::Value, String> {
+    let health = collect_desktop_diagnostics(app.clone(), state.inner().clone()).await;
+    let bundle = support_bundle_value(&app, health)?;
+    let filename = format!("Headroom-Support-{}.json", epoch_seconds());
+    let selection = app
+        .dialog()
+        .file()
+        .add_filter("Headroom support report", &["json"])
+        .set_file_name(&filename)
+        .blocking_save_file();
+    let Some(selection) = selection else {
+        record_diagnostic_event(&app, "support_bundle_cancelled");
+        return Ok(serde_json::json!({"status": "cancelled"}));
+    };
+    let path = selection
+        .into_path()
+        .map_err(|_| "support bundle destination is invalid".to_string())?;
+    write_support_bundle_path(&path, &bundle)?;
+    record_diagnostic_event(&app, "support_bundle_saved");
+    Ok(serde_json::json!({"status": "saved"}))
+}
+
 #[tauri::command]
 fn desktop_retry_engine(app: AppHandle) -> Result<serde_json::Value, String> {
     let engine = app.state::<DesktopEngine>().inner().clone();
@@ -3215,6 +3809,7 @@ fn desktop_retry_engine(app: AppHandle) -> Result<serde_json::Value, String> {
     if let Ok(mut policy) = app.state::<CollectionScheduler>().policy.lock() {
         policy.retry_at = None;
     }
+    record_diagnostic_event(&app, "engine_manual_retry");
     set_engine_state_windows(&app, "recovering", Some("engine_manual_retry"));
     start_desktop_engine_async(&app);
     Ok(snapshot_envelope(&app.state::<DesktopStore>().snapshot()?))
@@ -3251,6 +3846,11 @@ fn desktop_show_dashboard(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn desktop_show_settings(app: AppHandle) -> Result<(), String> {
     show_desktop_window(&app, Some("settings"))
+}
+
+#[tauri::command]
+fn desktop_show_diagnostics(app: AppHandle) -> Result<(), String> {
+    show_desktop_window(&app, Some("diagnostics"))
 }
 
 #[tauri::command]
@@ -3485,6 +4085,7 @@ fn start_desktop_engine_async(app: &AppHandle) {
         engine.starting.store(false, Ordering::SeqCst);
         match outcome {
             Ok(()) => {
+                record_diagnostic_event(&app, "engine_ready");
                 let enabled = app
                     .state::<CollectionScheduler>()
                     .enabled
@@ -3513,6 +4114,9 @@ fn start_desktop_engine_async(app: &AppHandle) {
                         )
                     },
                 );
+                if let Some(code) = code {
+                    record_diagnostic_event(&app, code);
+                }
                 set_engine_state_windows(&app, state, code);
                 if state != "degraded" {
                     schedule_engine_restart(app, retry.unwrap_or(Duration::from_millis(100)));
@@ -3570,6 +4174,7 @@ fn start_engine_watchdog(app: &AppHandle) {
                 },
             );
             set_engine_state_windows(&app, if degraded { "degraded" } else { "recovering" }, code);
+            record_diagnostic_event(&app, "engine_unexpected_exit");
             if !degraded {
                 schedule_engine_restart(app.clone(), delay);
             }
@@ -3674,6 +4279,14 @@ fn request_scheduled_collection(app: &AppHandle, trigger: &str) {
         app.state::<CollectionScheduler>()
             .running
             .store(false, Ordering::SeqCst);
+        record_diagnostic_event(
+            &app,
+            match settled {
+                "current" => "collection_current",
+                "offline" => "collection_offline",
+                _ => "collection_attention",
+            },
+        );
         if diagnostic.is_some() {
             set_engine_state_windows(&app, settled, diagnostic);
         } else {
@@ -3771,8 +4384,9 @@ fn build_desktop_tray(app: &AppHandle) -> tauri::Result<()> {
     let dashboard = MenuItem::with_id(app, "dashboard", "Open Dashboard", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+    let diagnostics = MenuItem::with_id(app, "diagnostics", "Diagnostics…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&dashboard, &refresh, &settings, &quit])?;
+    let menu = Menu::with_items(app, &[&dashboard, &refresh, &settings, &diagnostics, &quit])?;
     let snapshot = app.state::<DesktopStore>().snapshot().ok();
     let level = snapshot
         .as_ref()
@@ -3791,6 +4405,9 @@ fn build_desktop_tray(app: &AppHandle) -> tauri::Result<()> {
             "refresh" => request_scheduled_collection(app, "manual"),
             "settings" => {
                 let _ = show_desktop_window(app, Some("settings"));
+            }
+            "diagnostics" => {
+                let _ = show_desktop_window(app, Some("diagnostics"));
             }
             "quit" => app.exit(0),
             _ => {}
@@ -4107,11 +4724,13 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(DesktopEngine::default())
         .manage(DesktopStore::default())
         .manage(DesktopUiState::default())
         .manage(CollectionScheduler::default())
         .manage(CapacityNotificationState::default())
+        .manage(DiagnosticJournal::default())
         .manage(StartupRouting {
             login_launch,
             decision_complete: AtomicBool::new(false),
@@ -4130,6 +4749,8 @@ pub fn run() {
             desktop_open_device_url,
             desktop_snapshot,
             desktop_retry_engine,
+            desktop_diagnostics,
+            desktop_export_diagnostics,
             desktop_set_theme,
             desktop_update_settings,
             desktop_routing_preview,
@@ -4140,6 +4761,7 @@ pub fn run() {
             desktop_set_launch_at_login,
             desktop_show_dashboard,
             desktop_show_settings,
+            desktop_show_diagnostics,
             desktop_hide_dashboard,
             desktop_quit
         ])
@@ -4159,6 +4781,12 @@ pub fn run() {
             // runs on the blocking pool and later replaces this projection;
             // startup lifecycle work never stalls the main UI thread.
             let handshake = desktop_startup_handshake();
+            if let Ok(path) = diagnostic_state_path(app.handle()) {
+                if let Ok(mut events) = app.state::<DiagnosticJournal>().events.lock() {
+                    *events = load_diagnostic_events_path(&path, epoch_seconds());
+                }
+            }
+            record_diagnostic_event(app.handle(), "app_started");
             if let Ok(mut ledger) = app.state::<CapacityNotificationState>().windows.lock() {
                 *ledger = load_notification_ledger(app.handle());
             }
@@ -4257,6 +4885,170 @@ mod tests {
 
     fn url(raw: &str) -> Url {
         Url::parse(raw).expect("test URL parses")
+    }
+
+    fn engine_health_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "schema": ENGINE_HEALTH_SCHEMA,
+            "generated_at": 1_800_000_000,
+            "engine_version": "0.4.0",
+            "private_backup": false,
+            "components": ENGINE_COMPONENT_IDS.iter().map(|id| {
+                diagnostic_component(id, "ok", &format!("{id}_ready"), "none")
+            }).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn engine_health_validation_reconstructs_only_the_bounded_contract() {
+        let fixture = engine_health_fixture();
+        let validated = validate_engine_health(&fixture).expect("health is valid");
+        assert_eq!(validated, fixture);
+        let mut unknown = fixture.clone();
+        unknown["raw_error"] = serde_json::json!("Bearer private");
+        assert!(validate_engine_health(&unknown).is_err());
+        let mut secret = fixture.clone();
+        secret["components"][0]["code"] = serde_json::json!("owner@example.com");
+        assert!(validate_engine_health(&secret).is_err());
+        let mut duplicate = fixture;
+        duplicate["components"][0]["id"] = serde_json::json!("bridge");
+        assert!(validate_engine_health(&duplicate).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_journal_rotates_and_never_follows_a_symlink() {
+        let directory = std::env::temp_dir().join(format!(
+            "headroom-diagnostics-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("test directory exists");
+        let path = directory.join("events.json");
+        let now = 1_800_000_000;
+        let mut events = VecDeque::from([DiagnosticEvent {
+            timestamp: now - DIAGNOSTIC_EVENT_MAX_AGE - 1,
+            code: "app_started".into(),
+        }]);
+        for offset in 0..300 {
+            events.push_back(DiagnosticEvent {
+                timestamp: now - 300 + offset,
+                code: "collection_current".into(),
+            });
+        }
+        write_diagnostic_events_path(&path, &mut events, now).expect("bounded journal writes");
+        assert_eq!(events.len(), DIAGNOSTIC_EVENT_MAX);
+        assert_eq!(
+            load_diagnostic_events_path(&path, now).len(),
+            DIAGNOSTIC_EVENT_MAX
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("journal metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let target = directory.join("outside.json");
+        fs::write(&target, b"outside").expect("outside fixture writes");
+        let link = directory.join("linked-events.json");
+        std::os::unix::fs::symlink(&target, &link).expect("fixture symlink creates");
+        assert!(load_diagnostic_events_path(&link, now).is_empty());
+        assert!(write_diagnostic_events_path(&link, &mut events, now).is_err());
+        assert_eq!(
+            fs::read(&target).expect("outside fixture reads"),
+            b"outside"
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn support_bundle_scanner_rejects_secret_identity_path_and_conversation_fixtures() {
+        let safe = serde_json::json!({
+            "schema": SUPPORT_BUNDLE_SCHEMA,
+            "generated_at": 1_800_000_000u64,
+            "app_version": "0.1.0",
+            "health": engine_health_fixture(),
+            "events": [{"timestamp": 1_800_000_000u64, "code": "app_started"}],
+        });
+        assert!(support_value_is_safe(&safe));
+        for fixture in [
+            "Bearer secret",
+            "owner@example.com",
+            "sk-private",
+            "/Users/private/.config",
+            "raw conversation transcript",
+            "access_token=private",
+        ] {
+            let mut unsafe_value = safe.clone();
+            unsafe_value["events"][0]["code"] = serde_json::json!(fixture);
+            assert!(!support_value_is_safe(&unsafe_value), "accepted {fixture}");
+        }
+        let mut unsafe_key = safe;
+        unsafe_key["credential_content"] = serde_json::json!("hidden");
+        assert!(!support_value_is_safe(&unsafe_key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn support_bundle_writer_is_private_atomic_and_refuses_symlinks() {
+        let directory = std::env::temp_dir().join(format!(
+            "headroom-support-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("test directory exists");
+        let value = serde_json::json!({
+            "schema": SUPPORT_BUNDLE_SCHEMA,
+            "generated_at": 1_800_000_000u64,
+            "app_version": "0.1.0",
+            "health": engine_health_fixture(),
+            "events": [{"timestamp": 1_800_000_000u64, "code": "app_started"}],
+        });
+        let report = directory.join("Headroom-Support.json");
+        write_support_bundle_path(&report, &value).expect("support report writes");
+        let encoded = fs::read(&report).expect("support report reads");
+        assert!(encoded.len() <= SUPPORT_BUNDLE_MAX_BYTES);
+        assert!(support_value_is_safe(
+            &serde_json::from_slice(&encoded).expect("support report parses")
+        ));
+        assert_eq!(
+            fs::metadata(&report)
+                .expect("support report metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        for private in [
+            b"Bearer secret".as_slice(),
+            b"owner@example.com".as_slice(),
+            b"/Users/private".as_slice(),
+            b"conversation transcript".as_slice(),
+        ] {
+            assert!(!encoded
+                .windows(private.len())
+                .any(|window| window == private));
+        }
+
+        let outside = directory.join("outside.json");
+        fs::write(&outside, b"outside").expect("outside fixture writes");
+        let link = directory.join("linked-report.json");
+        std::os::unix::fs::symlink(&outside, &link).expect("fixture symlink creates");
+        assert!(write_support_bundle_path(&link, &value).is_err());
+        assert_eq!(
+            fs::read(&outside).expect("outside fixture reads"),
+            b"outside"
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[cfg(unix)]
@@ -4450,6 +5242,7 @@ mod tests {
             "routing_launch",
             "provider_reauthentication_launch",
             "handoff_health",
+            "redacted_diagnostics",
         ];
         let compatible = serde_json::json!({
             "product": "headroom",

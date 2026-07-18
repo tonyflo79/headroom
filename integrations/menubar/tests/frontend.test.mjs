@@ -8,7 +8,8 @@ import {
   formatWeeklyReset, loginMessage,
   compactAccountWindows, externalReauthenticationConfirmation,
   externalReauthenticationPresentation,
-  normalizeActivity, normalizeBootstrap, normalizeDeviceInstructions, normalizeHandoffHealth,
+  normalizeActivity, normalizeBootstrap, normalizeDeviceInstructions, normalizeDiagnostics,
+  normalizeHandoffHealth,
   normalizeRoutingPreview,
   onboardingPresentation, percentLeft,
   refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
@@ -47,6 +48,49 @@ test("normalizes a compatible sanitized bootstrap", () => {
   const value = normalizeBootstrap(bootstrap);
   assert.equal(value.view.accounts[0].name, "personal");
   assert.equal(value.view.accounts[0].provider, "claude");
+});
+
+test("normalizes only the exact redacted diagnostics contract", () => {
+  const ids = [
+    "app", "sidecar", "update", "engine", "bridge", "registry", "snapshot",
+    "activity", "provider_claude", "provider_codex",
+  ];
+  const raw = {
+    schema: "headroom_desktop_diagnostics@1",
+    generated_at: 1_800_000_000,
+    app_version: "0.1.0",
+    engine_version: "0.4.0",
+    private_backup: false,
+    components: ids.map((id) => ({
+      id, state: "ok", code: `${id}_ready`, remediation: "none",
+    })),
+    inventory: [
+      { name: "health.json", kind: "redacted_health", records: 10 },
+      { name: "events.json", kind: "code_only_events", records: 4 },
+    ],
+  };
+  const value = normalizeDiagnostics(raw);
+  assert.equal(value.components.length, 10);
+  assert.equal(value.inventory[1].records, 4);
+  assert.throws(() => normalizeDiagnostics({ ...raw, home: "/Users/private" }),
+    /desktop diagnostics/);
+  assert.throws(() => normalizeDiagnostics({
+    ...raw, components: raw.components.map((row, index) => index === 0
+      ? { ...row, raw_error: "Bearer private" } : row),
+  }), /diagnostic component/);
+  assert.throws(() => normalizeDiagnostics({
+    ...raw, inventory: [raw.inventory[0], { ...raw.inventory[1], records: 129 }],
+  }), /inventory/);
+});
+
+test("diagnostics surface previews inventory before native export", () => {
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  const script = readFileSync(new URL("../dist/main.js", import.meta.url), "utf8");
+  assert.match(html, /id="diagnostics-inventory-copy"/);
+  assert.match(html, /Private recovery backups are never included/);
+  assert.match(script, /desktop_export_diagnostics/);
+  assert.match(script, /normalizeDiagnostics/);
+  assert.doesNotMatch(html, /raw logs|credential content/i);
 });
 
 test("normalizes bounded activity and renders coverage honestly", () => {
