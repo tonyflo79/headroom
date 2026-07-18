@@ -18,6 +18,7 @@ usage:
                                     before the CLI ever started (opt-in)
   headroom codex [args...]          launch Codex on the best account
   headroom caps                     print scripting capability flags as JSON
+  headroom compatibility            print redacted engine/state compatibility
   headroom run <model> -- <cmd...>  headless run with auto-rotation on limit-hit
   headroom rotate [model]           cool the current account down, pick the next
   headroom handoff [--session UUID] [--to SLOT] [--model FAMILY]
@@ -299,6 +300,15 @@ def _dispatch(argv):
         import json
 
         print(json.dumps(capability_contract(), sort_keys=True))
+        return 0
+    if command == "compatibility":
+        if args:
+            print("usage: headroom compatibility", file=sys.stderr)
+            return 2
+        import json
+
+        from . import compatibility
+        print(json.dumps(compatibility.contract(), sort_keys=True))
         return 0
     if command == "setup":
         from . import wizard
