@@ -215,6 +215,60 @@ class ActivityMetrics(unittest.TestCase):
         self.assertNotIn("session-a", encoded)
         self.assertEqual(os.stat(activity._state_path()).st_mode & 0o777, 0o600)
 
+    def test_account_rename_rebuilds_historical_attribution(self):
+        home = os.path.join(self.temp.name, "codex")
+        transcript = os.path.join(home, "sessions", "one.jsonl")
+        self._write(
+            transcript, session_meta(),
+            codex_event("2026-07-16T17:00:00Z", 100),
+        )
+        original = {"accounts": [{
+            "name": "codex-old", "provider": "codex", "home": home,
+        }]}
+        renamed = {"accounts": [{
+            "name": "codex-new", "provider": "codex", "home": home,
+        }]}
+        self._index(original)
+
+        value = self._index(renamed)
+
+        self.assertEqual(value["accounts"][0]["tokens"]["today"], {
+            "value": 100, "coverage": "exact"})
+        connection = activity._read_database()
+        try:
+            scopes = connection.execute(
+                "select distinct scope from events").fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(scopes, [("codex-new",)])
+
+    def test_removed_account_history_is_not_left_in_configured_totals(self):
+        first_home = os.path.join(self.temp.name, "codex-one")
+        second_home = os.path.join(self.temp.name, "codex-two")
+        self._write(
+            os.path.join(first_home, "sessions", "one.jsonl"),
+            session_meta("session-one"),
+            codex_event("2026-07-16T17:00:00Z", 100),
+        )
+        self._write(
+            os.path.join(second_home, "sessions", "two.jsonl"),
+            session_meta("session-two"),
+            codex_event("2026-07-16T18:00:00Z", 200),
+        )
+        both = {"accounts": [
+            {"name": "codex1", "provider": "codex", "home": first_home},
+            {"name": "codex2", "provider": "codex", "home": second_home},
+        ]}
+        remaining = {"accounts": [
+            {"name": "codex1", "provider": "codex", "home": first_home},
+        ]}
+        self._index(both)
+
+        value = self._index(remaining)
+
+        self.assertEqual(value["totals"]["tokens"]["today"], {
+            "value": 100, "coverage": "exact"})
+
     def test_unindexed_projection_fails_closed(self):
         config = {"accounts": [{
             "name": "missing", "provider": "codex",

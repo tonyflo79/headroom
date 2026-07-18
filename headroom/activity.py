@@ -396,11 +396,21 @@ def _index_sync(config, *, now=None, timezone_name=None,
     now = time.time() if now is None else float(now)
     timezone_name = timezone_name or _timezone_name()
     timezone = ZoneInfo(timezone_name)
+    configuration = _configuration_signature(config)
     connection = _database(filename)
     failures = 0
     try:
         prior_timezone = _meta(connection, "timezone")
-        if prior_timezone not in (None, timezone_name):
+        prior_configuration = _meta(connection, "configuration")
+        rebuild = prior_timezone not in (None, timezone_name) \
+            or prior_configuration not in (None, configuration)
+        if rebuild:
+            # Event rows intentionally retain no raw source path. Rebuild the
+            # private index when slot names/homes/providers change so removed
+            # scopes cannot remain in totals and renamed homes are attributed
+            # to their current slot. Keep the rebuild in one transaction so a
+            # desktop reader sees either the complete old or complete new
+            # attribution, never an in-progress mixture.
             connection.execute("delete from events")
             connection.execute("delete from sources")
         _set_meta(connection, "schema", STATE_SCHEMA)
@@ -413,10 +423,10 @@ def _index_sync(config, *, now=None, timezone_name=None,
                         connection, provider, scope, candidate, timezone, now):
                     failures += 1
                 count += 1
-                if count % 100 == 0:
+                if count % 100 == 0 and not rebuild:
                     connection.commit()
         _set_meta(connection, "indexed_at", int(now))
-        _set_meta(connection, "configuration", _configuration_signature(config))
+        _set_meta(connection, "configuration", configuration)
         _set_meta(connection, "failures", failures)
         connection.commit()
     finally:
