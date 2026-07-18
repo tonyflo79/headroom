@@ -56,6 +56,8 @@ jobs:
         run: scripts/build-desktop-sidecar.sh
       - name: Test the private bridge
         run: uv run --python 3.13.12 python -m unittest tests.test_desktop_bridge
+      - name: Install pinned accessibility test dependencies
+        run: npm ci --prefix integrations/menubar --ignore-scripts
       - name: Test the frontend state boundary
         run: npm --prefix integrations/menubar test
       - name: Check Rust formatting

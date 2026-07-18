@@ -13,8 +13,10 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = ROOT / "VERSION"
 CARGO_FILE = ROOT / "integrations/menubar/src-tauri/Cargo.toml"
+CARGO_LOCK_FILE = ROOT / "integrations/menubar/src-tauri/Cargo.lock"
 TAURI_FILE = ROOT / "integrations/menubar/src-tauri/tauri.conf.json"
 PACKAGE_FILE = ROOT / "integrations/menubar/package.json"
+PACKAGE_LOCK_FILE = ROOT / "integrations/menubar/package-lock.json"
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
 
 
@@ -32,14 +34,25 @@ def projected_files(version):
         rf'\g<1>"{version}"', cargo, count=1)
     if count != 1:
         raise ValueError("desktop Cargo package version is not recognizable")
+    cargo_lock = CARGO_LOCK_FILE.read_text(encoding="utf-8")
+    cargo_lock, lock_count = re.subn(
+        r'(?m)^(\[\[package\]\]\nname = "headroom-menubar"\nversion = )"[^"]+"',
+        rf'\g<1>"{version}"', cargo_lock, count=1)
+    if lock_count != 1:
+        raise ValueError("desktop Cargo lock package version is not recognizable")
     tauri = json.loads(TAURI_FILE.read_text(encoding="utf-8"))
     tauri["version"] = version
     package = json.loads(PACKAGE_FILE.read_text(encoding="utf-8"))
     package["version"] = version
+    package_lock = json.loads(PACKAGE_LOCK_FILE.read_text(encoding="utf-8"))
+    package_lock["version"] = version
+    package_lock["packages"][""]["version"] = version
     return {
         CARGO_FILE: cargo,
+        CARGO_LOCK_FILE: cargo_lock,
         TAURI_FILE: json.dumps(tauri, indent=2) + "\n",
         PACKAGE_FILE: json.dumps(package, indent=2) + "\n",
+        PACKAGE_LOCK_FILE: json.dumps(package_lock, indent=2) + "\n",
     }
 
 
