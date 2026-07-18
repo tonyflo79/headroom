@@ -91,6 +91,7 @@ const DESKTOP_WINDOW_LABEL: &str = "main";
 const DESKTOP_POPOVER_LABEL: &str = "desktop-popover";
 const DESKTOP_BRIDGE_SCHEMA: &str = "headroom_desktop_bridge@1";
 const DESKTOP_VIEW_SCHEMA: &str = "headroom_desktop_view@1";
+const COMPATIBILITY_SCHEMA: &str = "headroom_compatibility@1";
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_BRIDGE_FRAME_BYTES: usize = 1024 * 1024;
@@ -1927,6 +1928,276 @@ fn configured_theme(view: &serde_json::Value) -> &'static str {
         .unwrap_or("terminal")
 }
 
+fn exact_object(value: &serde_json::Value, fields: &[&str]) -> bool {
+    object_has_only(value, fields)
+        && value
+            .as_object()
+            .is_some_and(|object| object.len() == fields.len())
+}
+
+fn schema_range_is_one(value: &serde_json::Value) -> bool {
+    exact_object(value, &["minimum", "maximum"])
+        && value.get("minimum").and_then(serde_json::Value::as_u64) == Some(1)
+        && value.get("maximum").and_then(serde_json::Value::as_u64) == Some(1)
+}
+
+fn validate_compatibility_contract(
+    value: &serde_json::Value,
+    handshake: &serde_json::Value,
+) -> Result<(), String> {
+    if !exact_object(
+        value,
+        &[
+            "schema",
+            "product",
+            "engine",
+            "bridge",
+            "state",
+            "platform",
+            "architecture",
+            "capabilities",
+        ],
+    ) || value.get("schema").and_then(serde_json::Value::as_str) != Some(COMPATIBILITY_SCHEMA)
+    {
+        return Err("bundled desktop engine compatibility contract is invalid".into());
+    }
+    let product = value
+        .get("product")
+        .filter(|product| exact_object(product, &["name", "version"]))
+        .ok_or_else(|| "bundled desktop product compatibility is invalid".to_string())?;
+    let product_version = product
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .filter(|version| !version.is_empty() && version.len() <= 64)
+        .ok_or_else(|| "bundled desktop product version is invalid".to_string())?;
+    if product.get("name").and_then(serde_json::Value::as_str) != Some("headroom")
+        || handshake
+            .get("product_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(product_version)
+    {
+        return Err("bundled desktop product version is incompatible".into());
+    }
+    let engine = value
+        .get("engine")
+        .filter(|engine| exact_object(engine, &["version", "compatible_versions"]))
+        .ok_or_else(|| "bundled desktop engine compatibility is invalid".to_string())?;
+    let engine_range = engine
+        .get("compatible_versions")
+        .filter(|range| exact_object(range, &["minimum", "maximum_exclusive"]))
+        .ok_or_else(|| "bundled desktop engine range is invalid".to_string())?;
+    if engine.get("version").and_then(serde_json::Value::as_str) != Some(product_version)
+        || !["minimum", "maximum_exclusive"].iter().all(|field| {
+            engine_range
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|version| !version.is_empty() && version.len() <= 64)
+        })
+    {
+        return Err("bundled desktop engine range is incompatible".into());
+    }
+    let bridge = value
+        .get("bridge")
+        .filter(|bridge| {
+            exact_object(
+                bridge,
+                &["identifier", "current_schema", "compatible_schemas"],
+            )
+        })
+        .ok_or_else(|| "bundled desktop bridge compatibility is invalid".to_string())?;
+    if bridge.get("identifier").and_then(serde_json::Value::as_str) != Some(DESKTOP_BRIDGE_SCHEMA)
+        || bridge
+            .get("current_schema")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || !bridge
+            .get("compatible_schemas")
+            .is_some_and(schema_range_is_one)
+    {
+        return Err("bundled desktop bridge range is incompatible".into());
+    }
+    let state = value
+        .get("state")
+        .filter(|state| {
+            exact_object(
+                state,
+                &[
+                    "observed_schema",
+                    "status",
+                    "code",
+                    "remediation",
+                    "migration",
+                    "current_schema",
+                    "compatible_schemas",
+                ],
+            )
+        })
+        .ok_or_else(|| "bundled desktop state compatibility is invalid".to_string())?;
+    let state_status = state
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .filter(|status| {
+            [
+                "missing",
+                "compatible",
+                "migration_required",
+                "incompatible_older",
+                "incompatible_newer",
+                "invalid",
+                "unreadable",
+            ]
+            .contains(status)
+        })
+        .ok_or_else(|| "bundled desktop state status is invalid".to_string())?;
+    let migration = state
+        .get("migration")
+        .filter(|migration| {
+            exact_object(
+                migration,
+                &["required", "supported", "from_schema", "to_schema"],
+            )
+        })
+        .ok_or_else(|| "bundled desktop migration preview is invalid".to_string())?;
+    let observed_valid = state
+        .get("observed_schema")
+        .is_some_and(|schema| schema.is_null() || schema.as_u64().is_some());
+    let from_valid = migration
+        .get("from_schema")
+        .is_some_and(|schema| schema.is_null() || schema.as_u64().is_some());
+    if state
+        .get("current_schema")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || !state
+            .get("compatible_schemas")
+            .is_some_and(schema_range_is_one)
+        || !observed_valid
+        || !from_valid
+        || migration
+            .get("required")
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        || migration
+            .get("supported")
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        || migration
+            .get("to_schema")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || !["code", "remediation"].iter().all(|field| {
+            state
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|token| stable_handoff_token(token, 64))
+        })
+        || (state_status == "compatible"
+            && state
+                .get("observed_schema")
+                .and_then(serde_json::Value::as_u64)
+                != Some(1))
+    {
+        return Err("bundled desktop state range is incompatible".into());
+    }
+    let observed = state
+        .get("observed_schema")
+        .and_then(serde_json::Value::as_u64);
+    let from = migration
+        .get("from_schema")
+        .and_then(serde_json::Value::as_u64);
+    let required = migration
+        .get("required")
+        .and_then(serde_json::Value::as_bool)
+        .expect("migration required was validated");
+    let supported = migration
+        .get("supported")
+        .and_then(serde_json::Value::as_bool)
+        .expect("migration supported was validated");
+    let code = state
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .expect("state code was validated");
+    let remediation = state
+        .get("remediation")
+        .and_then(serde_json::Value::as_str)
+        .expect("state remediation was validated");
+    let state_consistent = match state_status {
+        "compatible" => {
+            observed == Some(1)
+                && from == Some(1)
+                && !required
+                && supported
+                && code == "state_schema_current"
+                && remediation == "none"
+        }
+        "missing" => {
+            observed.is_none()
+                && from.is_none()
+                && !required
+                && supported
+                && code == "state_not_configured"
+                && remediation == "run_setup"
+        }
+        "incompatible_newer" => {
+            observed.is_some_and(|schema| schema > 1)
+                && from == observed
+                && !required
+                && !supported
+                && code == "state_schema_too_new"
+                && remediation == "upgrade_headroom"
+        }
+        "incompatible_older" => {
+            observed.is_some_and(|schema| schema < 1)
+                && from == observed
+                && required
+                && !supported
+                && code == "state_schema_too_old"
+                && remediation == "upgrade_through_supported_release"
+        }
+        "migration_required" => {
+            observed.is_some_and(|schema| schema < 1)
+                && from == observed
+                && required
+                && supported
+                && code == "state_migration_available"
+                && remediation == "migrate_state"
+        }
+        "invalid" => {
+            observed == Some(1)
+                && from == Some(1)
+                && !required
+                && !supported
+                && code == "state_validation_failed"
+                && remediation == "inspect_diagnostics"
+        }
+        "unreadable" => {
+            observed.is_none()
+                && from.is_none()
+                && !required
+                && !supported
+                && [
+                    "state_unreadable",
+                    "state_oversized",
+                    "state_invalid",
+                    "state_schema_missing",
+                ]
+                .contains(&code)
+                && remediation == "inspect_diagnostics"
+        }
+        _ => false,
+    };
+    if !state_consistent {
+        return Err("bundled desktop state compatibility is contradictory".into());
+    }
+    if value.get("platform") != handshake.get("platform")
+        || value.get("architecture") != handshake.get("architecture")
+        || value.get("capabilities") != handshake.get("capabilities")
+    {
+        return Err("bundled desktop compatibility identity is inconsistent".into());
+    }
+    Ok(())
+}
+
 fn validate_desktop_bootstrap(
     handshake: &serde_json::Value,
     view: &serde_json::Value,
@@ -1959,6 +2230,7 @@ fn validate_desktop_bootstrap(
                 "provider_reauthentication_launch",
                 "handoff_health",
                 "redacted_diagnostics",
+                "schema_compatibility",
             ]
             .iter()
             .all(|name| values.iter().any(|value| value == name))
@@ -1966,6 +2238,12 @@ fn validate_desktop_bootstrap(
     if !supports_desktop {
         return Err("bundled desktop engine lacks the required capability".into());
     }
+    validate_compatibility_contract(
+        handshake
+            .get("compatibility")
+            .ok_or_else(|| "bundled desktop engine omitted compatibility".to_string())?,
+        handshake,
+    )?;
     validate_desktop_view(view)
 }
 
@@ -5243,12 +5521,46 @@ mod tests {
             "provider_reauthentication_launch",
             "handoff_health",
             "redacted_diagnostics",
+            "schema_compatibility",
         ];
         let compatible = serde_json::json!({
             "product": "headroom",
+            "product_version": "0.4.0",
             "bridge_schema": DESKTOP_BRIDGE_SCHEMA,
+            "platform": "darwin",
+            "architecture": "aarch64",
             "runtime": "frozen",
             "capabilities": capabilities,
+            "compatibility": {
+                "schema": COMPATIBILITY_SCHEMA,
+                "product": {"name": "headroom", "version": "0.4.0"},
+                "engine": {
+                    "version": "0.4.0",
+                    "compatible_versions": {
+                        "minimum": "0.4.0", "maximum_exclusive": "0.5.0"
+                    }
+                },
+                "bridge": {
+                    "identifier": DESKTOP_BRIDGE_SCHEMA,
+                    "current_schema": 1,
+                    "compatible_schemas": {"minimum": 1, "maximum": 1}
+                },
+                "state": {
+                    "observed_schema": 1,
+                    "status": "compatible",
+                    "code": "state_schema_current",
+                    "remediation": "none",
+                    "migration": {
+                        "required": false, "supported": true,
+                        "from_schema": 1, "to_schema": 1
+                    },
+                    "current_schema": 1,
+                    "compatible_schemas": {"minimum": 1, "maximum": 1}
+                },
+                "platform": "darwin",
+                "architecture": "aarch64",
+                "capabilities": capabilities,
+            },
         });
         assert!(validate_desktop_bootstrap(&compatible, &view).is_ok());
         let incompatible = serde_json::json!({
@@ -5258,6 +5570,20 @@ mod tests {
             "capabilities": capabilities[..9],
         });
         assert!(validate_desktop_bootstrap(&incompatible, &view).is_err());
+        let mut unknown = compatible.clone();
+        unknown["compatibility"]["state"]["home"] = serde_json::json!("/private");
+        assert!(validate_desktop_bootstrap(&unknown, &view).is_err());
+        let mut contradictory = compatible.clone();
+        contradictory["compatibility"]["state"]["migration"]["required"] = serde_json::json!(true);
+        assert!(validate_desktop_bootstrap(&contradictory, &view).is_err());
+        let mut newer = compatible;
+        newer["compatibility"]["state"]["observed_schema"] = serde_json::json!(2);
+        newer["compatibility"]["state"]["status"] = serde_json::json!("incompatible_newer");
+        newer["compatibility"]["state"]["code"] = serde_json::json!("state_schema_too_new");
+        newer["compatibility"]["state"]["remediation"] = serde_json::json!("upgrade_headroom");
+        newer["compatibility"]["state"]["migration"]["supported"] = serde_json::json!(false);
+        newer["compatibility"]["state"]["migration"]["from_schema"] = serde_json::json!(2);
+        assert!(validate_desktop_bootstrap(&newer, &view).is_ok());
     }
 
     #[test]
