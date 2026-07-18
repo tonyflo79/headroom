@@ -15,6 +15,7 @@ VERSION_FILE = ROOT / "VERSION"
 CARGO_FILE = ROOT / "integrations/menubar/src-tauri/Cargo.toml"
 TAURI_FILE = ROOT / "integrations/menubar/src-tauri/tauri.conf.json"
 PACKAGE_FILE = ROOT / "integrations/menubar/package.json"
+PACKAGE_LOCK_FILE = ROOT / "integrations/menubar/package-lock.json"
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
 
 
@@ -36,10 +37,14 @@ def projected_files(version):
     tauri["version"] = version
     package = json.loads(PACKAGE_FILE.read_text(encoding="utf-8"))
     package["version"] = version
+    package_lock = json.loads(PACKAGE_LOCK_FILE.read_text(encoding="utf-8"))
+    package_lock["version"] = version
+    package_lock["packages"][""]["version"] = version
     return {
         CARGO_FILE: cargo,
         TAURI_FILE: json.dumps(tauri, indent=2) + "\n",
         PACKAGE_FILE: json.dumps(package, indent=2) + "\n",
+        PACKAGE_LOCK_FILE: json.dumps(package_lock, indent=2) + "\n",
     }
 
 

@@ -495,6 +495,13 @@ test("validates and projects the complete settings contract", () => {
 
 test("uses locale formatters for percentages and exposes the settings console", () => {
   assert.match(formatPercent(72), /72/);
+  assert.notEqual(formatPercent(72, "en-US"), formatPercent(72, "de-DE"));
+  assert.notEqual(
+    formatWeeklyReset(1_800_500_000, "en-US"),
+    formatWeeklyReset(1_800_500_000, "de-DE"),
+  );
+  assert.notEqual(formatActivityValue(12_500, "en-US"),
+    formatActivityValue(12_500, "de-DE"));
   const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
   for (const id of ["settings-theme", "settings-refresh", "settings-terminal",
     "settings-launch-at-login", "settings-notifications", "settings-save"]) {
