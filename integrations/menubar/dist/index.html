@@ -16,13 +16,26 @@
           <p id="summary" class="summary" aria-live="polite">Starting the bundled engine…</p>
         </div>
         <div class="toolbar">
-          <button id="refresh" type="button" disabled>Refresh</button>
+          <button id="refresh" type="button" aria-keyshortcuts="Meta+R" disabled>Refresh</button>
           <div id="surface-actions" class="surface-actions"></div>
           <span id="engine-badge" class="badge">connecting</span>
         </div>
       </header>
 
       <p id="surface-status" class="surface-status" role="status" aria-live="polite"></p>
+
+      <section id="update-panel" class="update-panel" aria-labelledby="update-title" aria-live="polite" aria-atomic="true" hidden>
+        <div>
+          <p class="eyebrow">HEADROOM // SIGNED UPDATE</p>
+          <strong id="update-title">Update available</strong>
+          <p id="update-notes"></p>
+        </div>
+        <div class="update-actions">
+          <button id="update-install" class="primary" type="button">Install update</button>
+          <button id="update-restart" class="primary" type="button" hidden>Restart Headroom</button>
+          <button id="update-later" type="button">Later</button>
+        </div>
+      </section>
 
       <section id="settings" class="settings-panel" aria-labelledby="settings-title" hidden>
         <div class="settings-heading">
@@ -145,8 +158,8 @@
           </div>
           <button id="close-diagnostics" type="button" aria-label="Close Diagnostics">Close</button>
         </div>
-        <p id="diagnostics-status" class="diagnostics-status" role="status" aria-live="polite">Loading bounded health…</p>
-        <div id="diagnostics-components" class="diagnostics-components" aria-live="polite"></div>
+        <p id="diagnostics-status" class="diagnostics-status" role="status" aria-live="polite" aria-atomic="true">Loading bounded health…</p>
+        <div id="diagnostics-components" class="diagnostics-components" role="region" aria-label="Component health" aria-live="polite"></div>
         <div class="diagnostics-inventory">
           <div>
             <span>[SUPPORT REPORT INVENTORY]</span>
@@ -180,6 +193,7 @@
               <option value="codex">Codex</option>
             </select>
             <button id="routing-preview" type="button">Preview route</button>
+            <button id="close-routing" type="button" aria-label="Close Routing">Close</button>
           </div>
         </div>
         <p id="routing-diagnostic" class="routing-diagnostic" role="status" aria-live="polite">Choose a model family to prove its current route.</p>
@@ -204,10 +218,10 @@
           <h2 id="fleet-title">$ headroom status</h2>
           <p id="headline">Waiting for a sanitized snapshot</p>
         </div>
-        <div id="accounts" class="accounts" aria-live="polite"></div>
+        <div id="accounts" class="accounts" role="region" aria-label="Account capacity" aria-live="polite"></div>
         <details id="add-account" class="add-account" hidden>
           <summary>+ add account</summary>
-          <div id="actions" class="actions" aria-live="polite"></div>
+          <div id="actions" class="actions" role="region" aria-label="Account setup actions" aria-live="polite"></div>
         </details>
       </section>
 
@@ -258,6 +272,7 @@
           <section class="burn-view burn-view-wide burn-table-wrap">
             <h3>LAST 30 LOCAL DAYS · EXACT SOURCES</h3>
             <table class="burn-table">
+              <caption class="sr-only">Exact token activity by local calendar day</caption>
               <thead><tr><th>DATE</th><th>TOTAL</th><th>7D AVG</th><th>CODEX</th><th>CLAUDE</th><th>CLAUDE CALLS</th><th>DRIVER</th></tr></thead>
               <tbody id="burn-table-body"></tbody>
             </table>
@@ -265,7 +280,11 @@
         </div>
       </details>
 
-      <footer><span id="revision">revision 0</span> · [bundled engine] [private bridge] [no localhost server]</footer>
+      <footer>
+        <span id="revision">revision 0</span> · [bundled engine] [private bridge] [no localhost server]
+        · <button id="check-update" class="footer-action" type="button">check update</button>
+        <span id="update-status" role="status" aria-live="polite" aria-atomic="true">not checked</span>
+      </footer>
     </main>
     <script type="module" src="main.js"></script>
   </body>

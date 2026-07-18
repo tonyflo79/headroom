@@ -32,7 +32,7 @@ BRIDGE_CAPABILITIES = (
     "account_lifecycle", "reauthentication", "resilient_collection",
     "validated_settings", "routing_launch",
     "provider_reauthentication_launch", "handoff_health",
-    "schema_compatibility", "shutdown",
+    "redacted_diagnostics", "schema_compatibility", "shutdown",
 )
 
 # A future state release adds one transformer keyed by its source schema.

@@ -20,8 +20,6 @@ import time
 
 from . import (
     __version__, account_lifecycle, activity, capabilities, compatibility,
-    collect as collector, connect, notify, paths, registry, route, widget,
-    __version__, account_lifecycle, activity, capabilities,
     collect as collector, connect, diagnostics, notify, paths, registry, route,
     widget,
 )
@@ -1309,13 +1307,6 @@ def _handle(command, args):
             "architecture": platform.machine(),
             "capabilities": advertised_capabilities,
             "compatibility": compatibility.contract(advertised_capabilities),
-            "capabilities": [
-                "fixture_snapshot", "discover", "adopt", "refresh",
-                "claude_login", "codex_device_login", "onboarding",
-                "account_lifecycle", "reauthentication",
-                "resilient_collection", "validated_settings",
-                "routing_launch", "provider_reauthentication_launch",
-                "handoff_health", "redacted_diagnostics", "shutdown"],
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False

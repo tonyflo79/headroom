@@ -32,6 +32,16 @@ const ACTIVITY_DRIVERS = new Set([
   "support", "writing", "unlabeled",
 ]);
 const MAX_ACTIVITY_VALUE = 1_000_000_000_000_000;
+const UPDATE_SCHEMA = "headroom_desktop_update@1";
+const UPDATE_PHASES = new Set([
+  "not_checked", "checking", "current", "available", "downloading",
+  "ready_to_restart", "failed",
+]);
+const UPDATE_CODES = new Set([
+  "update_not_checked", "update_checking", "update_current", "update_available",
+  "update_downloading", "update_installed", "update_metadata_invalid",
+  "update_check_failed", "update_changed", "update_verification_or_install_failed",
+]);
 const HANDOFF_STATES = new Set([
   "configured", "unavailable", "downgraded", "armed",
   "supervision_lost", "loop_guard", "disabled",
@@ -68,6 +78,142 @@ let activeInvoke = null;
 let activeRevision = 0;
 let activeRoutingPreview = null;
 let activityPollTimer = null;
+let activeUpdate = null;
+let updateInitialized = false;
+
+export function prefersReducedMotion(matchMedia = globalThis.matchMedia) {
+  return typeof matchMedia === "function" &&
+    matchMedia("(prefers-reduced-motion: reduce)").matches === true;
+}
+
+function boundedDisplayString(value, maximum, { nullable = false } = {}) {
+  if (nullable && value === null) return null;
+  if (typeof value !== "string" || value.length < 1 || value.length > maximum ||
+      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+    throw new Error("invalid bounded display string");
+  }
+  return value;
+}
+
+export function normalizeUpdate(raw) {
+  const expected = [
+    "schema", "channel", "current_version", "phase", "available_version", "notes", "code",
+  ];
+  const keys = Object.keys(raw || {});
+  if (keys.length !== expected.length || expected.some((key) => !keys.includes(key)) ||
+      raw.schema !== UPDATE_SCHEMA || !new Set(["stable", "prerelease"]).has(raw.channel) ||
+      !UPDATE_PHASES.has(raw.phase) || !UPDATE_CODES.has(raw.code)) {
+    throw new Error("invalid desktop update contract");
+  }
+  const currentVersion = boundedDisplayString(raw.current_version, 64);
+  const availableVersion = boundedDisplayString(raw.available_version, 64, { nullable: true });
+  const notes = boundedDisplayString(raw.notes, 2000, { nullable: true });
+  const requiresVersion = new Set(["available", "downloading", "ready_to_restart"]);
+  const phaseCodes = {
+    not_checked: new Set(["update_not_checked"]), checking: new Set(["update_checking"]),
+    current: new Set(["update_current"]), available: new Set(["update_available"]),
+    downloading: new Set(["update_downloading"]),
+    ready_to_restart: new Set(["update_installed"]),
+    failed: new Set([
+      "update_metadata_invalid", "update_check_failed", "update_changed",
+      "update_verification_or_install_failed",
+    ]),
+  };
+  if ((requiresVersion.has(raw.phase) && availableVersion === null) ||
+      (!requiresVersion.has(raw.phase) && raw.phase !== "failed" && availableVersion !== null) ||
+      (notes !== null && availableVersion === null) || !phaseCodes[raw.phase].has(raw.code)) {
+    throw new Error("invalid desktop update state");
+  }
+  return {
+    schema: UPDATE_SCHEMA, channel: raw.channel, current_version: currentVersion,
+    phase: raw.phase, available_version: availableVersion, notes, code: raw.code,
+  };
+}
+
+function renderUpdate(raw, invoke) {
+  const update = normalizeUpdate(raw);
+  activeUpdate = update;
+  const panel = document.getElementById("update-panel");
+  const title = document.getElementById("update-title");
+  const notes = document.getElementById("update-notes");
+  const install = document.getElementById("update-install");
+  const restart = document.getElementById("update-restart");
+  const later = document.getElementById("update-later");
+  const check = document.getElementById("check-update");
+  const status = document.getElementById("update-status");
+  const busy = update.phase === "checking" || update.phase === "downloading";
+  panel.setAttribute("aria-busy", String(busy));
+  check.disabled = !invoke || busy;
+  status.textContent = update.phase === "failed" ? ({
+    update_metadata_invalid: "invalid update metadata",
+    update_changed: "update changed · check again",
+    update_verification_or_install_failed: "install failed · current app usable",
+  })[update.code] || "check unavailable" : ({
+    not_checked: "not checked", checking: "checking…", current: "current",
+    available: `${update.available_version} available`, downloading: "verifying + installing…",
+    ready_to_restart: "restart ready",
+  })[update.phase];
+  panel.hidden = !["available", "downloading", "ready_to_restart"].includes(update.phase);
+  title.textContent = update.phase === "ready_to_restart"
+    ? `Headroom ${update.available_version} is installed`
+    : update.phase === "downloading" ? `Installing Headroom ${update.available_version}`
+      : `Headroom ${update.available_version} is available`;
+  notes.textContent = update.notes || "Signed release from the configured Headroom channel.";
+  install.hidden = update.phase === "ready_to_restart";
+  install.disabled = update.phase !== "available" || !invoke;
+  install.setAttribute("aria-describedby", "update-status");
+  install.textContent = install.dataset.confirmVersion === update.available_version
+    ? "Confirm install" : "Install update";
+  restart.hidden = update.phase !== "ready_to_restart";
+  restart.disabled = update.phase !== "ready_to_restart" || !invoke;
+  restart.setAttribute("aria-describedby", "update-status");
+  restart.textContent = restart.dataset.confirmVersion === update.available_version
+    ? "Confirm restart" : "Restart Headroom";
+  later.hidden = update.phase === "downloading";
+  check.onclick = invoke ? async () => {
+    try { renderUpdate(await invoke("desktop_check_for_update"), invoke); }
+    catch { status.textContent = "check unavailable"; }
+  } : null;
+  install.onclick = invoke ? async () => {
+    if (install.dataset.confirmVersion !== update.available_version) {
+      install.dataset.confirmVersion = update.available_version;
+      install.textContent = "Confirm install";
+      status.textContent = `confirm signed ${update.available_version} install`;
+      return;
+    }
+    delete install.dataset.confirmVersion;
+    install.disabled = true;
+    try { renderUpdate(await invoke("desktop_install_update", { confirmed: true }), invoke); }
+    catch { status.textContent = "install failed · current app unchanged"; }
+  } : null;
+  restart.onclick = invoke ? async () => {
+    if (restart.dataset.confirmVersion !== update.available_version) {
+      restart.dataset.confirmVersion = update.available_version;
+      restart.textContent = "Confirm restart";
+      status.textContent = "confirm restart to finish update";
+      return;
+    }
+    delete restart.dataset.confirmVersion;
+    restart.disabled = true;
+    try { await invoke("desktop_restart_after_update", { confirmed: true }); }
+    catch { restart.disabled = false; status.textContent = "restart unavailable"; }
+  } : null;
+  later.onclick = () => {
+    delete install.dataset.confirmVersion;
+    delete restart.dataset.confirmVersion;
+    panel.hidden = true;
+  };
+  return update;
+}
+
+function configureUpdater(invoke) {
+  if (activeUpdate) renderUpdate(activeUpdate, invoke);
+  if (!invoke || updateInitialized) return;
+  updateInitialized = true;
+  invoke("desktop_update_status")
+    .then((update) => renderUpdate(update, invoke))
+    .catch(() => { document.getElementById("update-status").textContent = "unavailable"; });
+}
 
 export function shouldApplySnapshot(currentRevision, incomingRevision) {
   return Number.isInteger(incomingRevision) && incomingRevision > currentRevision;
@@ -78,17 +224,17 @@ export function shouldApplyCommandResult(baseRevision, currentRevision) {
     currentRevision <= baseRevision;
 }
 
-export function formatReset(epoch, now = Date.now()) {
+export function formatReset(epoch, now = Date.now(), locales = undefined) {
   const value = Number(epoch);
   if (!Number.isFinite(value)) return { label: "reset unknown", exact: null };
   const target = value * 1000;
   const difference = target - now;
-  const exact = new Intl.DateTimeFormat(undefined, {
+  const exact = new Intl.DateTimeFormat(locales, {
     dateStyle: "medium", timeStyle: "medium",
   }).format(new Date(target));
   if (difference <= 0) return { label: "reset due", exact };
   const minutes = Math.max(1, Math.round(difference / 60_000));
-  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "always" });
+  const formatter = new Intl.RelativeTimeFormat(locales, { numeric: "always" });
   if (minutes >= 1440) {
     return { label: `resets ${formatter.format(Math.round(minutes / 1440), "day")}`, exact };
   }
@@ -98,27 +244,27 @@ export function formatReset(epoch, now = Date.now()) {
   return { label: `resets ${formatter.format(minutes, "minute")}`, exact };
 }
 
-export function formatWeeklyReset(epoch) {
+export function formatWeeklyReset(epoch, locales = undefined) {
   if (epoch === null || epoch === undefined || epoch === "") return "—";
   const value = Number(epoch);
   if (!Number.isFinite(value) || value <= 0) return "—";
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(locales, {
     weekday: "short", month: "short", day: "numeric",
     hour: "numeric", minute: "2-digit", timeZoneName: "short",
   }).format(new Date(value * 1000));
 }
 
-export function formatPercent(value) {
+export function formatPercent(value, locales = undefined) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
-  return new Intl.NumberFormat(undefined, {
+  return new Intl.NumberFormat(locales, {
     style: "percent", maximumFractionDigits: 0,
   }).format(number / 100);
 }
 
-export function formatActivityValue(value) {
+export function formatActivityValue(value, locales = undefined) {
   if (!Number.isSafeInteger(value) || value < 0 || value > MAX_ACTIVITY_VALUE) return "—";
-  return new Intl.NumberFormat(undefined, {
+  return new Intl.NumberFormat(locales, {
     notation: "compact", maximumFractionDigits: value < 1000 ? 0 : 1,
   }).format(value);
 }
@@ -956,6 +1102,7 @@ function accountCard(account, activity = null, lifecycle = null, surface = "main
   const header = document.createElement("header");
   const identity = document.createElement("div");
   const name = document.createElement("h3");
+  name.id = `account-${account.name}-title`;
   name.textContent = account.name;
   const detail = document.createElement("p");
   detail.textContent = [account.provider, account.identity].filter(Boolean).join(" · ");
@@ -968,6 +1115,8 @@ function accountCard(account, activity = null, lifecycle = null, surface = "main
   header.append(identity, state);
   const windows = document.createElement("div");
   windows.className = "windows";
+  windows.setAttribute("role", "group");
+  windows.setAttribute("aria-label", `${account.name} capacity windows`);
   for (const item of compactAccountWindows(account.windows)) {
     windows.append(windowRow(item.label, item.value));
   }
@@ -975,6 +1124,7 @@ function accountCard(account, activity = null, lifecycle = null, surface = "main
     header, windows, weeklyResetRow(account.windows?.["7d"]),
     accountActivityRow(activity),
   );
+  article.setAttribute("aria-labelledby", name.id);
   if (surface === "main" && lifecycle && account.policy) {
     article.append(accountLifecyclePanel(account, lifecycle));
   }
@@ -1012,6 +1162,7 @@ function renderBurnHeatmap(rows) {
     const cell = document.createElement("span");
     cell.className = `burn-day burn-level-${logHeatLevel(row.total, maximum)}`;
     cell.tabIndex = 0;
+    cell.setAttribute("role", "img");
     cell.title = `${row.date} · ${formatActivityValue(row.total)} tokens · ${row.driver}`;
     cell.setAttribute("aria-label", cell.title);
     return cell;
@@ -1123,7 +1274,9 @@ function renderBurnTable(rows) {
 function renderBurnDashboard(activity) {
   const rows = burnRowsInRange(activity?.daily || [], activeBurnRange);
   for (const button of document.querySelectorAll("[data-burn-range]")) {
-    button.classList.toggle("active", button.dataset.burnRange === activeBurnRange);
+    const active = button.dataset.burnRange === activeBurnRange;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
     button.onclick = () => {
       activeBurnRange = button.dataset.burnRange;
       renderBurnDashboard(activity);
@@ -1185,7 +1338,10 @@ function accountLifecyclePanel(account, { invoke, update }) {
   reauthentication.className = "reauthentication";
   const reauthDiagnostic = document.createElement("p");
   reauthDiagnostic.className = "diagnostic";
+  reauthDiagnostic.id = `reauth-${account.name}-status`;
+  reauthDiagnostic.setAttribute("role", "status");
   reauthDiagnostic.setAttribute("aria-live", "polite");
+  reauthDiagnostic.setAttribute("aria-atomic", "true");
   const device = document.createElement("div");
   device.className = "device-instructions";
   device.hidden = true;
@@ -1193,6 +1349,7 @@ function accountLifecyclePanel(account, { invoke, update }) {
     const reauth = actionButton("Re-authenticate", async () => {
       reauth.disabled = true;
       cancel.hidden = false;
+      reauthentication.setAttribute("aria-busy", "true");
       try {
         let job = await invoke("desktop_start_reauthentication", {
           name: account.name,
@@ -1211,9 +1368,12 @@ function accountLifecyclePanel(account, { invoke, update }) {
         reauth.disabled = false;
         cancel.hidden = true;
         cancel.disabled = false;
+        reauthentication.setAttribute("aria-busy", "false");
       }
     }, "primary");
+    reauth.setAttribute("aria-describedby", reauthDiagnostic.id);
     const cancel = actionButton("Cancel", async () => {});
+    cancel.setAttribute("aria-describedby", reauthDiagnostic.id);
     cancel.hidden = true;
     reauthentication.append(reauth, cancel, device, reauthDiagnostic);
   } else {
@@ -1233,6 +1393,7 @@ function accountLifecyclePanel(account, { invoke, update }) {
         }
         confirmationArmed = false;
         openLogin.disabled = true;
+        reauthentication.setAttribute("aria-busy", "true");
         openLogin.textContent = confirmation.label;
         reauthDiagnostic.textContent = confirmation.message;
         try {
@@ -1247,8 +1408,10 @@ function accountLifecyclePanel(account, { invoke, update }) {
         } finally {
           openLogin.textContent = recovery.label;
           openLogin.disabled = false;
+          reauthentication.setAttribute("aria-busy", "false");
         }
       }, "primary");
+      openLogin.setAttribute("aria-describedby", reauthDiagnostic.id);
       reauthentication.append(openLogin);
     }
     reauthentication.append(reauthDiagnostic);
@@ -1288,6 +1451,7 @@ function candidateCard(candidate, invoke, update, existingNames = []) {
     if (!validate()) return;
     button.disabled = true;
     button.textContent = "Adopting…";
+    form.setAttribute("aria-busy", "true");
     try {
       update(await invoke("desktop_adopt", {
         candidateId: candidate.id, name: input.value,
@@ -1297,6 +1461,7 @@ function candidateCard(candidate, invoke, update, existingNames = []) {
     } finally {
       button.textContent = "Adopt";
       button.disabled = false;
+      form.setAttribute("aria-busy", "false");
     }
   });
   return form;
@@ -1329,10 +1494,16 @@ function providerLoginCard(provider, invoke, update, existingNames = []) {
   cancel.hidden = true;
   const diagnostic = document.createElement("p");
   diagnostic.className = "diagnostic";
+  diagnostic.id = `login-${provider}-status`;
+  diagnostic.setAttribute("role", "status");
   diagnostic.setAttribute("aria-live", "polite");
+  diagnostic.setAttribute("aria-atomic", "true");
   const device = document.createElement("div");
   device.className = "device-instructions";
+  device.setAttribute("role", "status");
   device.hidden = true;
+  start.setAttribute("aria-describedby", diagnostic.id);
+  cancel.setAttribute("aria-describedby", diagnostic.id);
   fields.append(name, expected, start, cancel);
   form.append(title, fields, device, diagnostic);
 
@@ -1353,6 +1524,7 @@ function providerLoginCard(provider, invoke, update, existingNames = []) {
     event.preventDefault();
     if (!validate()) return;
     running = true;
+    form.setAttribute("aria-busy", "true");
     start.disabled = true;
     name.disabled = true;
     expected.disabled = true;
@@ -1379,6 +1551,7 @@ function providerLoginCard(provider, invoke, update, existingNames = []) {
       expected.disabled = false;
       cancel.hidden = true;
       cancel.disabled = false;
+      form.setAttribute("aria-busy", "false");
     }
   });
   return form;
@@ -1650,9 +1823,12 @@ async function openSettingsPanel() {
   if (document.body.dataset.surface !== "main") return;
   const panel = document.getElementById("settings");
   document.getElementById("diagnostics").hidden = true;
+  document.getElementById("routing").hidden = true;
   if (activeBootstrap) populateSettingsForm(activeBootstrap.view.settings);
   panel.hidden = false;
-  panel.scrollIntoView({ block: "start", behavior: "smooth" });
+  panel.scrollIntoView({
+    block: "start", behavior: prefersReducedMotion() ? "auto" : "smooth",
+  });
   applySettingsValidation(document.getElementById("settings-form"));
   document.getElementById("settings-title-input").focus();
   const status = document.getElementById("settings-login-status");
@@ -1760,7 +1936,9 @@ async function openDiagnosticsPanel() {
   const panel = document.getElementById("diagnostics");
   const status = document.getElementById("diagnostics-status");
   panel.hidden = false;
-  panel.scrollIntoView({ block: "start", behavior: "smooth" });
+  panel.scrollIntoView({
+    block: "start", behavior: prefersReducedMotion() ? "auto" : "smooth",
+  });
   document.getElementById("diagnostics-export").disabled = true;
   status.textContent = "Loading bounded health…";
   if (!activeInvoke) {
@@ -1776,8 +1954,21 @@ async function openDiagnosticsPanel() {
   }
   document.getElementById("close-diagnostics").onclick = () => {
     panel.hidden = true;
+    document.getElementById("open-diagnostics")?.focus();
   };
   document.getElementById("close-diagnostics").focus();
+}
+
+function openRoutingPanel() {
+  if (document.body.dataset.surface !== "main") return;
+  document.getElementById("settings").hidden = true;
+  document.getElementById("diagnostics").hidden = true;
+  const panel = document.getElementById("routing");
+  panel.hidden = false;
+  panel.scrollIntoView({
+    block: "start", behavior: prefersReducedMotion() ? "auto" : "smooth",
+  });
+  document.getElementById("routing-family").focus();
 }
 
 function configureSurfaceActions(surface, invoke) {
@@ -1795,10 +1986,14 @@ function configureSurfaceActions(surface, invoke) {
       actionButton("Quit", () => invoke("desktop_quit"), "danger"),
     );
   } else {
-    controls.push(
-      actionButton("Diagnostics", openDiagnosticsPanel),
-      actionButton("Settings", openSettingsPanel),
-    );
+    const diagnostics = actionButton("Diagnostics", openDiagnosticsPanel);
+    diagnostics.id = "open-diagnostics";
+    const routing = actionButton("Route", openRoutingPanel);
+    routing.id = "open-routing";
+    const settings = actionButton("Settings", openSettingsPanel);
+    settings.id = "open-settings";
+    settings.setAttribute("aria-keyshortcuts", "Meta+,");
+    controls.push(diagnostics, routing, settings);
   }
   actions.replaceChildren(...controls);
 }
@@ -1834,6 +2029,7 @@ function configureSettings(value, invoke) {
     const save = document.getElementById("settings-save");
     const diagnostic = document.getElementById("settings-errors");
     save.disabled = true;
+    form.setAttribute("aria-busy", "true");
     diagnostic.textContent = "Validating and committing settings…";
     try {
       await invoke("desktop_update_settings", {
@@ -1846,6 +2042,7 @@ function configureSettings(value, invoke) {
         "Settings were not changed. Custom provider paths must name executable files.";
     } finally {
       save.disabled = false;
+      form.setAttribute("aria-busy", "false");
     }
   } : null;
   const login = document.getElementById("settings-launch-at-login");
@@ -1869,6 +2066,11 @@ function configureSettings(value, invoke) {
   } : null;
   document.getElementById("close-settings").onclick = () => {
     panel.hidden = true;
+    document.getElementById("open-settings")?.focus();
+  };
+  document.getElementById("close-routing").onclick = () => {
+    document.getElementById("routing").hidden = true;
+    document.getElementById("open-routing")?.focus();
   };
 }
 
@@ -1958,6 +2160,7 @@ function configureRouting(value, invoke) {
   preview.onclick = invoke ? async () => {
     if (!ROUTING_FAMILIES.has(family.value)) return;
     preview.disabled = true;
+    preview.setAttribute("aria-busy", "true");
     const diagnostic = document.getElementById("routing-diagnostic");
     diagnostic.classList.remove("is-error");
     diagnostic.textContent = `Proving the current ${family.value} route…`;
@@ -1973,6 +2176,7 @@ function configureRouting(value, invoke) {
         "Routing preview is unavailable; refresh capacity or inspect diagnostics.";
     } finally {
       preview.disabled = false;
+      preview.setAttribute("aria-busy", "false");
     }
   } : null;
   family.onchange = () => {
@@ -2077,6 +2281,7 @@ export function renderBootstrap(raw, invoke = null) {
   configureSurfaceActions(value.surface, invoke);
   configureSettings(value, invoke);
   configureRouting(value, invoke);
+  configureUpdater(invoke);
   const freshnessAge = view.freshness.age_seconds === null
     ? "age unknown" : `${view.freshness.age_seconds}s old`;
   document.getElementById("surface-status").textContent =
@@ -2115,18 +2320,28 @@ if (typeof document !== "undefined") {
     }, activeInvoke);
   };
   window.__headroomSetRefreshState = applyRefreshState;
+  window.__headroomApplyUpdate = (update) => {
+    try { renderUpdate(update, activeInvoke); }
+    catch { document.getElementById("update-status").textContent = "invalid update state"; }
+  };
   window.__headroomOpenPanel = (panel) => {
     if (panel === "settings" || panel === "appearance") openSettingsPanel();
     if (panel === "diagnostics") openDiagnosticsPanel();
+    if (panel === "routing") openRoutingPanel();
   };
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      for (const id of ["diagnostics", "settings"]) {
-        const panel = document.getElementById(id);
-        if (!panel.hidden) {
-          panel.hidden = true;
-          return;
-        }
+      if (!document.getElementById("settings").hidden) {
+        document.getElementById("close-settings").click();
+        return;
+      }
+      if (!document.getElementById("routing").hidden) {
+        document.getElementById("close-routing").click();
+        return;
+      }
+      if (!document.getElementById("diagnostics").hidden) {
+        document.getElementById("close-diagnostics").click();
+        return;
       }
     }
     if (!event.metaKey || event.ctrlKey || event.altKey) return;

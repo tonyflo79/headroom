@@ -11,10 +11,41 @@ import {
   normalizeActivity, normalizeBootstrap, normalizeDeviceInstructions, normalizeDiagnostics,
   normalizeHandoffHealth,
   normalizeRoutingPreview,
+  normalizeUpdate,
   onboardingPresentation, percentLeft,
   refreshPresentation, refreshStatePresentation, shouldApplyCommandResult,
   shouldApplySnapshot, settingsPatch, suggestedAccountName, validateSettingsDraft,
 } from "../dist/main.js";
+
+test("accepts only the bounded native signed-update projection", () => {
+  const available = {
+    schema: "headroom_desktop_update@1", channel: "stable",
+    current_version: "0.4.0", phase: "available", available_version: "0.4.1",
+    notes: "Credential renewal reliability improvements.", code: "update_available",
+  };
+  assert.deepEqual(normalizeUpdate(available), available);
+  assert.equal(normalizeUpdate({ ...available, channel: "prerelease" }).channel, "prerelease");
+  assert.throws(() => normalizeUpdate({ ...available, channel: "https://attacker.invalid" }),
+    /update contract/);
+  assert.throws(() => normalizeUpdate({ ...available, download_url: "file:///private" }),
+    /update contract/);
+  assert.throws(() => normalizeUpdate({ ...available, notes: "x".repeat(2001) }),
+    /display string/);
+  assert.throws(() => normalizeUpdate({ ...available, phase: "current" }),
+    /update state/);
+});
+
+test("update UI requires separate install and restart actions", () => {
+  const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../dist/main.js", import.meta.url), "utf8");
+  for (const id of ["update-panel", "update-install", "update-restart", "check-update"]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(source, /desktop_install_update/);
+  assert.match(source, /desktop_restart_after_update/);
+  assert.match(source, /confirmed: true/);
+  assert.doesNotMatch(source, /desktop_(check_for_update|install_update)[\s\S]{0,160}(url|signature|path):/);
+});
 
 const bootstrap = {
   bridge: {
@@ -508,6 +539,13 @@ test("validates and projects the complete settings contract", () => {
 
 test("uses locale formatters for percentages and exposes the settings console", () => {
   assert.match(formatPercent(72), /72/);
+  assert.notEqual(formatPercent(72, "en-US"), formatPercent(72, "de-DE"));
+  assert.notEqual(
+    formatWeeklyReset(1_800_500_000, "en-US"),
+    formatWeeklyReset(1_800_500_000, "de-DE"),
+  );
+  assert.notEqual(formatActivityValue(12_500, "en-US"),
+    formatActivityValue(12_500, "de-DE"));
   const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
   for (const id of ["settings-theme", "settings-refresh", "settings-terminal",
     "settings-launch-at-login", "settings-notifications", "settings-save"]) {
