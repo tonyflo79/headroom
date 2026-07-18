@@ -9,7 +9,7 @@
 #![allow(dead_code)] // Removed when the legacy popover helpers move onto the bridge.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::TcpStream,
@@ -32,6 +32,7 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_positioner::{Position, WindowExt};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
@@ -101,6 +102,7 @@ const DESKTOP_WINDOW_MAX_HEIGHT: f64 = 440.0;
 const DESKTOP_POPOVER_WIDTH: f64 = 420.0;
 const DESKTOP_POPOVER_HEIGHT: f64 = 680.0;
 const WINDOW_STATE_SCHEMA: &str = "headroom_desktop_window@1";
+const NOTIFICATION_STATE_SCHEMA: &str = "headroom_capacity_notifications@1";
 const DESKTOP_THEMES: [&str; 5] = ["midnight", "minimal", "chrome", "paper", "terminal"];
 const COLLECTION_IDLE_INTERVAL: Duration = Duration::from_secs(300);
 const COLLECTION_INTERVAL_MIN_SECONDS: u64 = 60;
@@ -157,6 +159,23 @@ const SINGLETON_SOCKET_PATH: &str = "/tmp/dev_headroom_menubar.sock";
 struct BridgeSession {
     child: CommandChild,
     events: Receiver<CommandEvent>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct NotificationWindowState {
+    reset_at: Option<i64>,
+    alerted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CapacityNotification {
+    title: String,
+    body: String,
+}
+
+#[derive(Default)]
+struct CapacityNotificationState {
+    windows: Mutex<HashMap<String, NotificationWindowState>>,
 }
 
 #[cfg(unix)]
@@ -2272,6 +2291,200 @@ fn push_bridge_to_windows(app: &AppHandle, handshake: &serde_json::Value) {
     }
 }
 
+fn notification_window_label(key: &str) -> String {
+    match key {
+        "5h" => "5-hour".into(),
+        "7d" => "weekly".into(),
+        _ => key
+            .strip_prefix("scoped:")
+            .filter(|label| !label.is_empty())
+            .unwrap_or("model")
+            .to_string(),
+    }
+}
+
+fn notification_left(value: f64) -> String {
+    if value.fract().abs() < 0.05 {
+        format!("{value:.0}%")
+    } else {
+        format!("{value:.1}%")
+    }
+}
+
+fn evaluate_capacity_notifications(
+    view: &serde_json::Value,
+    ledger: &mut HashMap<String, NotificationWindowState>,
+) -> Vec<CapacityNotification> {
+    let settings = view.pointer("/settings/notifications");
+    if settings
+        .and_then(|value| value.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        // Disabling alerts is a hard boundary: forget prior crossings so a
+        // later opt-in cannot emit a retroactive reset notification.
+        ledger.clear();
+        return Vec::new();
+    }
+    let reset_enabled = settings
+        .and_then(|value| value.get("reset_enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let global_threshold = settings
+        .and_then(|value| value.get("global_threshold_percent"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| (1..=99).contains(value))
+        .unwrap_or(20) as f64;
+    let accounts = view
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut events = Vec::new();
+    for account in accounts {
+        let Some(name) = account.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(provider) = account
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .filter(|provider| matches!(*provider, "claude" | "codex"))
+        else {
+            continue;
+        };
+        let trusted = matches!(
+            account
+                .get("trust_state")
+                .and_then(serde_json::Value::as_str),
+            Some("verified" | "verified_local")
+        );
+        let account_current = matches!(
+            account.get("state").and_then(serde_json::Value::as_str),
+            Some("current" | "limited")
+        );
+        if !trusted || !account_current {
+            continue;
+        }
+        let threshold = settings
+            .and_then(|value| value.get("provider_threshold_percent"))
+            .and_then(|value| value.get(provider))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| (1..=99).contains(value))
+            .map_or(global_threshold, |value| value as f64);
+        let Some(windows) = account
+            .get("windows")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        let mut newly_low = Vec::new();
+        let mut newly_reset = Vec::new();
+        for (window_key, window) in windows {
+            if window_key != "5h" && window_key != "7d" && !window_key.starts_with("scoped:") {
+                continue;
+            }
+            let state = window.get("state").and_then(serde_json::Value::as_str);
+            let left = match state {
+                Some("current") => window
+                    .get("left_percent")
+                    .and_then(serde_json::Value::as_f64)
+                    .filter(|value| value.is_finite() && (0.0..=100.0).contains(value)),
+                Some("limited") => Some(0.0),
+                _ => None,
+            };
+            let Some(left) = left else {
+                continue;
+            };
+            let reset_at = window
+                .get("resets_at")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|value| *value > 0);
+            let key = format!("{name}|{window_key}");
+            let previous = ledger.entry(key).or_default();
+            let reset_changed =
+                previous.reset_at.is_some() && reset_at.is_some() && previous.reset_at != reset_at;
+            if reset_changed {
+                if previous.alerted && left > threshold && reset_enabled {
+                    newly_reset.push(notification_window_label(window_key));
+                }
+                previous.alerted = false;
+            }
+            if left <= threshold && !previous.alerted {
+                previous.alerted = true;
+                newly_low.push((notification_window_label(window_key), left));
+            }
+            if reset_at.is_some() {
+                previous.reset_at = reset_at;
+            }
+        }
+        if !newly_low.is_empty() {
+            newly_low.sort_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let body = newly_low
+                .iter()
+                .map(|(label, left)| format!("{label} {} left", notification_left(*left)))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            events.push(CapacityNotification {
+                title: format!("{name} capacity low"),
+                body,
+            });
+        } else if !newly_reset.is_empty() {
+            newly_reset.sort();
+            newly_reset.dedup();
+            events.push(CapacityNotification {
+                title: format!("{name} capacity reset"),
+                body: format!("{} capacity is available again", newly_reset.join(" and ")),
+            });
+        }
+    }
+    events
+}
+
+fn deliver_capacity_notifications(app: &AppHandle, events: Vec<CapacityNotification>) {
+    if events.is_empty() {
+        return;
+    }
+    let notification = app.notification();
+    let permission = match notification.permission_state() {
+        Ok(tauri::plugin::PermissionState::Granted) => tauri::plugin::PermissionState::Granted,
+        Ok(tauri::plugin::PermissionState::Prompt)
+        | Ok(tauri::plugin::PermissionState::PromptWithRationale) => notification
+            .request_permission()
+            .unwrap_or(tauri::plugin::PermissionState::Denied),
+        Ok(state) => state,
+        Err(_) => return,
+    };
+    if permission != tauri::plugin::PermissionState::Granted {
+        return;
+    }
+    for event in events {
+        // Native Notification Center delivery only: no window show/focus call,
+        // no sound, and no overlay inside Headroom's webview.
+        let _ = notification
+            .builder()
+            .title(event.title)
+            .body(event.body)
+            .show();
+    }
+}
+
+fn evaluate_and_deliver_capacity_notifications(app: &AppHandle, view: &serde_json::Value) {
+    let events = {
+        let state = app.state::<CapacityNotificationState>();
+        let Ok(mut ledger) = state.windows.lock() else {
+            return;
+        };
+        let events = evaluate_capacity_notifications(view, &mut ledger);
+        let _ = save_notification_ledger(app, &ledger);
+        events
+    };
+    deliver_capacity_notifications(app, events);
+}
+
 fn publish_desktop_view(
     app: &AppHandle,
     view: serde_json::Value,
@@ -2288,6 +2501,7 @@ fn publish_desktop_view(
     }
     apply_window_preference(app, &snapshot.view);
     push_snapshot_to_windows(app, &snapshot);
+    evaluate_and_deliver_capacity_notifications(app, &snapshot.view);
     finish_login_launch_routing(app, &snapshot.view);
     Ok(snapshot)
 }
@@ -3614,6 +3828,120 @@ fn window_state_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| "desktop window state directory is unavailable".to_string())
 }
 
+fn notification_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("capacity-notifications.json"))
+        .map_err(|_| "desktop notification state directory is unavailable".to_string())
+}
+
+fn load_notification_ledger(app: &AppHandle) -> HashMap<String, NotificationWindowState> {
+    let Some(path) = notification_state_path(app).ok() else {
+        return HashMap::new();
+    };
+    let Some(metadata) = fs::symlink_metadata(&path).ok() else {
+        return HashMap::new();
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 65_536 {
+        return HashMap::new();
+    }
+    let Some(value) = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return HashMap::new();
+    };
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(NOTIFICATION_STATE_SCHEMA) {
+        return HashMap::new();
+    }
+    let Some(windows) = value
+        .get("windows")
+        .and_then(serde_json::Value::as_object)
+        .filter(|windows| windows.len() <= 256)
+    else {
+        return HashMap::new();
+    };
+    windows
+        .iter()
+        .filter_map(|(key, entry)| {
+            let valid_key = !key.is_empty()
+                && key.len() <= 96
+                && key.contains('|')
+                && !key
+                    .chars()
+                    .any(|character| matches!(character, '\0' | '\n' | '\r'));
+            let alerted = entry.get("alerted").and_then(serde_json::Value::as_bool);
+            let reset_at = entry
+                .get("reset_at")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|value| *value > 0);
+            (valid_key && alerted.is_some()).then(|| {
+                (
+                    key.clone(),
+                    NotificationWindowState {
+                        reset_at,
+                        alerted: alerted.unwrap_or(false),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn save_notification_ledger(
+    app: &AppHandle,
+    ledger: &HashMap<String, NotificationWindowState>,
+) -> Result<(), String> {
+    let path = notification_state_path(app)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "desktop notification state path is invalid".to_string())?;
+    fs::create_dir_all(directory)
+        .map_err(|_| "desktop notification state directory could not be created".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "desktop notification state permissions could not be set".to_string())?;
+    let temporary = directory.join(format!(
+        ".capacity-notifications-{}.tmp",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&temporary);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| "desktop notification state could not be prepared".to_string())?;
+    let windows = ledger
+        .iter()
+        .take(256)
+        .map(|(key, state)| {
+            (
+                key.clone(),
+                serde_json::json!({
+                    "reset_at": state.reset_at,
+                    "alerted": state.alerted,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({
+            "schema": NOTIFICATION_STATE_SCHEMA,
+            "windows": windows,
+        }),
+    )
+    .map_err(|_| "desktop notification state could not be encoded".to_string())?;
+    file.write_all(b"\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "desktop notification state could not be committed".to_string())?;
+    fs::rename(&temporary, &path)
+        .map_err(|_| "desktop notification state could not be published".to_string())?;
+    Ok(())
+}
+
 fn valid_window_placement(value: &serde_json::Value) -> Option<WindowPlacement> {
     if value.get("schema").and_then(serde_json::Value::as_str) != Some(WINDOW_STATE_SCHEMA) {
         return None;
@@ -3778,10 +4106,12 @@ pub fn run() {
         )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_positioner::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(DesktopEngine::default())
         .manage(DesktopStore::default())
         .manage(DesktopUiState::default())
         .manage(CollectionScheduler::default())
+        .manage(CapacityNotificationState::default())
         .manage(StartupRouting {
             login_launch,
             decision_complete: AtomicBool::new(false),
@@ -3829,6 +4159,9 @@ pub fn run() {
             // runs on the blocking pool and later replaces this projection;
             // startup lifecycle work never stalls the main UI thread.
             let handshake = desktop_startup_handshake();
+            if let Ok(mut ledger) = app.state::<CapacityNotificationState>().windows.lock() {
+                *ledger = load_notification_ledger(app.handle());
+            }
             let snapshot = app
                 .state::<DesktopStore>()
                 .replace_view(desktop_startup_view())
@@ -4539,6 +4872,94 @@ mod tests {
         assert_eq!(shell_quote("/safe/path"), "/safe/path");
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    fn notification_view(
+        enabled: bool,
+        reset_enabled: bool,
+        account_state: &str,
+        trust_state: &str,
+        left: f64,
+        reset_at: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "settings": {"notifications": {
+                "enabled": enabled,
+                "reset_enabled": reset_enabled,
+                "global_threshold_percent": 20,
+                "provider_threshold_percent": {},
+            }},
+            "accounts": [{
+                "name": "claude1", "provider": "claude",
+                "state": account_state, "trust_state": trust_state,
+                "windows": {
+                    "5h": {"state": "current", "left_percent": left,
+                           "resets_at": reset_at},
+                    "7d": {"state": "current", "left_percent": 80,
+                           "resets_at": reset_at + 1000},
+                },
+            }],
+        })
+    }
+
+    #[test]
+    fn notifications_are_opt_in_and_deduplicated_per_crossing() {
+        let mut ledger = HashMap::new();
+        let disabled = notification_view(false, false, "current", "verified", 10.0, 1000);
+        assert!(evaluate_capacity_notifications(&disabled, &mut ledger).is_empty());
+        assert!(ledger.is_empty());
+
+        let enabled = notification_view(true, false, "current", "verified", 10.0, 1000);
+        let first = evaluate_capacity_notifications(&enabled, &mut ledger);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].title, "claude1 capacity low");
+        assert_eq!(first[0].body, "5-hour 10% left");
+        assert!(evaluate_capacity_notifications(&enabled, &mut ledger).is_empty());
+    }
+
+    #[test]
+    fn held_stale_and_unverified_readings_never_notify() {
+        for (state, trust) in [
+            ("held", "verified"),
+            ("stale", "verified"),
+            ("current", "held"),
+        ] {
+            let mut ledger = HashMap::new();
+            let view = notification_view(true, true, state, trust, 0.0, 1000);
+            assert!(evaluate_capacity_notifications(&view, &mut ledger).is_empty());
+            assert!(ledger.is_empty());
+        }
+    }
+
+    #[test]
+    fn reset_alert_requires_new_provider_window_and_is_also_deduplicated() {
+        let mut ledger = HashMap::new();
+        let low = notification_view(true, true, "current", "verified", 5.0, 1000);
+        assert_eq!(evaluate_capacity_notifications(&low, &mut ledger).len(), 1);
+
+        // A corrected percentage inside the same provider window is not proof
+        // of a reset and must stay quiet.
+        let same_window = notification_view(true, true, "current", "verified", 90.0, 1000);
+        assert!(evaluate_capacity_notifications(&same_window, &mut ledger).is_empty());
+
+        let reset = notification_view(true, true, "current", "verified", 90.0, 2000);
+        let events = evaluate_capacity_notifications(&reset, &mut ledger);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "claude1 capacity reset");
+        assert!(evaluate_capacity_notifications(&reset, &mut ledger).is_empty());
+    }
+
+    #[test]
+    fn provider_threshold_override_controls_the_crossing() {
+        let mut view = notification_view(true, false, "current", "verified", 15.0, 1000);
+        view["settings"]["notifications"]["provider_threshold_percent"]["claude"] =
+            serde_json::json!(10);
+        let mut ledger = HashMap::new();
+        assert!(evaluate_capacity_notifications(&view, &mut ledger).is_empty());
+        view["accounts"][0]["windows"]["5h"]["left_percent"] = serde_json::json!(9);
+        let events = evaluate_capacity_notifications(&view, &mut ledger);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].body, "5-hour 9% left");
     }
 
     #[test]

@@ -39,9 +39,10 @@ plus 69 route, lease, and fail-closed tests. PR CI remains authoritative for
 the complete 666-test Linux engine suite and the unsigned macOS application
 build.
 
-## Non-negotiable hold
+## Current stability follow-up
 
-Notifications remain paused and are not part of this integration stack. The
-core gate remains open until PRs #38–#40 are integrated and the account owner
-has completed the real-provider recovery, refresh, selected launch, and
-automatic-switch acceptance pass.
+The historical integration hold above has been superseded by the focused
+login/notification reliability gate in
+`docs/desktop/LOGIN-NOTIFICATION-STABILITY.md`. Capacity notifications remain
+opt-in, and automatic switching is not required for the compact manual-account
+utility acceptance path.

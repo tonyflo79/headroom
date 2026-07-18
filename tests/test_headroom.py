@@ -313,9 +313,8 @@ class ClaudeIdentity(unittest.TestCase):
 
 
 class ClaudeLimits(unittest.TestCase):
-    """The direct usage probe: cached-token expiry and auth rejection must
-    hold with distinct, actionable codes — never a raw HTTPError that would
-    surface as a permanent, opaque 'collector error'."""
+    """The direct usage probe repairs provider OAuth once, then holds any
+    unrecovered expiry/rejection with a stable actionable code."""
 
     def _oauth(self, **extra):
         return dict({"accessToken": "tok-abc"}, **extra)
@@ -330,21 +329,77 @@ class ClaudeLimits(unittest.TestCase):
         return urllib.error.HTTPError("https://api.anthropic.com/api/oauth/"
                                       "usage", code, "denied", {}, None)
 
-    def test_expired_cached_token_holds_without_network(self):
-        opener = mock.Mock(side_effect=AssertionError("probe must not run"))
-        expired_ms = (time.time() - 60) * 1000
-        with self._with_oauth(self._oauth(expiresAt=expired_ms)):
-            with self.assertRaises(collect.IdentityBindingError) as caught:
-                collect.claude_limits("/h", None, opener=opener)
-        self.assertEqual(caught.exception.code, "claude_usage_token_expired")
-        opener.assert_not_called()
+    @staticmethod
+    def _usage_response():
+        class Response(io.BytesIO):
+            headers = {"anthropic-organization-id": "org-usage"}
 
-    def test_expired_token_in_plain_seconds_also_holds(self):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        return Response(json.dumps({
+            "five_hour": {"utilization": 12, "resets_at": None},
+            "seven_day": {"utilization": 34, "resets_at": None},
+        }).encode())
+
+    def test_expired_cached_token_refreshes_before_probe(self):
+        opener = mock.Mock(return_value=self._usage_response())
+        expired_ms = (time.time() - 60) * 1000
+        fresh = self._oauth(accessToken="tok-fresh",
+                            expiresAt=(time.time() + 3600) * 1000)
+        refresher = mock.Mock(return_value=fresh)
+        with self._with_oauth(self._oauth(expiresAt=expired_ms)):
+            result = collect.claude_limits(
+                "/h", None, opener=opener, refresher=refresher)
+        refresher.assert_called_once_with("/h", force=True)
+        self.assertEqual(result["windows"]["5h"]["used_percent"], 12.0)
+        self.assertIn("tok-fresh", opener.call_args.args[0].get_header(
+            "Authorization"))
+
+    def test_temporarily_unreadable_keychain_recovers_before_hold(self):
+        opener = mock.Mock(return_value=self._usage_response())
+        fresh = self._oauth(accessToken="keychain-recovered",
+                            expiresAt=(time.time() + 3600) * 1000)
+        refresher = mock.Mock(return_value=fresh)
+        with self._with_oauth({}):
+            result = collect.claude_limits(
+                "/slot", None, opener=opener, refresher=refresher)
+        refresher.assert_called_once_with("/slot", force=True)
+        self.assertEqual(result["windows"]["7d"]["used_percent"], 34.0)
+
+    def test_expired_token_holds_when_provider_refresh_fails(self):
         opener = mock.Mock(side_effect=AssertionError("probe must not run"))
-        with self._with_oauth(self._oauth(expiresAt=time.time() - 60)):
+        expired = self._oauth(expiresAt=time.time() - 60)
+        with self._with_oauth(expired):
             with self.assertRaises(collect.IdentityBindingError) as caught:
-                collect.claude_limits("/h", None, opener=opener)
+                collect.claude_limits(
+                    "/h", None, opener=opener,
+                    refresher=mock.Mock(return_value=expired))
         self.assertEqual(caught.exception.code, "claude_usage_token_expired")
+
+    def test_http_401_refreshes_and_retries_once(self):
+        opener = mock.Mock(side_effect=[self._http_error(401),
+                                        self._usage_response()])
+        fresh = self._oauth(accessToken="tok-rotated",
+                            expiresAt=(time.time() + 3600) * 1000)
+        refresher = mock.Mock(return_value=fresh)
+        with self._with_oauth(self._oauth(expiresAt=time.time() + 3600)):
+            result = collect.claude_limits(
+                "/slot", None, opener=opener, refresher=refresher)
+        refresher.assert_called_once_with("/slot", force=True)
+        self.assertEqual(opener.call_count, 2)
+        self.assertEqual(result["windows"]["7d"]["used_percent"], 34.0)
+
+    def test_unexpired_token_does_not_invoke_refresh(self):
+        opener = mock.Mock(return_value=self._usage_response())
+        refresher = mock.Mock(side_effect=AssertionError("must not refresh"))
+        with self._with_oauth(self._oauth(expiresAt=time.time() + 3600)):
+            collect.claude_limits(
+                "/h", None, opener=opener, refresher=refresher)
+        refresher.assert_not_called()
 
     def test_future_or_absent_expiry_probes_normally(self):
         for oauth in (self._oauth(),  # no expiresAt recorded
@@ -373,6 +428,62 @@ class ClaudeLimits(unittest.TestCase):
         with self._with_oauth(self._oauth()):
             with self.assertRaises(collect.ProviderThrottleError):
                 collect.claude_limits("/h", None, opener=opener)
+
+
+class ClaudeCredentialRefresh(unittest.TestCase):
+    def test_provider_doctor_refreshes_exact_slot_without_inference(self):
+        with tempfile.TemporaryDirectory() as home:
+            expired = {"accessToken": "old", "refreshToken": "refresh",
+                       "expiresAt": 1}
+            fresh = {"accessToken": "new", "refreshToken": "rotated",
+                     "expiresAt": 9_999_999_999_000}
+
+            def runner(argv, **kwargs):
+                self.assertEqual(argv, ["/provider/claude", "doctor"])
+                self.assertEqual(kwargs["cwd"], home)
+                self.assertEqual(kwargs["env"]["CLAUDE_CONFIG_DIR"], home)
+                self.assertEqual(kwargs["env"]["CLAUDE_CODE_SAFE_MODE"], "1")
+                self.assertTrue(kwargs["capture_output"])
+                return FakeCompleted(returncode=0)
+
+            with mock.patch.object(collect, "claude_oauth",
+                                   side_effect=[expired, fresh]), \
+                    mock.patch.object(collect, "claude_bin",
+                                      return_value="/provider/claude"):
+                result = collect.refresh_claude_oauth(
+                    home, runner=runner, now=100)
+        self.assertEqual(result["accessToken"], "new")
+
+    def test_fresh_credential_skips_provider_process(self):
+        fresh = {"accessToken": "current", "expiresAt": 9_999_999_999_000}
+        with mock.patch.object(collect, "claude_oauth", return_value=fresh):
+            result = collect.refresh_claude_oauth(
+                "/slot", runner=mock.Mock(
+                    side_effect=AssertionError("doctor must not run")), now=100)
+        self.assertIs(result, fresh)
+
+    def test_snapshot_binds_rotated_access_token_after_collection(self):
+        identity = {"verified": True, "email": "a@example.test",
+                    "account_fingerprint": "FP", "method": "provider"}
+        limits = {
+            "captured_at": int(time.time()), "source": "anthropic_usage_api",
+            "source_identity_fingerprint": "USAGE", "stale": False,
+            "windows": {
+                "5h": {"used_percent": 1, "resets_at": None,
+                       "window_minutes": 300},
+                "7d": {"used_percent": 2, "resets_at": None,
+                       "window_minutes": 10080},
+            },
+        }
+        with mock.patch.object(collect, "claude_identity", return_value=identity), \
+                mock.patch.object(collect, "credential_digest",
+                                  side_effect=["before-refresh", "after-refresh"]), \
+                mock.patch.object(collect, "claude_plan", return_value="Max"), \
+                mock.patch.object(collect, "claude_limits", return_value=limits):
+            row = collect.collect([_account("a")])["accounts"][0]
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["identity"]["credential_digest"],
+                         "after-refresh")
 
 
 class ThrottleCarryover(unittest.TestCase):
@@ -2379,7 +2490,7 @@ class DashboardRemovalOrdering(unittest.TestCase):
 
 
 class ActionableClaudeRefresh(unittest.TestCase):
-    def test_expired_keychain_token_never_recommends_refused_refresh(self):
+    def test_expired_keychain_token_reports_exhausted_provider_repair(self):
         account = _account("a")
         identity = {"verified": True, "email": "a@example.test",
                     "account_fingerprint": "FP", "method": "local"}
@@ -2394,6 +2505,7 @@ class ActionableClaudeRefresh(unittest.TestCase):
             row = collect.collect([account])["accounts"][0]
         self.assertEqual(row["error_code"], "claude_usage_token_expired")
         self.assertIn("Keychain-backed macOS login", row["note"])
+        self.assertIn("automatic token repair did not recover", row["note"])
         self.assertNotIn("headroom auth refresh", row["note"])
         self.assertNotIn("headroom connect a", row["note"])
 
