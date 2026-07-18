@@ -24,8 +24,13 @@ class ReleaseVersionCase(unittest.TestCase):
                 encoding="utf-8"))
         package = json.loads((ROOT / "integrations/menubar/package.json").read_text(
             encoding="utf-8"))
+        package_lock = json.loads((
+            ROOT / "integrations/menubar/package-lock.json").read_text(
+                encoding="utf-8"))
         self.assertEqual(tauri["version"], version)
         self.assertEqual(package["version"], version)
+        self.assertEqual(package_lock["version"], version)
+        self.assertEqual(package_lock["packages"][""]["version"], version)
 
     def test_release_version_checker_accepts_the_committed_tree(self):
         result = subprocess.run(
