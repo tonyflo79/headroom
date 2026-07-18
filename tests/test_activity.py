@@ -269,6 +269,41 @@ class ActivityMetrics(unittest.TestCase):
         self.assertEqual(value["totals"]["tokens"]["today"], {
             "value": 100, "coverage": "exact"})
 
+    def test_schema_upgrade_repairs_preexisting_stale_attribution(self):
+        home = os.path.join(self.temp.name, "codex")
+        transcript = os.path.join(home, "sessions", "one.jsonl")
+        self._write(
+            transcript, session_meta(),
+            codex_event("2026-07-16T17:00:00Z", 100),
+        )
+        config = {"accounts": [{
+            "name": "codex1", "provider": "codex", "home": home,
+        }]}
+        self._index(config)
+        connection = activity._database()
+        try:
+            connection.execute(
+                "update meta set value='headroom_activity_index@2' "
+                "where key='schema'")
+            connection.execute("update events set scope='stale-slot'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        value = self._index(config)
+
+        self.assertEqual(value["accounts"][0]["tokens"]["today"], {
+            "value": 100, "coverage": "exact"})
+        connection = activity._read_database()
+        try:
+            schema = activity._meta(connection, "schema")
+            scopes = connection.execute(
+                "select distinct scope from events").fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(schema, activity.STATE_SCHEMA)
+        self.assertEqual(scopes, [("codex1",)])
+
     def test_unindexed_projection_fails_closed(self):
         config = {"accounts": [{
             "name": "missing", "provider": "codex",

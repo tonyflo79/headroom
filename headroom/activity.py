@@ -22,7 +22,7 @@ from . import paths, registry
 
 
 SCHEMA = "headroom_daily_burn@1"
-STATE_SCHEMA = "headroom_activity_index@2"
+STATE_SCHEMA = "headroom_activity_index@3"
 WINDOWS = ("today", "7d", "30d")
 TOKEN_FIELDS = (
     "input_tokens", "output_tokens", "cache_creation_input_tokens",
@@ -400,9 +400,11 @@ def _index_sync(config, *, now=None, timezone_name=None,
     connection = _database(filename)
     failures = 0
     try:
+        prior_schema = _meta(connection, "schema")
         prior_timezone = _meta(connection, "timezone")
         prior_configuration = _meta(connection, "configuration")
-        rebuild = prior_timezone not in (None, timezone_name) \
+        rebuild = prior_schema not in (None, STATE_SCHEMA) \
+            or prior_timezone not in (None, timezone_name) \
             or prior_configuration not in (None, configuration)
         if rebuild:
             # Event rows intentionally retain no raw source path. Rebuild the
