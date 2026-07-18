@@ -213,6 +213,7 @@ menu actions, and clean exit.
 | `headroom serve --demo` | preview the dashboard with bundled sample data — no accounts needed |
 | `headroom widget-feed --swiftbar` | render the last published snapshot for SwiftBar; never collects |
 | `headroom statusline` | color-coded capacity for your Claude Code status line |
+| `headroom compatibility` | redacted engine, bridge, state-schema, platform, and capability matrix |
 | `headroom doctor` | environment + config health check (handy for bug reports) |
 
 ## Hand off a capped session
