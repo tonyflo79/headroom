@@ -1214,6 +1214,12 @@ class DesktopBridgeSubprocess(unittest.TestCase):
         self.assertTrue(all(frame["ok"] for frame in frames))
         self.assertEqual(frames[0]["result"]["bridge_schema"],
                          desktop_bridge.SCHEMA)
+        self.assertEqual(frames[0]["result"]["compatibility"]["capabilities"],
+                         frames[0]["result"]["capabilities"])
+        self.assertEqual(frames[0]["result"]["compatibility"]["architecture"],
+                         frames[0]["result"]["architecture"])
+        self.assertEqual(frames[0]["result"]["compatibility"]["platform"],
+                         frames[0]["result"]["platform"])
         self.assertIn("resilient_collection",
                       frames[0]["result"]["capabilities"])
         self.assertIn("validated_settings",

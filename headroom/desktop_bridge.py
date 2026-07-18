@@ -19,7 +19,7 @@ import threading
 import time
 
 from . import (
-    __version__, account_lifecycle, activity, capabilities,
+    __version__, account_lifecycle, activity, capabilities, compatibility,
     collect as collector, connect, notify, paths, registry, route, widget,
 )
 
@@ -1281,21 +1281,22 @@ def _handle(command, args):
         if requested is not None and SCHEMA not in requested:
             raise BridgeError(
                 "incompatible_schema", "desktop does not accept this schema")
+        advertised_capabilities = list(compatibility.BRIDGE_CAPABILITIES)
         return {
             "product": "headroom", "product_version": __version__,
             "bridge_schema": SCHEMA, "bridge_schema_range": [1, 1],
             "state_schema_range": [1, 1], "platform": sys.platform,
             "architecture": platform.machine(),
-            "capabilities": [
-                "fixture_snapshot", "discover", "adopt", "refresh",
-                "claude_login", "codex_device_login", "onboarding",
-                "account_lifecycle", "reauthentication",
-                "resilient_collection", "validated_settings",
-                "routing_launch", "provider_reauthentication_launch",
-                "handoff_health", "shutdown"],
+            "capabilities": advertised_capabilities,
+            "compatibility": compatibility.contract(advertised_capabilities),
             "runtime": "frozen" if getattr(sys, "frozen", False) else "python",
             "pid": os.getpid(),
         }, False
+    if command == "compatibility":
+        if args:
+            raise BridgeError(
+                "invalid_args", "compatibility arguments are invalid")
+        return compatibility.contract(), False
     if command == "fixture_snapshot":
         if set(args) - {"now"}:
             raise BridgeError("invalid_args", "fixture arguments are invalid")
