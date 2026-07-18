@@ -24,6 +24,19 @@
 
       <p id="surface-status" class="surface-status" role="status" aria-live="polite"></p>
 
+      <section id="update-panel" class="update-panel" aria-labelledby="update-title" hidden>
+        <div>
+          <p class="eyebrow">HEADROOM // SIGNED UPDATE</p>
+          <strong id="update-title">Update available</strong>
+          <p id="update-notes"></p>
+        </div>
+        <div class="update-actions">
+          <button id="update-install" class="primary" type="button">Install update</button>
+          <button id="update-restart" class="primary" type="button" hidden>Restart Headroom</button>
+          <button id="update-later" type="button">Later</button>
+        </div>
+      </section>
+
       <section id="settings" class="settings-panel" aria-labelledby="settings-title" hidden>
         <div class="settings-heading">
           <div>
@@ -265,7 +278,11 @@
         </div>
       </details>
 
-      <footer><span id="revision">revision 0</span> · [bundled engine] [private bridge] [no localhost server]</footer>
+      <footer>
+        <span id="revision">revision 0</span> · [bundled engine] [private bridge] [no localhost server]
+        · <button id="check-update" class="footer-action" type="button">check update</button>
+        <span id="update-status" aria-live="polite">not checked</span>
+      </footer>
     </main>
     <script type="module" src="main.js"></script>
   </body>
