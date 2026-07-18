@@ -269,9 +269,11 @@ behavior, strict sanitization, and packaged active-child acceptance, see
 - Real Claude and Codex flows still require the human validation checklists in
   `docs/desktop/CLAUDE-LOGIN-VALIDATION.md` and
   `docs/desktop/CODEX-LOGIN-VALIDATION.md` before those slices can ship.
-- Recovery is currently a safe read-only state, not a repair workflow.
+- Claude access-token expiry is repaired through Claude Code's own per-slot
+  credential manager; rejected/revoked refresh credentials still require the
+  explicit human reauthentication workflow.
 - There is no updater, diagnostics export, signing, or notarization yet.
-- Notification preferences are durable and off by default, but native alert
-  delivery and the macOS permission prompt belong to the notification slice.
+- Native capacity notifications are durable, deduplicated, verified-reading
+  only, and off by default. macOS permission is requested only after opt-in.
 - The old loopback viewer helpers remain in Rust for their security tests but
   are not called by the desktop application path.

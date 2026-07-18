@@ -6,7 +6,7 @@ usage:
   headroom connect [name] [--provider claude|codex] [--adopt PATH]
                                     add an account (fresh login or adopt existing)
   headroom auth refresh <slot>     interactively re-login an owned Claude slot
-                                    (then run `headroom collect`; never automatic)
+                                    after provider token repair is exhausted
   headroom remove <slot> [--yes]   unregister one non-final slot; keeps its home
   headroom collect                  read usage for every account (no tokens spent)
   headroom status [model]           who has headroom right now (default: claude)

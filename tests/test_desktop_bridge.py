@@ -29,8 +29,16 @@ class DesktopBridgeUnit(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.env = mock.patch.dict(os.environ, {"HEADROOM_DIR": self.temp.name})
         self.env.start()
+        # Desktop projection tests must not start a daemon indexer that scans
+        # the developer/runner's real global Claude history after the isolated
+        # temporary HEADROOM_DIR has been removed. Activity indexing has its
+        # own synchronous contract suite in test_activity.py.
+        self.activity_worker = mock.patch.object(
+            desktop_bridge.activity, "_start_worker", return_value=False)
+        self.activity_worker.start()
 
     def tearDown(self):
+        self.activity_worker.stop()
         self.env.stop()
         self.temp.cleanup()
 

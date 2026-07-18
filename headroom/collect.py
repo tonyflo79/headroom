@@ -44,6 +44,11 @@ from datetime import datetime, timezone
 from . import paths, registry
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
+CLAUDE_REFRESH_TIMEOUT = paths.env_int("HEADROOM_CLAUDE_REFRESH_TIMEOUT", 30)
+# Renew well before the eight-hour access-token boundary.  A five-minute
+# margin can be skipped by scheduler jitter or a short macOS sleep; thirty
+# minutes leaves several normal collection cycles while remaining infrequent.
+CLAUDE_REFRESH_MARGIN = paths.env_int("HEADROOM_CLAUDE_REFRESH_MARGIN", 1800)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
 # how long a past reading stays serviceable — keep in sync with route.py,
 # which enforces the same bound at routing time (collect must not import
@@ -336,6 +341,69 @@ def claude_plan(home):
 
 def claude_bin():
     return shutil.which("claude")
+
+
+def claude_oauth_expiry(oauth):
+    """Return a Claude access-token expiry in epoch seconds, if recorded."""
+    value = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return value / 1000.0 if value > 1e11 else float(value)
+
+
+def refresh_claude_oauth(home, force=False, runner=subprocess.run, now=None):
+    """Let Claude Code refresh one slot's OAuth credential without a browser.
+
+    Claude's ``doctor`` command only checks the installation and settings; it
+    does not guarantee an OAuth exchange.  Current Claude Code builds expose a
+    provider-owned refresh-token login through ``CLAUDE_CODE_OAUTH_*``.  Feed
+    the existing slot metadata to that command so Claude Code, not Headroom,
+    performs and persists the exchange (including Keychain writes and refresh-
+    token rotation).  The exact ``CLAUDE_CONFIG_DIR`` keeps slots isolated.
+
+    Incomplete refresh metadata fails closed instead of falling back to an
+    interactive login that could open a browser or bind the wrong account.
+    """
+    now = time.time() if now is None else float(now)
+    current = claude_oauth(home) or {}
+    expiry = claude_oauth_expiry(current)
+    if not force and (expiry is None or expiry > now + CLAUDE_REFRESH_MARGIN):
+        return current
+    binary = claude_bin()
+    if not binary:
+        return current
+    refresh_token = current.get("refreshToken")
+    raw_scopes = current.get("scopes")
+    if isinstance(raw_scopes, str):
+        scopes = raw_scopes.split()
+    elif isinstance(raw_scopes, (list, tuple)):
+        scopes = list(raw_scopes)
+    else:
+        scopes = []
+    if (not isinstance(refresh_token, str) or not refresh_token
+            or not scopes
+            or any(not isinstance(scope, str) or not scope
+                   or len(scope) > 128
+                   or re.fullmatch(r"[A-Za-z0-9:_-]+", scope) is None
+                   for scope in scopes)):
+        return current
+    env = scrubbed_env()
+    env["CLAUDE_CONFIG_DIR"] = home
+    # Keep this provider-owned maintenance exchange independent of project
+    # hooks/plugins.  Secrets remain in the child environment and are never
+    # placed in argv, logs, snapshots, or error text.
+    env["CLAUDE_CODE_SAFE_MODE"] = "1"
+    env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
+    env["CLAUDE_CODE_OAUTH_SCOPES"] = " ".join(scopes)
+    try:
+        runner(
+            [binary, "auth", "login", "--claudeai"], cwd=home, env=env,
+            capture_output=True, text=True, timeout=CLAUDE_REFRESH_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return current
+    refreshed = claude_oauth(home) or {}
+    return refreshed if refreshed.get("accessToken") else current
 
 
 def claude_identity(home, runner=subprocess.run):
@@ -763,43 +831,70 @@ def limit_entry(limit, minutes):
     }
 
 
-def claude_limits(home, expected_fingerprint, opener=open_authenticated):
+def claude_limits(home, expected_fingerprint, opener=open_authenticated,
+                  refresher=refresh_claude_oauth):
     oauth = claude_oauth(home) or {}
     if not oauth.get("accessToken"):
-        raise IdentityBindingError("claude_credentials_missing")
-    # The CACHED access token may have expired since the CLI last refreshed
-    # it (headroom never refreshes credentials itself — racing the CLI's own
-    # rotation could invalidate its session). An expired token would 401
-    # below and read as an opaque collector error; hold with an actionable
-    # code instead. expiresAt is milliseconds in current CLI builds — accept
-    # a plain-seconds value too, so a unit change can never mark every fresh
-    # token as expired.
-    expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
-        expires_epoch = expires_at / 1000.0 if expires_at > 1e11 else expires_at
-        if expires_epoch <= time.time():
-            raise IdentityBindingError("claude_usage_token_expired")
-    request = urllib.request.Request(
-        "https://api.anthropic.com/api/oauth/usage",
-        headers={
-            "authorization": "Bearer " + oauth["accessToken"],
-            "anthropic-beta": "oauth-2025-04-20",
-            "anthropic-version": "2023-06-01",
-        },
-    )
+        # A locked/waking macOS Keychain can make one read look absent even
+        # though `claude auth status` just verified the slot. Give Claude's
+        # credential manager one bounded chance to re-open/repair its item.
+        candidate = refresher(home, force=True)
+        if isinstance(candidate, dict) and candidate.get("accessToken"):
+            oauth = candidate
+        else:
+            raise IdentityBindingError("claude_credentials_missing")
+    expiry = claude_oauth_expiry(oauth)
+    if expiry is not None and expiry <= time.time() + CLAUDE_REFRESH_MARGIN:
+        candidate = refresher(home, force=True)
+        if isinstance(candidate, dict) and candidate.get("accessToken"):
+            oauth = candidate
+        expiry = claude_oauth_expiry(oauth)
+    if expiry is not None and expiry <= time.time():
+        raise IdentityBindingError("claude_usage_token_expired")
+
+    def usage_request(credential):
+        return urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "authorization": "Bearer " + credential["accessToken"],
+                "anthropic-beta": "oauth-2025-04-20",
+                "anthropic-version": "2023-06-01",
+            },
+        )
+
     try:
-        response = opener(request, timeout=30)
+        response = opener(usage_request(oauth), timeout=30)
     except urllib.error.HTTPError as error:
         if error.code == 429:
             raise ProviderThrottleError(
                 retry_after_epoch(error.headers), provider_response=True
             ) from error
-        if error.code in (401, 403):
-            # auth rejection is not capacity and not a rate limit: hold the
-            # slot with a distinct, actionable code instead of letting a raw
-            # HTTPError surface as a generic collector error
+        if error.code == 401:
+            candidate = refresher(home, force=True)
+            rotated = isinstance(candidate, dict) \
+                and candidate.get("accessToken") \
+                and candidate.get("accessToken") != oauth.get("accessToken")
+            if rotated:
+                oauth = candidate
+                try:
+                    response = opener(usage_request(oauth), timeout=30)
+                except urllib.error.HTTPError as retry_error:
+                    if retry_error.code == 429:
+                        raise ProviderThrottleError(
+                            retry_after_epoch(retry_error.headers),
+                            provider_response=True,
+                        ) from retry_error
+                    if retry_error.code in (401, 403):
+                        raise IdentityBindingError(
+                            "claude_usage_token_rejected") from retry_error
+                    raise
+            else:
+                raise IdentityBindingError(
+                    "claude_usage_token_rejected") from error
+        elif error.code == 403:
             raise IdentityBindingError("claude_usage_token_rejected") from error
-        raise
+        else:
+            raise
     with response:
         response_org = response.headers.get("anthropic-organization-id")
         response_fingerprint = fingerprint(response_org) if response_org else None
@@ -1176,6 +1271,11 @@ def _collect_accounts_sequential(accounts, backoff=None,
                     raise ProviderThrottleError(claude_backoff_until)
                 result.update(claude_limits(account["home"],
                                             account.get("pinned_usage_org")))
+                # The provider may rotate the access token while collecting.
+                # Bind the published row to the post-refresh credential so the
+                # router does not mistake a healthy rotation for a slot swap.
+                result["identity"]["credential_digest"] = credential_digest(
+                    "claude", account["home"])
                 if not account.get("pinned_usage_org") \
                         and result.get("source_identity_fingerprint"):
                     # trust-on-first-use: remember which org this slot's
@@ -1323,25 +1423,26 @@ def _collect_accounts_sequential(accounts, backoff=None,
                         account["home"], ".credentials.json")))
                 if keychain_backed:
                     result["note"] = (
-                        f"cached Claude token {what} — Headroom never refreshes "
-                        "credentials itself. This is a Keychain-backed macOS login, "
-                        "so Headroom cannot safely roll back an automated re-login. "
-                        "Re-authenticate this slot directly in Claude Code, then "
-                        "refresh Headroom; readings held until then.")
+                        f"cached Claude token {what} and Claude Code's automatic "
+                        "token repair did not recover it. This is a Keychain-backed "
+                        "macOS login, so re-authenticate this slot directly in "
+                        "Claude Code, then refresh Headroom; readings are held "
+                        "until then.")
                 else:
                     result["note"] = (
-                        f"cached Claude token {what} — headroom never refreshes "
-                        "credentials itself. Run one Claude Code turn on this "
-                        "account (the CLI refreshes its token) or `headroom auth "
-                        f"refresh {account['name']}` to re-login; readings held "
-                        "until then.")
+                        f"cached Claude token {what} and Claude Code's automatic "
+                        "token repair did not recover it. Run one Claude Code turn "
+                        "on this account or `headroom auth refresh "
+                        f"{account['name']}` to re-login; readings are held until "
+                        "then.")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
                 # `security`) — this path means the Keychain was locked or the
                 # item name differs; elsewhere it means no file-based login yet.
-                result["note"] = ("Claude login found but its token could not "
-                                  "be read. On macOS unlock the login Keychain "
+                result["note"] = ("Claude login was found, but its token remained "
+                                  "unreadable after provider repair. On macOS "
+                                  "unlock the login Keychain "
                                   "and allow `security` access when prompted "
                                   "(set HEADROOM_CLAUDE_KEYCHAIN_SERVICE if your "
                                   "CLI uses a different item name); on "
