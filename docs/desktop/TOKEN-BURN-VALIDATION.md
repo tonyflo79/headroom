@@ -19,6 +19,11 @@ It does not use a localhost or Vercel service.
 - Historical Claude logs in a shared provider home are reported as exact but
   unattributed. They are never assigned to one of the four configured account
   cards without account evidence.
+- Renaming, adding, removing, or moving a configured account atomically rebuilds
+  the private index. Historical events therefore follow the current slot/home
+  mapping, and removed accounts cannot remain hidden inside aggregate totals.
+  Upgrading to this index schema also forces one repair rebuild for installations
+  that may already contain stale attribution.
 - Codex sessions that contain no token events create a visible partial-coverage
   warning. Their cumulative thread total is not guessed onto a date.
 - No Claude chat or ChatGPT estimates are produced by this version.
