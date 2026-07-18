@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -19,6 +20,14 @@ class ReleaseVersionCase(unittest.TestCase):
         cargo = (ROOT / "integrations/menubar/src-tauri/Cargo.toml").read_text(
             encoding="utf-8")
         self.assertRegex(cargo, re.escape(f'version = "{version}"'))
+        cargo_lock = (
+            ROOT / "integrations/menubar/src-tauri/Cargo.lock").read_text(
+                encoding="utf-8")
+        self.assertRegex(
+            cargo_lock,
+            rf'(?m)^\[\[package\]\]\nname = "headroom-menubar"\n'
+            rf'version = "{re.escape(version)}"$',
+        )
         tauri = json.loads((
             ROOT / "integrations/menubar/src-tauri/tauri.conf.json").read_text(
                 encoding="utf-8"))
@@ -31,6 +40,24 @@ class ReleaseVersionCase(unittest.TestCase):
         self.assertEqual(package["version"], version)
         self.assertEqual(package_lock["version"], version)
         self.assertEqual(package_lock["packages"][""]["version"], version)
+
+    def test_projector_updates_cargo_and_npm_lockfile_versions(self):
+        script = ROOT / "scripts/release-version.py"
+        spec = importlib.util.spec_from_file_location("release_version", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        projected = module.projected_files("9.8.7")
+        cargo_lock = projected[
+            ROOT / "integrations/menubar/src-tauri/Cargo.lock"]
+        self.assertRegex(
+            cargo_lock,
+            r'(?m)^\[\[package\]\]\nname = "headroom-menubar"\n'
+            r'version = "9\.8\.7"$',
+        )
+        npm_lock = json.loads(projected[
+            ROOT / "integrations/menubar/package-lock.json"])
+        self.assertEqual(npm_lock["version"], "9.8.7")
+        self.assertEqual(npm_lock["packages"][""]["version"], "9.8.7")
 
     def test_release_version_checker_accepts_the_committed_tree(self):
         result = subprocess.run(
