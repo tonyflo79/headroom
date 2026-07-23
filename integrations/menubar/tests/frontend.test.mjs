@@ -133,7 +133,7 @@ test("normalizes bounded activity and renders coverage honestly", () => {
     calls: periods(3, coverage),
   });
   const raw = {
-    schema: "headroom_daily_burn@1", timezone: "America/Los_Angeles",
+    schema: "headroom_daily_burn@2", timezone: "America/Los_Angeles",
     status: "ready", indexed_at: 1_800_000_000,
     accounts: [{
       name: "personal", provider: "claude",
@@ -164,7 +164,7 @@ test("normalizes bounded activity and renders coverage honestly", () => {
 
 test("malformed optional activity fails closed without hiding capacity", () => {
   const raw = structuredClone(bootstrap);
-  raw.view.activity = { schema: "headroom_daily_burn@1", accounts: "private" };
+  raw.view.activity = { schema: "headroom_daily_burn@2", accounts: "private" };
   const normalized = normalizeBootstrap(raw);
   assert.equal(normalized.view.accounts[0].state, "current");
   assert.equal(normalized.view.activity.accounts[0].tokens.today.coverage,
@@ -201,6 +201,7 @@ test("removes automatic handoff from the desktop surface", () => {
 
 test("compact activity is present on cards and in the totals strip", () => {
   const html = readFileSync(new URL("../dist/index.html", import.meta.url), "utf8");
+  const script = readFileSync(new URL("../dist/main.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("../dist/style.css", import.meta.url), "utf8");
   assert.match(html, /id="activity-summary"/);
   assert.match(html, /id="total-tokens-today"/);
@@ -213,6 +214,10 @@ test("compact activity is present on cards and in the totals strip", () => {
   assert.match(css, /\.account-activity/);
   assert.match(css, /\.activity-summary/);
   assert.match(css, /\.burn-dashboard/);
+  assert.match(html, /EFFECTIVE TOKENS/);
+  assert.match(html, /cache reads × 10%/i);
+  assert.match(script, /Effective tokens estimated from exact local events/);
+  assert.doesNotMatch(html, /Exact local token activity/);
 });
 
 test("rejects an incompatible bridge", () => {

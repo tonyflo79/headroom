@@ -25,7 +25,7 @@ def session_meta(identity="session-a", timestamp="2026-07-16T17:00:00Z"):
     })
 
 
-def codex_event(timestamp, total):
+def codex_event(timestamp, total, cached=0):
     return line({
         "timestamp": timestamp, "type": "event_msg",
         "payload": {
@@ -34,7 +34,7 @@ def codex_event(timestamp, total):
                 "total_token_usage": {"total_tokens": total * 50},
                 "last_token_usage": {
                     "input_tokens": total - 10,
-                    "cached_input_tokens": total - 20,
+                    "cached_input_tokens": cached,
                     "output_tokens": 10,
                     "total_tokens": total,
                 },
@@ -77,9 +77,9 @@ class ActivityMetrics(unittest.TestCase):
         home = os.path.join(self.temp.name, "codex")
         original = os.path.join(home, "sessions", "original.jsonl")
         copied = os.path.join(home, "sessions", "copied.jsonl")
-        first = codex_event("2026-07-16T17:01:00Z", 100)
+        first = codex_event("2026-07-16T17:01:00Z", 100, cached=80)
         self._write(original, session_meta(), first,
-                    codex_event("2026-07-16T18:01:00Z", 50))
+                    codex_event("2026-07-16T18:01:00Z", 50, cached=30))
         self._write(copied, session_meta(), first)
         config = {"accounts": [{
             "name": "codex1", "provider": "codex", "home": home,
@@ -88,13 +88,16 @@ class ActivityMetrics(unittest.TestCase):
         value = self._index(config)
 
         account = value["accounts"][0]
+        # Cached input is a subset of Codex total_tokens. The comparable
+        # baseline counts non-cache tokens fully and cached reads at 10%:
+        # (100 - 80) + 8 + (50 - 30) + 3 = 51.
         self.assertEqual(account["tokens"]["today"], {
-            "value": 150, "coverage": "exact"})
+            "value": 51, "coverage": "exact"})
         self.assertEqual(account["sessions"]["today"]["value"], 1)
         self.assertEqual(value["daily"], [{
-            "date": "2026-07-16", "codex_tokens": 150,
+            "date": "2026-07-16", "codex_tokens": 51,
             "claude_code_tokens": 0, "claude_code_calls": 0,
-            "total": 150, "driver": "unlabeled", "evidence": "",
+            "total": 51, "driver": "unlabeled", "evidence": "",
         }])
 
     def test_claude_uses_all_cache_fields_but_one_max_per_message_call(self):
@@ -124,8 +127,10 @@ class ActivityMetrics(unittest.TestCase):
 
         value = self._index(config)
 
+        # The retained maximum for message-a is 90 non-cache + 60 cached;
+        # message-b adds 50 non-cache. Effective total: 90 + 6 + 50 = 146.
         self.assertEqual(value["accounts"][0]["tokens"]["today"], {
-            "value": 200, "coverage": "exact"})
+            "value": 146, "coverage": "exact"})
         self.assertEqual(value["accounts"][0]["sessions"]["today"]["value"], 1)
         self.assertEqual(value["totals"]["calls"]["today"]["value"], 2)
 
@@ -214,6 +219,35 @@ class ActivityMetrics(unittest.TestCase):
         self.assertNotIn(transcript, encoded)
         self.assertNotIn("session-a", encoded)
         self.assertEqual(os.stat(activity._state_path()).st_mode & 0o777, 0o600)
+
+    def test_raw_token_index_is_rebuilt_for_effective_token_baseline(self):
+        home = os.path.join(self.temp.name, "codex")
+        transcript = os.path.join(home, "sessions", "one.jsonl")
+        self._write(
+            transcript, session_meta(),
+            codex_event("2026-07-16T17:00:00Z", 100, cached=80),
+        )
+        config = {"accounts": [{
+            "name": "codex1", "provider": "codex", "home": home,
+        }]}
+        self._index(config)
+        connection = activity._database()
+        try:
+            connection.execute("update events set tokens=100")
+            connection.execute(
+                "update meta set value='headroom_activity_index@3' "
+                "where key='schema'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertTrue(activity._index_sync(
+            config, now=NOW, timezone_name=TIMEZONE,
+            global_claude_home=""))
+        rebuilt = activity._project(config, now=NOW)
+
+        self.assertEqual(rebuilt["totals"]["tokens"]["today"], {
+            "value": 28, "coverage": "exact"})
 
     def test_account_rename_rebuilds_historical_attribution(self):
         home = os.path.join(self.temp.name, "codex")

@@ -1,8 +1,10 @@
-"""Exact, private token-burn indexing for the desktop app.
+"""Private effective-token indexing for the desktop app.
 
 The index stores only numeric usage, dates, opaque hashes, and private source
 paths in a mode-0600 SQLite file. Raw transcripts and prompts are never copied.
-Only bounded, normalized daily totals cross the desktop bridge.
+Only bounded, normalized daily estimates cross the desktop bridge. The
+estimate counts non-cache tokens fully and cache reads at ten percent so the
+headline is comparable with the usage baselines engineers commonly discuss.
 """
 
 from __future__ import annotations
@@ -21,8 +23,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from . import paths, registry
 
 
-SCHEMA = "headroom_daily_burn@1"
-STATE_SCHEMA = "headroom_activity_index@3"
+SCHEMA = "headroom_daily_burn@2"
+STATE_SCHEMA = "headroom_activity_index@4"
 WINDOWS = ("today", "7d", "30d")
 TOKEN_FIELDS = (
     "input_tokens", "output_tokens", "cache_creation_input_tokens",
@@ -31,6 +33,7 @@ TOKEN_FIELDS = (
 MAX_TOKEN_VALUE = 10**15
 MAX_DAILY_ROWS = 800
 REFRESH_SECONDS = 60
+CACHE_READ_WEIGHT_PERCENT = 10
 UNATTRIBUTED = "unattributed"
 
 _WORKER_LOCK = threading.Lock()
@@ -152,6 +155,14 @@ def _bounded_integer(value):
             and 0 <= value <= MAX_TOKEN_VALUE else None)
 
 
+def _effective_tokens(raw_tokens, cached_read_tokens):
+    """Return a comparable usage estimate with cache reads weighted at 10%."""
+    cached = min(raw_tokens, cached_read_tokens)
+    uncached = raw_tokens - cached
+    weighted_cache = (cached * CACHE_READ_WEIGHT_PERCENT + 50) // 100
+    return min(uncached + weighted_cache, MAX_TOKEN_VALUE)
+
+
 def _hash(*values):
     digest = hashlib.sha256()
     for value in values:
@@ -178,6 +189,8 @@ def _codex_event(raw, timezone, session_key):
     usage = info.get("last_token_usage") if isinstance(info, dict) else None
     tokens = (_bounded_integer(usage.get("total_tokens"))
               if isinstance(usage, dict) else None)
+    cached = ((_bounded_integer(usage.get("cached_input_tokens", 0)) or 0)
+              if isinstance(usage, dict) else 0)
     stamp = _timestamp(value.get("timestamp"))
     if not tokens or stamp is None:
         return None
@@ -186,7 +199,7 @@ def _codex_event(raw, timezone, session_key):
     return {
         "event_key": _hash(raw.rstrip(b"\r\n")),
         "local_date": _local_date(stamp, timezone),
-        "tokens": tokens,
+        "tokens": _effective_tokens(tokens, cached),
         "session_key": session_key,
     }
 
@@ -214,7 +227,8 @@ def _claude_tokens(usage):
         count = _bounded_integer(usage.get(field, 0))
         if count is not None:
             total += count
-    return min(total, MAX_TOKEN_VALUE)
+    cached = _bounded_integer(usage.get("cache_read_input_tokens", 0)) or 0
+    return _effective_tokens(total, cached)
 
 
 def _claude_event(raw, timezone):

@@ -6,11 +6,16 @@ It does not use a localhost or Vercel service.
 
 ## Fidelity contract
 
-- Codex is exact where a `token_count` event contains
-  `last_token_usage.total_tokens`. Cached input is already included in that
-  total and is not added a second time.
-- Claude Code is exact from input, output, cache-creation, and cache-read token
-  fields.
+- Source fields are read exactly from local provider events, but the displayed
+  number is deliberately labeled an **effective-token estimate**. It is a
+  comparison baseline, not a reconstruction of either provider's proprietary
+  subscription-limit formula.
+- Codex uses `last_token_usage.total_tokens` as raw throughput. Because
+  `cached_input_tokens` is a subset of that total, effective tokens are
+  `total - cached + round(cached × 0.10)`.
+- Claude Code sums input, output, cache-creation, and cache-read fields as raw
+  throughput. Effective tokens are `raw - cache_read +
+  round(cache_read × 0.10)`; cache creation remains fully weighted.
 - Repeated Claude transcript rows with the same session and message ID are one
   API call. The index retains the maximum observed usage for that call.
 - Copied or forked Codex event rows are deduplicated by an opaque event hash.
@@ -37,16 +42,14 @@ generic driver labels, fidelity state, and stable warning codes only.
 
 ## Reconciliation gate
 
-For local day `2026-07-15` in `America/Los_Angeles`, an independent raw-log
-calculation produced:
+The regression fixture independently exercises both provider formulas:
 
-- Codex: `142,282,028`
-- Claude Code: `41,052,176`
-- Combined: `183,334,204`
+- Codex: raw `150`, cache reads `110`, effective `51`.
+- Claude Code: raw `200`, cache reads `60`, effective `146`.
 
-The private index returned `183,334,204` for the same day, a delta of zero.
-The reconciliation command used an independent `rg`/`jq`/`awk` pipeline rather
-than the application parser.
+The private index must return those effective values with a delta of zero. A
+release candidate must additionally reconcile at least one completed private
+local day with an independent, non-persisting calculation.
 
 ## Release gate
 
