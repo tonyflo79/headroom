@@ -225,9 +225,9 @@
         </details>
       </section>
 
-      <section id="activity-summary" class="activity-summary" aria-label="Exact local token activity" hidden title="Exact local events · ≥ incomplete source coverage · — unavailable">
+      <section id="activity-summary" class="activity-summary" aria-label="Effective local token estimate" hidden title="Effective tokens estimated from exact local events · cache reads × 10% · ≥ incomplete source coverage · — unavailable">
         <div class="activity-total activity-total-wide">
-          <span>TOTAL TOKENS</span>
+          <span>EFFECTIVE TOKENS</span>
           <strong>TODAY <b id="total-tokens-today">—</b> · 7D <b id="total-tokens-7d">—</b> · 30D <b id="total-tokens-30d">—</b></strong>
         </div>
         <div class="activity-total activity-total-wide">
@@ -239,13 +239,13 @@
           <strong>TODAY <b id="total-calls-today">—</b> · 7D <b id="total-calls-7d">—</b> · 30D <b id="total-calls-30d">—</b></strong>
         </div>
         <div class="activity-total activity-total-wide">
-          <span>CLAUDE · UNATTRIBUTED HISTORY</span>
+          <span>CLAUDE · UNATTRIBUTED EFFECTIVE</span>
           <strong>TODAY <b id="unattributed-claude-today">—</b> · 7D <b id="unattributed-claude-7d">—</b> · 30D <b id="unattributed-claude-30d">—</b></strong>
         </div>
       </section>
 
       <details id="burn-dashboard" class="burn-dashboard">
-        <summary><span>&gt; token burn detail</span><small id="activity-status">INDEX UNAVAILABLE · local time</small></summary>
+        <summary><span>&gt; effective token detail</span><small id="activity-status">INDEX UNAVAILABLE · local time</small></summary>
         <div class="burn-range" aria-label="Token burn date range">
           <button type="button" data-burn-range="90" class="active">90D</button>
           <button type="button" data-burn-range="180">180D</button>
@@ -255,7 +255,7 @@
         <div class="burn-grid">
           <section class="burn-view burn-view-wide">
             <h3>DAILY BURN · LOG SCALE</h3>
-            <div id="burn-heatmap" class="burn-heatmap" aria-label="Daily token burn heatmap"></div>
+            <div id="burn-heatmap" class="burn-heatmap" aria-label="Daily effective token heatmap"></div>
           </section>
           <section class="burn-view burn-view-wide">
             <h3>WEEKLY TREND · LOG NORMALIZED</h3>
@@ -270,10 +270,10 @@
             <div id="burn-scale" class="burn-list burn-scale"></div>
           </section>
           <section class="burn-view burn-view-wide burn-table-wrap">
-            <h3>LAST 30 LOCAL DAYS · EXACT SOURCES</h3>
+            <h3>LAST 30 LOCAL DAYS · EFFECTIVE ESTIMATE</h3>
             <table class="burn-table">
-              <caption class="sr-only">Exact token activity by local calendar day</caption>
-              <thead><tr><th>DATE</th><th>TOTAL</th><th>7D AVG</th><th>CODEX</th><th>CLAUDE</th><th>CLAUDE CALLS</th><th>DRIVER</th></tr></thead>
+              <caption class="sr-only">Effective token estimate by local calendar day</caption>
+              <thead><tr><th>DATE</th><th>EFFECTIVE</th><th>7D AVG</th><th>CODEX</th><th>CLAUDE</th><th>CLAUDE CALLS</th><th>DRIVER</th></tr></thead>
               <tbody id="burn-table-body"></tbody>
             </table>
           </section>

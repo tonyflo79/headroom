@@ -100,10 +100,11 @@ silently switching slots if anything changed. The terminal-style black,
 phosphor-green, and glowing-bar treatment remains the default Midnight theme.
 
 The compact account cards show the exact weekly reset alongside incremental
-24-hour, 7-day, and 30-day token activity. Codex activity comes from its local
+24-hour, 7-day, and 30-day effective-token estimates. Non-cache tokens count
+fully and cache reads count at 10 percent. Codex activity comes from its local
 telemetry database; Claude activity is read only from the registered
 Headroom-owned account home, so shared transcripts are never guessed into an
-account. The totals strip aggregates tokens and distinct sessions. Coverage is
+account. The totals strip aggregates effective tokens and distinct sessions. Coverage is
 explicit: normal values are complete, `≥` is partial history, `…` is tracking
 from now, and `—` is unavailable. Commits and pull requests remain unavailable
 until a repository scope and attributable source are defined. Raw transcripts,

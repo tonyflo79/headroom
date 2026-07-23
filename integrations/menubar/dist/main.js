@@ -13,7 +13,7 @@ const REFRESH_INTERVAL_MIN = 60;
 const REFRESH_INTERVAL_MAX = 3600;
 const ROUTING_SCHEMA = "headroom_desktop_routing@1";
 const HANDOFF_HEALTH_SCHEMA = "headroom_handoff_health@1";
-const ACTIVITY_SCHEMA = "headroom_daily_burn@1";
+const ACTIVITY_SCHEMA = "headroom_daily_burn@2";
 const DIAGNOSTICS_SCHEMA = "headroom_desktop_diagnostics@1";
 const DIAGNOSTIC_COMPONENTS = new Set([
   "app", "sidecar", "update", "engine", "bridge", "registry", "snapshot",
@@ -1080,12 +1080,12 @@ function accountActivityRow(activity) {
   const partial = ACTIVITY_PERIODS.some(
     (period) => activity?.tokens?.[period]?.coverage === "partial");
   row.title = activity?.attribution === "exact" && partial
-    ? "Exact recorded events; ≥ marks incomplete provider source coverage"
+    ? "Effective tokens estimated from exact local events; cache reads count 10%; ≥ marks incomplete provider source coverage"
     : activity?.attribution === "exact"
-      ? "Exact provider events grouped by local calendar day"
+      ? "Effective tokens estimated from exact local events; cache reads count 10%; grouped by local calendar day"
     : "Historical usage cannot be assigned safely to this account";
   const label = document.createElement("span");
-  label.textContent = "TOKENS";
+  label.textContent = "EFFECTIVE";
   const metrics = document.createElement("span");
   metrics.textContent = ACTIVITY_PERIODS.map(
     (period) => `${period.toUpperCase()} ${formatActivityMetric(activity?.tokens?.[period])}`,
@@ -1163,7 +1163,7 @@ function renderBurnHeatmap(rows) {
     cell.className = `burn-day burn-level-${logHeatLevel(row.total, maximum)}`;
     cell.tabIndex = 0;
     cell.setAttribute("role", "img");
-    cell.title = `${row.date} · ${formatActivityValue(row.total)} tokens · ${row.driver}`;
+    cell.title = `${row.date} · ${formatActivityValue(row.total)} effective tokens · ${row.driver}`;
     cell.setAttribute("aria-label", cell.title);
     return cell;
   });
@@ -1187,7 +1187,7 @@ function renderBurnTrend(rows) {
   const svg = document.createElementNS(namespace, "svg");
   svg.setAttribute("viewBox", "0 0 600 100");
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", "Weekly exact token totals on a logarithmic scale");
+  svg.setAttribute("aria-label", "Weekly effective token estimates on a logarithmic scale");
   const maximum = Math.max(...weekly.map((row) => Math.log10(row.total + 1)), 1);
   const points = weekly.map((row, index) => {
     const x = weekly.length === 1 ? 300 : (index / (weekly.length - 1)) * 590 + 5;
@@ -1201,7 +1201,7 @@ function renderBurnTrend(rows) {
   line.setAttribute("stroke-width", "2");
   const title = document.createElementNS(namespace, "title");
   const peak = weekly.reduce((best, row) => row.total > best.total ? row : best);
-  title.textContent = `Peak week ${peak.week}: ${formatActivityValue(peak.total)} tokens`;
+  title.textContent = `Peak week ${peak.week}: ${formatActivityValue(peak.total)} effective tokens`;
   svg.append(title, line);
   target.replaceChildren(svg);
 }
@@ -1231,7 +1231,7 @@ function renderBurnScale(rows) {
   const total = rows.reduce((sum, row) => sum + row.total, 0);
   const words = total * 0.75;
   const values = [
-    ["WORDS", formatActivityValue(Math.round(words)), "tokens × 0.75"],
+    ["WORDS", formatActivityValue(Math.round(words)), "effective tokens × 0.75"],
     ["READING", `${formatActivityValue(Math.round(words / 250 / 60))}h`, "250 words/min"],
     ["NOVELS", formatActivityValue(Math.round(words / 90_000)), "90k words/novel"],
   ];
@@ -1307,9 +1307,9 @@ function renderActivitySummary(activity, mode) {
   setPeriods("unattributed-claude", activity?.unattributed?.claude_code?.tokens);
   const status = document.getElementById("activity-status");
   if (status) {
-    const label = activity?.status === "indexing" ? "INDEXING EXACT LOCAL LOGS"
+    const label = activity?.status === "indexing" ? "INDEXING LOCAL LOGS"
       : activity?.status === "refreshing" ? "REFRESHING INDEX"
-        : activity?.status === "ready" ? "EXACT LOCAL-DAY INDEX" : "INDEX UNAVAILABLE";
+        : activity?.status === "ready" ? "EFFECTIVE LOCAL-DAY INDEX · CACHE READS × 10%" : "INDEX UNAVAILABLE";
     const warning = activity?.warnings?.includes("source_read_incomplete")
       ? " · SOURCE READ INCOMPLETE"
       : activity?.warnings?.includes("codex_legacy_usage_unavailable")
